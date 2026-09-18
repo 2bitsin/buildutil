@@ -156,12 +156,17 @@ def test_a_python_test_file_registers_a_suite_by_presence(tmp_path):
 
 
 def test_python_in_a_test_subtree_registers_too(tmp_path):
-  """The directory half of the convention, matching *.test/ for C++."""
+  """The directory half of the convention, matching *.test/ for C++.
+  Inside it, pytest's own file rules decide what is a test, so the suite
+  can keep helpers next to its cases."""
   _tree(tmp_path, ["tool"])
   suite = tmp_path / "sources" / "tool" / "driver.test"
   suite.mkdir()
-  (suite / "run.py").write_text("def test_ok():\n    assert True\n")
-  assert "tool-pytest" in _ctest_names(tmp_path)
+  (suite / "test_run.py").write_text("def test_ok():\n    assert True\n")
+  (suite / "_fixtures.py").write_text("VALUE = 1\n")
+  names = _ctest_names(tmp_path)
+  assert "tool-pytest" in names
+  assert "_fixtures.py" not in names, "a helper module is not a test file"
 
 
 def test_a_python_suite_carries_the_same_runner_contract(tmp_path):

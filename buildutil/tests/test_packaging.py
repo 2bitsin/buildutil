@@ -8,6 +8,7 @@ right conan commands. Everything below runs without conan or git — the
 calls go through packaging.py's injectable seams, and the recipe is
 exec'd against stub conan modules (the established template pattern)."""
 import importlib.util
+import json
 import subprocess
 import sys
 import types
@@ -257,6 +258,19 @@ def test_no_tag_no_tty_is_a_refusal(tmp_path, monkeypatch):
   with pytest.raises(SystemExit, match="cannot infer"):
     packaging.resolve_version(bump=True, git=_git_tags(),
                               isatty=False, root=tmp_path)
+
+
+def test_the_refusal_never_recommends_a_key_nothing_reads(tmp_path,
+                                                          monkeypatch):
+  """[package] has no version key: config parses kind, name and nothing
+  else, and [package] takes no unknown-key check, so a version line
+  written on this advice would silently do nothing."""
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  with pytest.raises(SystemExit) as refusal:
+    packaging.resolve_version(bump=True, git=_git_tags(),
+                              isatty=False, root=tmp_path)
+  assert "[package] version" not in str(refusal.value)
+  assert "--version" in str(refusal.value)
 
 
 # ------------------------------------------ ranged runtime Requires --
@@ -528,3 +542,110 @@ def test_an_unpackaged_project_install_does_not_move(tmp_path):
   existing project's install output."""
   prefix = _lib_tree(tmp_path, "")
   assert not list(prefix.rglob("*.a")), list(prefix.rglob("*"))
+
+
+# ------------------------------- what a package says it is ------------
+
+class _Components(dict):
+  """conan's cpp_info.components: a name creates its component."""
+
+  def __missing__(self, name):
+    self[name] = SimpleNamespace(libs=None, libdirs=None, includedirs=None,
+                                 system_libs=[], requires=None)
+    return self[name]
+
+
+class _CppInfo(SimpleNamespace):
+  """Enough of conan's cpp_info for package_info to fill in."""
+
+  def __init__(self):
+    super().__init__(libs=None, libdirs=None, includedirs=None,
+                     bindirs=None, properties={}, components=_Components())
+
+  def set_property(self, name, value):
+    self.properties[name] = value
+
+
+def _described(tmp_path, toml_text, files, manifest=None):
+  """package_info() over a package tree of exactly these files."""
+  mod = _recipe_module(tmp_path, toml_text)
+  pkg = tmp_path / "pkg"
+  for rel in files:
+    path = pkg / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+  if manifest is not None:
+    path = pkg / "share" / "buildutil" / "buildutil-components.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"components": manifest}))
+  recipe = mod.ProjectRecipe()
+  recipe.package_folder = str(pkg)
+  recipe.cpp_info = _CppInfo()
+  recipe.package_info()
+  return recipe.cpp_info
+
+
+CORES = '[package]\nkind = "library"\nname = "cores"\n'
+NOT_LINKABLE = CORES + "linkable = false\n"
+PAYLOAD = ["lib/genesis_plus_gx_libretro.so", "include/cores/libretro.h"]
+
+
+def test_a_runtime_payload_is_advertised_as_a_library_by_default(tmp_path):
+  """The state of affairs the ticket is about: every file with a library
+  suffix becomes a link target, whatever it is for."""
+  info = _described(tmp_path, CORES, PAYLOAD)
+  assert info.libs == ["genesis_plus_gx_libretro"]
+
+
+def test_a_package_that_declares_itself_unlinkable_advertises_no_libs(tmp_path):
+  """Libretro cores are dlopen'd by a front-end and never linked -- every
+  one of them exports the same retro_* symbols, so a consumer could link
+  at most one and would still load the rest by path. Presence cannot tell
+  such a shared object from one meant to be linked; the project says so."""
+  info = _described(tmp_path, NOT_LINKABLE, PAYLOAD)
+  assert info.libs == []
+  assert info.libdirs == ["lib"], "the loader still has to be pointed at it"
+  assert info.includedirs == ["include"]
+
+
+def test_a_cmake_file_under_the_packages_own_share_is_a_build_module(tmp_path):
+  """The other half of the same gap: a project can GENERATE a cmake
+  module and ship it through the `*.install/` layout rule, but nothing
+  connected it to `cmake_build_modules`, which is what makes
+  find_package include it."""
+  info = _described(tmp_path, NOT_LINKABLE,
+                    PAYLOAD + ["share/cmake/cores/genesis-plus-gx.cmake"])
+  assert info.properties["cmake_build_modules"] == [
+    "share/cmake/cores/genesis-plus-gx.cmake"]
+
+
+def test_a_cmake_file_somewhere_else_is_not_a_build_module(tmp_path):
+  """`share/cmake/<package>/` is the place, so a dependency's exported
+  config lying elsewhere in the tree is not included into consumers."""
+  info = _described(tmp_path, CORES,
+                    PAYLOAD + ["share/cmake/other/thing.cmake",
+                               "lib/cmake/cores/thing.cmake"])
+  assert "cmake_build_modules" not in info.properties
+
+
+def test_an_unlinkable_package_says_so_for_every_component_too(tmp_path):
+  """The component branch answers the same question about the same
+  files, and a multi-module package must not disagree with itself."""
+  info = _described(
+    tmp_path, NOT_LINKABLE, PAYLOAD + ["cores/libgenesis.a"],
+    manifest=[{"path": "cores/genesis", "lib": "genesis", "needs": [],
+               "external": []},
+              {"path": "cores/snes", "lib": "snes", "needs": [],
+               "external": []}])
+  assert [c.libs for c in info.components.values()] == [[], []]
+
+
+def test_a_linkable_package_still_componentises_its_libraries(tmp_path):
+  info = _described(
+    tmp_path, CORES, ["cores/libgenesis.a", "include/cores/api.h"],
+    manifest=[{"path": "cores/genesis", "lib": "genesis", "needs": [],
+               "external": []},
+              {"path": "cores/snes", "lib": "snes", "needs": [],
+               "external": []}])
+  assert info.components["genesis"].libs == ["genesis"]
+  assert info.components["snes"].libs == []

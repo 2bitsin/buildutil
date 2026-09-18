@@ -11,9 +11,9 @@ every publish (`--no-version-autoincrement` holds it). The pair
 persists in _bdudata/package-version.ini — checkout-local state, like
 every other _bdudata fact; a new tag resets the build counter. When no
 semver tag exists the base is PROMPTED at a tty (and saved), refused
-otherwise. An explicit `version` in [package] pins everything and
-disables the derivation — the escape hatch for projects that version
-some other way.
+otherwise. There is deliberately no version key in [package]: `publish
+--version` is the escape hatch for a project that versions some other
+way, and it persists nothing.
 
 The flow is export-pkg-based: the tree buildutil already built IS the
 package source — `conan export-pkg` runs the recipe's package() against
@@ -122,8 +122,7 @@ def resolve_version(bump: bool, override: str = "", git=subprocess.run,
         "buildutil: cannot infer the package version — no git tag is a "
         "valid semantic version (x.y.z), nothing was entered before, "
         "and this is not a terminal to ask at. Tag the repo (git tag "
-        "1.0.0), set [package] version in buildutil.toml to pin, or "
-        "run interactively to be prompted.")
+        "1.0.0), pass --version, or run interactively to be prompted.")
     entered = ""
     while not SEMVER_TAG.match(entered):
       entered = ask("package base version (semver x.y.z): ").strip()

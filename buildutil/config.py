@@ -224,6 +224,7 @@ def _load_project() -> dict:
     "conan_options_os": {},
     "conan_conf": [],
     "buildutil_version": "",     # [buildutil] version: pin for `update`
+    "update_source": "",         # [update] source: index or git URL
     "package_kind": "",          # [package] kind: "library"|"application"
     "package_name": "",          # [package] name (conan package name)
     "resources": [],             # [resources] / [[resources]] sets
@@ -291,6 +292,7 @@ def _load_project() -> dict:
   # [buildutil] version = "X.Y.Z" pins what `buildutil update` installs
   # inside this project; "latest" (or absent) means newest available
   cfg["buildutil_version"] = str(raw.get("buildutil", {}).get("version", ""))
+  cfg["update_source"] = str(raw.get("update", {}).get("source", ""))
   # [package]: this project ships as a conan package. COMMITTED on
   # purpose — what a project ships as is a fact about the project, and
   # the conanfile reads the same section, so a fresh clone packages

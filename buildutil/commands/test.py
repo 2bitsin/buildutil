@@ -1,7 +1,9 @@
 """buildutil commands: test, cache-clean."""
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +17,24 @@ from ..engine import *
 from .. import options as project_options
 
 
+
+# Where buildutil_pytest.py leaves each suite's case counts, relative to
+# the build directory.
+PYTEST_REPORTS = Path("Testing") / "buildutil-pytest"
+
+
+def pytest_suite_lines(build_dir: Path) -> list[str]:
+  """One line per python suite that ran, as pytest itself counts cases.
+
+  A suite is ONE ctest entry, so `Passed` is all the ctest summary can
+  say about it -- a suite whose every case skipped for want of a corpus
+  reads exactly like a suite that proved something."""
+  lines = []
+  for report in sorted((build_dir / PYTEST_REPORTS).glob("*.json")):
+    counts = json.loads(report.read_text())
+    tally = ", ".join(f"{n} {outcome}" for outcome, n in sorted(counts.items()))
+    lines.append(f"{report.stem}: {tally or 'no cases'}")
+  return lines
 
 
 @app.command()
@@ -167,6 +187,8 @@ def test(
   if filter:
     ctest_cmd += ["-R", filter]
   ctest_cmd += parallel_args(parallel, jobs)
+  # Nothing older than this run may be counted as part of it.
+  shutil.rmtree(build_dir / PYTEST_REPORTS, ignore_errors=True)
   # Capture ctest so the result banner can quote its pass/fail summary —
   # one invocation then reports its own count, no piping/grepping.
   ctest = subprocess.run(ctest_cmd, capture_output=True, text=True)
@@ -177,6 +199,8 @@ def test(
   else:
     sys.stdout.write(ctest.stdout)
   sys.stderr.write(ctest.stderr)
+  for line in pytest_suite_lines(build_dir):
+    typer.echo(f"pytest {line}")
   summary = next((ln.strip() for ln in ctest.stdout.splitlines() if "tests passed" in ln), "")
   if ctest.returncode != 0:
     _status(f"TESTS FAILED — {summary}" if summary else "TESTS FAILED")

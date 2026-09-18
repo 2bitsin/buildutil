@@ -33,7 +33,10 @@ hook that writes a file into data_dir('ui.embed') has thereby added an
 embedded resource: no declaration, no cmake, and the accessor, the
 ccache content digest and the re-glob all follow. A name that a
 generated file and a hand-written one both claim is a configure error
-naming both.
+naming both. Both roots read that way, the per-profile one and the
+shared one, and a data directory is SWEPT when the hook ends: it holds
+what this run emitted or wrote and nothing else, so a renamed payload
+ships once rather than twice.
 
 buildutil owns no toolchain here on purpose. What a project transpiles,
 bundles or compresses is the project's business; this module is the
@@ -65,6 +68,13 @@ _PROGRAMS = tuple(Path(p) for p in
 _EXE_SUFFIXES = ('', '.exe', '.cmd', '.bat') if os.name == 'nt' else ('',)
 _generated: list[Path] = []
 _inputs: list[Path] = []
+# data directory -> what was in it before this run touched it
+_swept: dict[Path, dict[Path, tuple[int, int]]] = {}
+_kept: set[Path] = set()            # data_dir(keep=True): swept by nobody
+
+# The directory suffixes whose CONTENTS are the declaration: what is in
+# one is embedded or shipped, so what an earlier run left in one ships too.
+_DATA_SUFFIXES = ('embed', 'install')
 
 
 def source_dir() -> Path:
@@ -93,7 +103,8 @@ def output_dir(shared:bool = False) -> Path:
   root.mkdir(parents=True, exist_ok=True)
   return root
 
-def data_dir(name:str, *, tag:str|None = None, shared:bool = False) -> Path:
+def data_dir(name:str, *, tag:str|None = None, shared:bool = False,
+             keep:bool = False) -> Path:
   """The shadow copy of one of the module's DATA directories, created.
 
       data_dir('ui.embed')             -> <root>/ui.embed/
@@ -103,7 +114,12 @@ def data_dir(name:str, *, tag:str|None = None, shared:bool = False) -> Path:
   the one place that knows the tag goes AFTER the suffix and that the
   vocabulary is closed -- `ui.linux.embed/` reads as an untagged set
   called `ui.linux` and would ship everywhere, and a typo'd tag would
-  silently produce a directory nothing ever globs."""
+  silently produce a directory nothing ever globs.
+
+  The tree holds what this run put there: a file an earlier run wrote and
+  this one did not is removed, because the directory's contents ARE the
+  declaration and renaming a payload would otherwise ship both names.
+  `keep=True` for a tree something else co-writes."""
   if '/' in name or name.startswith('.'):
     raise SystemExit(
       f"buildutil configure: data_dir({name!r}) takes a single directory "
@@ -116,7 +132,41 @@ def data_dir(name:str, *, tag:str|None = None, shared:bool = False) -> Path:
     name = f"{name}.{tag}"
   path = output_dir(shared)/name
   path.mkdir(parents=True, exist_ok=True)
+  if keep:
+    _kept.add(path)
+    _swept.pop(path, None)
+  else:
+    _watch(path)
   return path
+
+
+def _watch(directory:Path) -> None:
+  """The tree's before-picture, taken once and before anything writes:
+  a file still exactly as it was then, and not declared, is one this run
+  did not produce."""
+  if directory not in _swept and directory not in _kept:
+    _swept[directory] = {path: _fingerprint(path)
+                         for path in directory.rglob('*') if path.is_file()}
+
+
+def _fingerprint(path:Path) -> tuple[int, int]:
+  info = path.stat()
+  return (info.st_mtime_ns, info.st_size)
+
+
+def _watch_data_dir(relative_path, shared:bool) -> None:
+  """emit('ui.embed/app.js') writes into a data directory as surely as
+  data_dir('ui.embed') does, and sweeps it on the same terms."""
+  head, *rest = Path(relative_path).parts
+  if rest and _is_data_dir(head):
+    _watch(output_dir(shared)/head)
+
+
+def _is_data_dir(name:str) -> bool:
+  parts = name.split('.')
+  if len(parts) > 2 and parts[-1] in _TAGS:
+    parts = parts[:-1]
+  return len(parts) > 1 and parts[-1] in _DATA_SUFFIXES
 
 
 def inputs(*patterns:str, root=None) -> list[Path]:
@@ -209,6 +259,7 @@ def emit_bytes(relative_path, content:bytes, *, shared:bool = False) -> Path:
   """emit() for binary output -- a compressed payload, an image, anything
   that is not text. Same content-diff: rewriting identical bytes would
   move an mtime and rebuild whatever embeds them."""
+  _watch_data_dir(relative_path, shared)
   path = output_dir(shared)/relative_path
   path.parent.mkdir(parents=True, exist_ok=True)
   if not (path.exists() and path.read_bytes() == content):
@@ -230,6 +281,7 @@ def emit(relative_path, content:str, *, shared:bool = False,
   the same way -- a file written under the old locale-dependent default
   may not decode as utf-8 at all, which counts as changed, so the first
   build after this lands rewrites it correctly."""
+  _watch_data_dir(relative_path, shared)
   path = output_dir(shared)/relative_path
   path.parent.mkdir(parents=True, exist_ok=True)
   try:
@@ -256,6 +308,25 @@ def depends(*paths) -> None:
       _inputs.append(resolved)
 
 @atexit.register
+def _finish() -> None:
+  _write_manifest()
+  _sweep()
+
+
+def _sweep() -> None:
+  """Every watched data directory, left holding exactly what this run
+  emitted or wrote into it. Deepest entries first, so a directory is
+  considered after the files it held."""
+  for directory, before in _swept.items():
+    for path in sorted(directory.rglob('*'), reverse=True):
+      if path.is_dir():
+        if not any(path.iterdir()):
+          path.rmdir()
+      elif (path.resolve() not in _generated
+            and before.get(path) == _fingerprint(path)):
+        path.unlink()
+
+
 def _write_manifest() -> None:
   lines = [f'G {path}' for path in _generated] + [f'D {path}' for path in _inputs]
   _MANIFEST.parent.mkdir(parents=True, exist_ok=True)

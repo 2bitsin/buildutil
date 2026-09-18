@@ -206,7 +206,7 @@ def _root(
   """build driver — project named by buildutil.toml at the repo root.
 
   Also available with no project: `buildutil init` (scaffold one),
-  `buildutil update` (self-upgrade from the private index),
+  `buildutil update` (self-upgrade with pip),
   `buildutil --version`.
   """
   from . import watchdog

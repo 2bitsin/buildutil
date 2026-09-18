@@ -5,7 +5,7 @@ Source of truth for required packages is sources/CMakeLists.txt — the
 Require(...) calls are parsed here so both the cmake build and the
 conan graph agree on versions. Whether this project itself SHIPS as a
 conan package is read from buildutil.toml's [package] section (kind =
-library|application, name, version) — the same committed fact the
+library|application, name) — the same committed fact the
 driver's `buildutil publish` acts on. Without it the recipe is a plain
 consumer, exactly as before.
 """
@@ -395,6 +395,9 @@ class ProjectRecipe(ConanFile):
     if not _PKG:
       return
     root = Path(self.package_folder)
+    modules = _cmake_build_modules(root, self.name)
+    if modules:
+      self.cpp_info.set_property("cmake_build_modules", modules)
     if _PKG["kind"] == "application":
       bindirs = sorted({
         str(p.parent.relative_to(root)) for p in root.rglob("*")
@@ -414,6 +417,14 @@ class ProjectRecipe(ConanFile):
         stem = p.name.split(".")[0]
         libs.add(stem[3:] if stem.startswith("lib") else stem)
         libdirs.add(str(p.parent.relative_to(root)))
+    # `[package] linkable = false`: what this package ships is loaded at
+    # run time, not linked -- libretro cores a front-end dlopens, plugins,
+    # a data-only payload. They keep their libdirs (that is where the
+    # loader is pointed) and advertise no link target, so a consumer
+    # spelling target_link_libraries against the package gets nothing on
+    # its link line instead of -l<the-thing-it-must-not-link>.
+    if not _PKG.get("linkable", True):
+      libs = set()
     incdirs = ["include"] if (root / "include").is_dir() else []
     # COMPONENTS. A multi-module package lets a consumer link ONE module
     # (<pkg>::<module>) instead of the whole package; conan keeps
@@ -458,6 +469,17 @@ class ProjectRecipe(ConanFile):
     self.cpp_info.libs = sorted(libs)
     self.cpp_info.libdirs = sorted(libdirs) or ["lib"]
     self.cpp_info.includedirs = incdirs
+
+
+def _cmake_build_modules(root: Path, name: str) -> list[str]:
+  """`share/cmake/<package>/*.cmake` in the install tree IS a cmake build
+  module: a file put there exists to be include()d by find_package, and
+  nothing else puts one there. Presence is the declaration, as it is for
+  every other directory convention -- a project generates the file into
+  its `*.install/` tree and this announces it."""
+  directory = root / "share" / "cmake" / name
+  return [str(found.relative_to(root))
+          for found in sorted(directory.glob("*.cmake"))]
 
 
 def _module_linkage() -> str:

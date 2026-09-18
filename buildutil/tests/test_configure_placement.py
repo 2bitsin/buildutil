@@ -347,3 +347,35 @@ def test_a_failing_tool_shows_its_own_output(tmp_path):
   assert cfg.returncode != 0
   assert "the tool said this" in cfg.stderr
   assert "the pretend transpile failed" in cfg.stderr
+
+
+RENAMING_HOOK = """\
+import buildutil_configure as cfg
+
+name = (cfg.source_dir() / 'payload.name').read_text().strip()
+cfg.depends(cfg.source_dir() / 'payload.name')
+cfg.emit('ui.embed/' + name, 'payload')
+"""
+
+
+@e2e
+def test_a_renamed_payload_stops_shipping_under_its_old_name(tmp_path):
+  """The shadow tree is not wiped between builds by design -- emit()
+  content-diffs so an unchanged payload does not churn a rebuild -- so
+  before the sweep, a hook that renamed its output left the old file in a
+  directory whose CONTENTS are the declaration, and the binary carried
+  both. It survived every incremental build until someone wiped _build,
+  and nothing in the build said so."""
+  root = _tree(tmp_path, {"payload.name": "app.js\n"}, hook=RENAMING_HOOK)
+  build = tmp_path / "b"
+  _ok(_configure(root, build))
+  _ok(_build(build))
+  assert "[app.js]payload" in _run(build)
+
+  (root / "sources" / "demo" / "payload.name").write_text("app.js.gz\n")
+  _ok(_build(build))
+  out = _run(build)
+  assert "[app.js.gz]payload" in out
+  assert "[app.js]" not in out, (
+    "the old name is still embedded -- both payloads ship, which is how a "
+    "binary keeps the uncompressed copy of everything it compressed")

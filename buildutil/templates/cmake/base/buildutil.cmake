@@ -1643,7 +1643,13 @@ function(_buildutil_add_test_target target)
     add_dependencies(${test_target} ${target})
   endif()
   _buildutil_mirror_parent(_mirror)
-  install(TARGETS ${test_target} RUNTIME DESTINATION "${_mirror}")
+  # A suite is a BUILD-tree artifact: ctest runs it from there, and a
+  # packaged project's install tree is what its conan package ships --
+  # megabytes of test binary in every consumer's cache, for a program
+  # nobody installs to run. Excluded from the default install, still
+  # reachable as `cmake --install <build> --component tests`.
+  install(TARGETS ${test_target} RUNTIME DESTINATION "${_mirror}"
+          COMPONENT tests EXCLUDE_FROM_ALL)
   # Label each discovered test with the owning module, so `ctest -L <mod>`
   # — and `buildutil test --target <mod>` — can filter.
   #
@@ -1764,30 +1770,72 @@ endfunction()
 # second kind, for suites that RUN programs rather than link them.
 #
 # It inherits the same contract as every other test process: <build>/bin
-# on PATH so tools are invoked by bare name, and the module dir as cwd so
-# corpora are relative paths. Nothing is injected and nothing declared.
+# on PATH so tools are invoked by bare name, the module dir as cwd so
+# corpora are relative paths, and each suite directory on PYTHONPATH so a
+# helper module beside the tests imports by its bare name.
 #
 # One ctest entry per suite, not per case: discovering cases would mean
 # running pytest at CONFIGURE time, and a configure step that executes
 # the project's tests to find out what they are is a worse trade than a
 # coarser count. pytest's own report still names every case that failed.
 function(_buildutil_add_python_test_target target)
-  file(GLOB_RECURSE py_tests CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.test.py")
-  file(GLOB_RECURSE py_dirs CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.test/*.py")
-  list(APPEND py_tests ${py_dirs})
-  if(NOT py_tests)
-    return()
-  endif()
   # same gate as the gtest suites: `buildutil build --no-tests` must skip
   # this kind too, or --no-tests stops meaning what it says
   if(NOT BUILD_TESTING)
     return()
   endif()
-  list(REMOVE_DUPLICATES py_tests)
+  file(GLOB_RECURSE _loose CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.test.py")
+  _buildutil_python_suite_dirs(_dirs "${CMAKE_CURRENT_SOURCE_DIR}")
+  set(py_tests "")
+  foreach(_file IN LISTS _loose)
+    if(NOT _file MATCHES "/[^/]*\\.test/")   # already in a suite directory
+      list(APPEND py_tests "${_file}")
+    endif()
+  endforeach()
+  list(APPEND py_tests ${_dirs})
+  if(NOT py_tests)
+    return()
+  endif()
+  _buildutil_pytest_file_option(_files_option)
   _buildutil_register_python_suite(${target} "${CMAKE_CURRENT_SOURCE_DIR}"
-                                   ${py_tests})
+                                   ${py_tests} ${_files_option})
+  foreach(_dir IN LISTS _dirs)
+    set_property(TEST ${target}-pytest APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION "PYTHONPATH=path_list_prepend:${_dir}")
+  endforeach()
+endfunction()
+
+# What pytest calls a test file: its own two conventions, plus buildutil's
+# `*.test.py`. Everything else a suite directory holds is a helper --
+# conftest.py, a shared protocol module -- and handing those to pytest as
+# explicit paths is what made them into (empty) test files.
+function(_buildutil_pytest_patterns out)
+  set(${out} "test_*.py" "*_test.py" "*.test.py" PARENT_SCOPE)
+endfunction()
+
+# The same vocabulary as pytest reads it: one -o for a directory argument.
+function(_buildutil_pytest_file_option out)
+  _buildutil_pytest_patterns(_patterns)
+  string(JOIN " " _joined ${_patterns})
+  set(${out} -o "python_files=${_joined}" PARENT_SCOPE)
+endfunction()
+
+# The `*.test/` directories under `root` that hold a python suite. A
+# directory qualifies by holding a file pytest would collect, so a
+# `*.test/` subtree of C++ sources stays a gtest subtree.
+function(_buildutil_python_suite_dirs out root)
+  set(_dirs "")
+  _buildutil_pytest_patterns(_patterns)
+  foreach(_pattern IN LISTS _patterns)
+    file(GLOB_RECURSE _found CONFIGURE_DEPENDS "${root}/*.test/${_pattern}")
+    foreach(_file IN LISTS _found)
+      string(REGEX REPLACE "(/[^/]*\\.test)/.*$" "\\1" _dir "${_file}")
+      list(APPEND _dirs "${_dir}")
+    endforeach()
+  endforeach()
+  list(REMOVE_DUPLICATES _dirs)
+  set(${out} "${_dirs}" PARENT_SCOPE)
 endfunction()
 
 # ARGN is what pytest is handed: a module's files, or a declared directory.
@@ -1818,14 +1866,28 @@ function(_buildutil_register_python_suite target directory)
   # loads the file directly and has no opinion about its name.
   #
   # -rs: skip reasons reach the entry's output, which ctest keeps.
+  set(_env "PATH=path_list_prepend:${CMAKE_BINARY_DIR}/bin")
+  set(_plugin "")
+  if(BUILDUTIL_PYSUPPORT)
+    # buildutil_pytest.py: the case counts and the all-skipped verdict a
+    # single ctest entry cannot otherwise show. A bare `BUILDUTIL=1 cmake`
+    # declares no pysupport, and there plain pytest is the honest answer.
+    set(_plugin -p buildutil_pytest)
+    list(APPEND _env
+      "PYTHONPATH=path_list_prepend:${BUILDUTIL_PYSUPPORT}"
+      "BUILDUTIL_PYTEST_REPORT=set:${CMAKE_BINARY_DIR}/Testing/buildutil-pytest/${target}-pytest.json")
+  endif()
   add_test(NAME ${target}-pytest
-    COMMAND "${_suite_python}" -m pytest --import-mode=importlib
+    COMMAND "${_suite_python}" -m pytest --import-mode=importlib ${_plugin}
             ${ARGN} -q -rs)
   set_tests_properties(${target}-pytest PROPERTIES
     LABELS ${target}
+    # 77 is what buildutil_pytest.py exits when every case skipped, so a
+    # suite that ran nothing reads as ctest's own Skipped, not as a pass
+    SKIP_RETURN_CODE 77
     WORKING_DIRECTORY "${directory}"
     FIXTURES_REQUIRED buildutil-driver
-    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CMAKE_BINARY_DIR}/bin")
+    ENVIRONMENT_MODIFICATION "${_env}")
 endfunction()
 
 # [test] python: a directory that is not a module, as one ctest entry.
@@ -1835,8 +1897,8 @@ function(_buildutil_python_suites)
   if(NOT BUILD_TESTING)
     return()
   endif()
-  set(_patterns "test_*.py" "*_test.py" "*.test.py")
-  string(JOIN " " _python_files ${_patterns})
+  _buildutil_pytest_patterns(_patterns)
+  _buildutil_pytest_file_option(_files_option)
   foreach(_suite IN LISTS ARGN)
     set(_suite_dir "${CMAKE_SOURCE_DIR}/${_suite}")
     if(NOT IS_DIRECTORY "${_suite_dir}")
@@ -1857,7 +1919,7 @@ function(_buildutil_python_suites)
     endif()
     string(REPLACE "/" "-" _suite_target "${_suite}")
     _buildutil_register_python_suite(${_suite_target} "${_suite_dir}"
-      "${_suite_dir}" -o "python_files=${_python_files}")
+      "${_suite_dir}" ${_files_option})
   endforeach()
 endfunction()
 
@@ -1894,7 +1956,8 @@ function(_buildutil_add_bench_target target)
     _buildutil_add_link_pools(${bench_target} PRIVATE)
   endif()
   _buildutil_mirror_parent(_mirror)
-  install(TARGETS ${bench_target} RUNTIME DESTINATION "${_mirror}")
+  install(TARGETS ${bench_target} RUNTIME DESTINATION "${_mirror}"
+          COMPONENT benches EXCLUDE_FROM_ALL)
 endfunction()
 
 # Compile flags for our own targets:
@@ -2038,9 +2101,10 @@ function(_buildutil_exec_configure dir name out_incdirs out_sources)
   if(NOT Python3_Interpreter_FOUND)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
   endif()
-  set(per_profile "${CMAKE_BINARY_DIR}/generated/${name}")
-  set(shared      "${CMAKE_SOURCE_DIR}/_build/generated/${name}")
-  set(manifest    "${per_profile}/.manifest")
+  _buildutil_generated_roots("${name}" _roots)
+  list(GET _roots 0 per_profile)
+  list(GET _roots 1 shared)
+  set(manifest "${per_profile}/.manifest")
   file(MAKE_DIRECTORY "${per_profile}" "${shared}")
   # The TARGET platform and the tag vocabulary ride in too: the output
   # root is a module directory, so a hook that emits into `ui.embed.<tag>/`
@@ -2202,8 +2266,8 @@ function(_buildutil_install_runtime_data target)
   # The shadow tree is a source tree: a generator that writes
   # generated/<module>/data.install/ ships that data exactly as the
   # module's own data.install/ does, tags and overlay levels included.
-  _buildutil_platform_data_dirs("${CMAKE_BINARY_DIR}/generated/${target}"
-                                "install" _rd_sh_dirs _rd_sh_levels)
+  _buildutil_generated_data_dirs("${target}" "install"
+                                 _rd_sh_dirs _rd_sh_levels)
   list(APPEND _rd_dirs ${_rd_sh_dirs})
   list(APPEND _rd_levels ${_rd_sh_levels})
   list(LENGTH _rd_dirs _rd_count)
@@ -2526,7 +2590,9 @@ function(Init_submodule)
   # module's headers UNQUALIFIED was relying on that leak, and now needs
   # the supported spelling (<module>/foo.h) like everyone else. Trees with
   # [cmake] export_module_headers on are unaffected.
+  set(compiles_nothing FALSE)
   if(NOT sources)
+    set(compiles_nothing TRUE)
     set(empty_tu "${CMAKE_BINARY_DIR}/generated/_buildutil/empty.cpp")
     if(NOT EXISTS "${empty_tu}")
       file(WRITE "${empty_tu}"
@@ -2573,7 +2639,12 @@ function(Init_submodule)
     # project's install output moves. ARCHIVE_OUTPUT_NAME touches only
     # the .a — the cmake target keeps the joined name, and an app
     # sharing the leaf collides with nothing (different file names).
-    if(@PACKAGE_LIBS@)
+    # ... but only when there is an object in it. The empty TU above
+    # gives a source-less module a real target to answer questions with;
+    # the archive built from it holds nothing, nothing can link it, and
+    # shipping it makes package_info() advertise a library that is not
+    # one.
+    if(@PACKAGE_LIBS@ AND NOT compiles_nothing)
       _buildutil_module_app_name(_pkg_leaf)
       set_target_properties(${lib} PROPERTIES
         ARCHIVE_OUTPUT_NAME "${_pkg_leaf}")
@@ -3053,6 +3124,30 @@ endfunction()
 # project transpiles, bundles or compresses is the project's business,
 # and buildutil_configure.py is the placement API it does that with.
 
+# A module's two generated roots, in overlay order: the per-profile one
+# and the build-invariant shared one, exactly as _buildutil_exec_configure
+# hands them to a configure hook. Both are module directories, so both are
+# read by the data conventions.
+function(_buildutil_generated_roots name out)
+  set(${out} "${CMAKE_BINARY_DIR}/generated/${name}"
+             "${CMAKE_SOURCE_DIR}/_build/generated/${name}" PARENT_SCOPE)
+endfunction()
+
+# Every applicable `*.<suffix>/` directory of a module's generated roots,
+# with its overlay level.
+function(_buildutil_generated_data_dirs name suffix out_dirs out_levels)
+  set(_gd_dirs "")
+  set(_gd_levels "")
+  _buildutil_generated_roots("${name}" _gd_roots)
+  foreach(_gd_root IN LISTS _gd_roots)
+    _buildutil_platform_data_dirs("${_gd_root}" "${suffix}" _gd_d _gd_l)
+    list(APPEND _gd_dirs ${_gd_d})
+    list(APPEND _gd_levels ${_gd_l})
+  endforeach()
+  set(${out_dirs} "${_gd_dirs}" PARENT_SCOPE)
+  set(${out_levels} "${_gd_levels}" PARENT_SCOPE)
+endfunction()
+
 # The whole feature, per module. Called from Init_submodule after the
 # library exists.
 function(_buildutil_add_embedded_resources target)
@@ -3068,7 +3163,7 @@ function(_buildutil_add_embedded_resources target)
   # platform-tagged overlays of it. CONFIGURE_DEPENDS for the same reason
   # *.install/ needs it -- a file added to the directory that nobody
   # embeds is a green build missing a resource.
-  set(gen "${CMAKE_BINARY_DIR}/generated/${target}")
+  set(gen "${CMAKE_BINARY_DIR}/generated/${target}")   # where this writes
   _buildutil_platform_data_dirs("${CMAKE_CURRENT_SOURCE_DIR}" "embed"
                                 _embed_dirs _embed_levels)
   _buildutil_append_data_entries("${_embed_dirs}" "${_embed_levels}"
@@ -3077,7 +3172,7 @@ function(_buildutil_add_embedded_resources target)
   # `*.embed/` directories, their platform tags, their overlay levels.
   # A name a hand-written file and a generated one both claim is the
   # same-specificity refusal.
-  _buildutil_platform_data_dirs("${gen}" "embed" _sh_dirs _sh_levels)
+  _buildutil_generated_data_dirs("${target}" "embed" _sh_dirs _sh_levels)
   _buildutil_append_data_entries("${_sh_dirs}" "${_sh_levels}"
                                  entries entry_levels)
   if(NOT entries)

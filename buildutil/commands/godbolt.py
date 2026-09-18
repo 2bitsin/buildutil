@@ -35,7 +35,7 @@ def godbolt(
   output: Path = typer.Option(
     None, "--output", "-o",
     help="Report directory (created, parents included, if missing). "
-       "Default: _build/godbolt-report/<profile>.",
+       "Default: _build/<profile>/godbolt-report.",
   ),
   include_tests: bool = typer.Option(
     False, "--include-tests",

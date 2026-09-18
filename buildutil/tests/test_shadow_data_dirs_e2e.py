@@ -51,9 +51,10 @@ CFG = {"name": "demo", "cmake_option_prefix": "DEMO",
 
 
 def _tree(root: Path, source_files: dict, shadow_files: dict,
-          main: str, build: str = "b") -> Path:
+          main: str, build: str = "b", shared_files: dict | None = None) -> Path:
   """A module `demo`, plus files planted in its shadow tree exactly
-  where a generator would have left them."""
+  where a generator would have left them -- per profile, and in the
+  build-invariant shared root that `output_dir(shared=True)` hands out."""
   root.mkdir(parents=True, exist_ok=True)
   deposit.ensure(root, CFG)
   (root / "CMakeLists.txt").write_text(ROOT_CMAKE)
@@ -68,6 +69,10 @@ def _tree(root: Path, source_files: dict, shadow_files: dict,
     path.write_text(text)
   for rel, text in shadow_files.items():
     path = root / build / "generated" / "demo" / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+  for rel, text in (shared_files or {}).items():
+    path = root / "_build" / "generated" / "demo" / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
   return root
@@ -179,3 +184,49 @@ def test_a_generated_install_directory_ships_like_any_other(tmp_path):
   for tree in (build, prefix):
     assert (tree / "gen.txt").read_text() == "generated", tree
     assert (tree / "hand.txt").read_text() == "generated-wins", tree
+
+
+@e2e
+def test_the_shared_root_is_a_module_directory_too(tmp_path):
+  """`output_dir(shared=True)` is the build-invariant root, for output
+  that cannot vary by build type -- and it was an INCLUDE root only. A
+  hook that put a payload there got a green build with nothing embedded
+  and nothing said, so the one thing a shared payload is for (transpile
+  once, not once per profile) could not be done."""
+  root = _tree(tmp_path, {}, {}, REPORT,
+               shared_files={"ui.embed/shared.txt": "shared"})
+  build = tmp_path / "b"
+  _ok(_configure(root, build))
+  _ok(subprocess.run(["cmake", "--build", str(build)],
+                     capture_output=True, text=True))
+  ran = _ok(subprocess.run([str(build / "bin" / "demo")],
+                           capture_output=True, text=True))
+  assert "shared.txt=shared" in ran.stdout
+
+
+@e2e
+def test_a_shared_install_directory_ships_like_any_other(tmp_path):
+  root = _tree(tmp_path, {}, {}, "int main() { return 0; }\n",
+               shared_files={"data.install/shared.txt": "shared"})
+  build = tmp_path / "b"
+  _ok(_configure(root, build))
+  _ok(subprocess.run(["cmake", "--build", str(build)],
+                     capture_output=True, text=True))
+  prefix = tmp_path / "inst"
+  _ok(subprocess.run(["cmake", "--install", str(build), "--prefix", str(prefix)],
+                     capture_output=True, text=True))
+  for tree in (build, prefix):
+    assert (tree / "shared.txt").read_text() == "shared", tree
+
+
+@e2e
+def test_the_two_generated_roots_may_not_claim_one_name(tmp_path):
+  """Same refusal as source-versus-generated: nothing orders two base
+  level sets, so the build that cannot say which file it holds is the
+  build that does not configure."""
+  root = _tree(tmp_path, {}, {"ui.embed/app.js": "per-profile"}, REPORT,
+               shared_files={"ui.embed/app.js": "shared"})
+  cfg = _configure(root, tmp_path / "b")
+  assert cfg.returncode != 0
+  assert "app.js" in cfg.stderr
+  assert "_build/generated/demo/ui.embed" in cfg.stderr.replace("\\", "/")

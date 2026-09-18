@@ -296,3 +296,20 @@ def test_tu_kind_classifies_scaffolding():
   assert gb.tu_kind("sources/x/y.bench/main.cpp") == "bench"
   # a directory NAMED test (no dot marker) is ordinary code
   assert gb.tu_kind("sources/attest/impl.cpp") == "code"
+
+
+def test_output_help_names_the_directory_the_verb_actually_writes():
+  # the default is <build_dir>/godbolt-report, and build_dir is
+  # _build/<profile>; the help used to advertise the two the other way
+  # round and no test held it to the code
+  import inspect
+
+  from buildutil.commands import godbolt as verb
+
+  source = inspect.getsource(verb.godbolt)
+  assert 'build_dir / "godbolt-report"' in source
+  help_text = verb.godbolt.__doc__ or ""
+  for parameter in inspect.signature(verb.godbolt).parameters.values():
+    if getattr(parameter.default, "param_decls", None) == ("--output", "-o"):
+      help_text = parameter.default.help
+  assert "_build/<profile>/godbolt-report" in help_text

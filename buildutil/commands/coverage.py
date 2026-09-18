@@ -142,8 +142,8 @@ def coverage(
   # the bridge TUs thoroughly and contribute not one .gcda line, so they
   # report 0% no matter what the suite does. [coverage] bridge_dirs
   # in buildutil.toml names those build subdirs; the first one present
-  # is exported as <PREFIX>_BRIDGE_DIR so the suite imports the
-  # instrumented module for this run.
+  # is exported as <module_define_prefix>_BRIDGE_DIR so the suite
+  # imports the instrumented module for this run.
   bridge_dir = next(
     (d for rel in PROJECT["coverage_bridge_dirs"]
      if (d := (build_dir / rel).resolve()).is_dir()), None)

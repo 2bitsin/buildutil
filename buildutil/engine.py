@@ -1455,12 +1455,25 @@ def _full_build(build_type: str, tests: bool = True, upload: bool = True,
   # A targeted build is a partial dev build: skip the whole-tree install and the
   # cache upload (they assume every target is present).
   if install and not targets:
-    subprocess.check_call([
-      "cmake", "--install", str(build_dir), "--prefix", str(INSTALL_PREFIX),
-    ])
+    _install_tree(build_dir, tests=tests, bench=bench)
   if upload and not targets:
     _upload_to_remote()
 
+
+
+def _install_tree(build_dir: Path, *, tests: bool, bench: bool) -> None:
+  """The built tree into _install/, suites included.
+
+  The suites install as their own components, excluded from the DEFAULT
+  install: a packaged project's `package()` is a plain `cmake --install`,
+  and a conan package has no business shipping megabytes of test binary.
+  The local tree is a dev artifact and still gets them -- it is where the
+  vscode launch configs point."""
+  install = ["cmake", "--install", str(build_dir),
+             "--prefix", str(INSTALL_PREFIX)]
+  subprocess.check_call(install)
+  for component in (["tests"] if tests else []) + (["benches"] if bench else []):
+    subprocess.check_call(install + ["--component", component])
 
 
 def _upload_to_remote() -> None:

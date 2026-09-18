@@ -1,23 +1,6 @@
-"""`buildutil install` — vendor the whole package into a project
-(stdlib-only, pre-venv, like init).
-
-The copy is TRACKED: it lands at <root>/.buildutil/buildutil/ (dot-
-prefixed, so the project's `_*` gitignore rule does not touch it), and
-a `./buildutil` launcher script lands at the repo root — the tool
-travels with the project, and a fresh clone on a system with nothing
-installed runs `./buildutil build` once: the launcher puts .buildutil/
-on PYTHONPATH, the bootstrap brings up the project venv, and every
-invocation after runs through it.
-
-A VENDORED marker file inside the copy carries the version;
-`buildutil --version` and the deposit stamp read it, and `buildutil
-update` sees it and upgrades the COPY in place (same private-index rule
-as a pip update) instead of pip.
-
-Install into a directory with no trace of buildutil also runs init —
-one command from empty directory to buildable project — unless
---no-init says the caller only wants the vendoring.
-"""
+"""`buildutil install` — vendor the package into a project so the tool
+travels with it: a tracked copy at <root>/.buildutil (dot-prefixed, out
+of reach of the project's `_*` gitignore rule) and a root launcher."""
 from __future__ import annotations
 
 import argparse
@@ -31,13 +14,9 @@ VENDOR_PARENT = ".buildutil"
 
 _EXCLUDE_DIRS = {"__pycache__", ".pytest_cache"}
 
-# The repo-root shortcut: `./buildutil build --whatever` from a clone,
-# venv-backed. Order of preference mirrors how a project actually runs:
-# a vendored copy IS the project's buildutil, so it wins over anything
-# installed on the machine; the project venv's interpreter/console
-# script carries the pinned toolchain, so it wins over PATH; python3 is
-# the first-run fallback whose bootstrap creates that venv. sh, not
-# bash — a fresh system promises no more.
+# Order of preference mirrors how a project runs: a vendored copy IS the
+# project's buildutil, the venv carries the pinned toolchain, python3 is
+# the first-run fallback whose bootstrap creates that venv.
 LAUNCHER = """\
 #!/bin/sh
 # buildutil launcher -- written by `buildutil install` / `buildutil init`.
@@ -70,19 +49,15 @@ exec python3 -m buildutil "$@"
 
 
 def write_launcher(root: Path) -> None:
-  """Put the `./buildutil` shortcut at the project root. Never clobbers
-  what isn't ours: a directory there is the pre-0.42 vendored layout
-  (vendor_into migrates it), a file without our marker is the
-  project's own. Our own launcher is content-compared and rewritten,
-  so an old shape heals on the next install/update."""
+  """The `./buildutil` shortcut: a directory there is the pre-0.42 layout
+  (vendor_into migrates it), a foreign file is the project's own."""
   path = root / "buildutil"
   if path.is_dir():
     print(f"  ./buildutil is a directory — launcher not written "
           f"(a pre-0.42 vendored copy? `git rm -r buildutil`, then "
           f"re-run install)")
     return
-  # bytes, not text: the foreign thing squatting on the name may well
-  # be a compiled binary, and identifying it must not crash on decode
+  # the foreign thing on the name may be a binary: never decode it
   existing = path.read_bytes() if path.exists() else None
   if existing is not None and b"buildutil launcher" not in existing[:200]:
     print("  ./buildutil exists and is not our launcher — kept")
@@ -95,13 +70,8 @@ def write_launcher(root: Path) -> None:
 
 
 def _source_version(source: Path) -> str:
-  """The version OF THE TREE BEING VENDORED -- never the running copy's.
-  The two differ exactly when it matters: `update` fetches the NEW
-  version into a scratch dir and vendors from there, and stamping it
-  with the running (old) version would leave a copy lying about itself
-  forever after. A scratch copy carries pip's dist-info beside it; a
-  re-vendored copy carries its own VENDORED marker; only the running
-  package falls back to its own metadata."""
+  """The version OF THE TREE BEING VENDORED — `update` vendors the NEW
+  version out of a scratch dir, and the old stamp would outlive it."""
   marker = source / "VENDORED"
   if marker.is_file():
     return marker.read_text(encoding="utf-8").strip()
@@ -113,11 +83,20 @@ def _source_version(source: Path) -> str:
   return package_version()
 
 
+def _source_origin(source: Path) -> str:
+  """Where the tree being vendored CAME from, so the copy can still be
+  updated once its own dist-info is gone."""
+  from .updatecmd import ORIGIN_STAMP, origin_from_direct_url, recorded_origin
+  stamp = source / ORIGIN_STAMP
+  if stamp.is_file():
+    return stamp.read_text(encoding="utf-8").strip()
+  for record in source.parent.glob("buildutil-*.dist-info/direct_url.json"):
+    return origin_from_direct_url(record.read_text(encoding="utf-8"))
+  return recorded_origin()
+
+
 def _copy_package(root: Path, source: Path) -> Path:
-  """The copy itself: package at `source` to <root>/.buildutil/buildutil
-  with the VENDORED version marker. Shared by the two callers with very
-  different intents — vendor_into (committed, with launcher) and
-  stage_copy (temporary, export-only)."""
+  """The copy itself, stamped with its version and its origin."""
   dst = root / VENDOR_PARENT / "buildutil"
   if dst.exists():
     shutil.rmtree(dst)
@@ -125,24 +104,23 @@ def _copy_package(root: Path, source: Path) -> Path:
   shutil.copytree(
     source, dst,
     ignore=shutil.ignore_patterns(*_EXCLUDE_DIRS))
+  from .updatecmd import ORIGIN_STAMP
   (dst / "VENDORED").write_text(
     _source_version(source) + "\n", encoding="utf-8")
+  origin = _source_origin(source)
+  if origin:
+    (dst / ORIGIN_STAMP).write_text(origin + "\n", encoding="utf-8")
   return dst
 
 
 def stage_copy(root: Path, source: Path = PKG_DIR) -> Path:
-  """The vendored copy ALONE — no launcher, no commit guidance, no
-  legacy migration. `publish --bake-buildutil` stages it around the
-  conan export and discards it after: shipping a self-building package
-  must never force the author to vendor their working tree. Returns
-  the copy's path."""
+  """The copy ALONE, for `publish --bake-buildutil`: shipping a
+  self-building package must not force the author to vendor their tree."""
   return _copy_package(root, source)
 
 
 def discard_staged(dst: Path) -> None:
-  """Undo stage_copy: the copy goes, and an emptied .buildutil/ parent
-  goes with it. A parent holding anything else is left alone — it
-  existed before us."""
+  """Undo stage_copy; a parent holding anything else existed before us."""
   if dst.exists():
     shutil.rmtree(dst)
   parent = dst.parent
@@ -151,10 +129,7 @@ def discard_staged(dst: Path) -> None:
 
 
 def vendor_into(root: Path, source: Path = PKG_DIR) -> Path:
-  """Copy the package at `source` to <root>/.buildutil/buildutil,
-  stamping the version, and (re)write the ./buildutil launcher.
-  Returns the destination. Refuses only the degenerate case: vendoring
-  a copy over itself."""
+  """The tracked copy plus the ./buildutil launcher."""
   dst = root / VENDOR_PARENT / "buildutil"
   if dst.resolve() == source.resolve():
     print("already running the vendored copy at "
@@ -163,11 +138,8 @@ def vendor_into(root: Path, source: Path = PKG_DIR) -> Path:
     return dst
   dst = _copy_package(root, source)
   version = _source_version(source)
-  # pre-0.42 the copy lived at <root>/buildutil — the exact path the
-  # launcher needs. A marker-carrying dir there is ours to retire; when
-  # it IS the source we are running from it, so deleting it under a
-  # live interpreter (whose lazy imports still resolve there) is the
-  # one thing this must not do — hand that step back.
+  # pre-0.42 the copy lived at <root>/buildutil, the launcher's path;
+  # deleting it while running FROM it is the one thing not to do
   legacy = root / "buildutil"
   if (legacy / "VENDORED").is_file():
     if legacy.resolve() == source.resolve():
@@ -200,8 +172,7 @@ def main(argv: list[str]) -> None:
                        "buildutil.toml exists")
   a = ap.parse_args(argv)
 
-  # nearest project root wins -- vendoring belongs beside buildutil.toml,
-  # not wherever cwd happens to be inside the tree
+  # vendoring belongs beside buildutil.toml, not wherever cwd is
   from .updatecmd import project_root
   root = project_root() or Path.cwd()
   had_project = (root / "buildutil.toml").is_file()
