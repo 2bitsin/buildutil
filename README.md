@@ -1254,6 +1254,14 @@ class has its schemes, however many levels of `#include` away it was reached.
 real header is still parsed in place, and an error or a goto-definition in
 class code lands in the file you edit.
 
+A **packaged** project ships the same arrangement, flattened into the one
+include root a package has: `include/<sources-relative>/hello-world.hpp` is
+the detour, the real header sits beside it as `hello-world.detoured.hpp`, and
+`hello-world.reflect.hpp` is beside both. A consumer writes the include it
+always wrote and gets the schemes; a consumer that does not use the reflect
+extension itself still compiles, because the support surface
+(`include/_buildutil/reflect.hpp`) ships too.
+
 ```cpp
 constexpr auto S = reflect::scheme_of<HelloWorld>();
 static_assert(reflect::scheme_size(S) == 2);
@@ -1345,22 +1353,20 @@ the same thing:
 ```toml
 [reflect]
 namespace  = "reflect"   # baked into user source; changing it breaks consumers
-include    = "detour"    # detour | source | module
-scan       = "direct"    # direct | preprocess — force-include modes only
 annotation = "macro"     # macro | attribute — what _Label/_Meta/_Help expand to
 macros     = "auto"      # auto | none | <path to the project's own file>
 ```
 
-`include = source` and `module` are the **deprecated** force-include modes,
-kept one release as an escape hatch. They push the reflect header into each
-`.cpp` (or each target) instead, which is what let a transitively-reached
-scheme go silently absent: `reflected<T>` is a requires-expression, so the
-miss answered *no* rather than failing, the same class instantiated a
-consumer's templates two ways in two TUs, and the linker picked one —
-165 tests green over a shipped binary that rejected its own inherited
-options. `scan` only chooses how those modes map a `.cpp` to its headers:
-`direct` reads its `#include` lines, `preprocess` asks the compiler for the
-transitive closure. The detour needs no mapping at all.
+The detour is the only delivery. `include = "source"` and `include =
+"module"` — which pushed the reflect header into each `.cpp`, or into each
+target — are **gone**, along with the `scan` key that only chose how they
+mapped a `.cpp` to its headers; a project still carrying either is refused
+with a message rather than quietly built the other way. What they could not
+do is deliver a scheme reached *transitively*: `reflected<T>` is a
+requires-expression, so the miss answered *no* rather than failing, the same
+class instantiated a consumer's templates two ways in two translation units,
+and the linker picked one — 165 tests green over a shipped binary that
+rejected its own inherited options.
 
 ### Annotations — what a declaration says beyond its name
 
@@ -1394,6 +1400,14 @@ its text is empty. Without it, the trailing comment wins, with a leading
 comment as fallback. The help tip and the source comment are two different
 things: an author who wants both writes `_Help` and leaves the comment free
 for a developer note. Two help annotations on one declaration are an error.
+
+A **leading** comment is read as help only when it is both immediately above
+the declaration (a blank line detaches it) and **at most three lines** long.
+A design note written above a member is adjacent to it and is not about it,
+and without the second half of that rule a forty-line note rendered verbatim
+under one option on the `--help` screen. A trailing comment has no such cap:
+it starts on the declaration's own line, so what it belongs to was never in
+doubt. For help text longer than three lines, write `_Help("...")`.
 Types do not support `_Help`: `type_scheme` carries only `LABEL` and tags,
 with no `COMMENT`.
 
@@ -1432,8 +1446,19 @@ search paths. Two of them are put back by hand: `-resource-dir` from
 `clang -print-resource-dir` (the builtin headers), and, on macOS,
 `-isysroot` from `SDKROOT` or `xcrun --show-sdk-path`. The second is not
 optional there: libc++ lives *inside* the SDK, and without it `<compare>`,
-`<cstdint>` and the rest resolve to nothing, every tagged type collapses,
-and the failure reads as a missing project include.
+`<cstdint>` and the rest resolve to nothing and every tagged type collapses.
+The parse also gets the consuming module's `COMPILE_DEFINITIONS`, so a
+tagged type behind an `#ifdef` is there for the generator exactly when it is
+there for the compiler.
+
+**The parse runs on the HOST**, whatever the build targets, so a host with no
+C++ toolchain loses every standard header. That is reported as what it is —
+the generator names the standard headers it could not find and says the
+project include path is not the cause — rather than as a missing project
+include, which is what it used to look like.
+
+The scan honours `BUILD_TESTING` and `BUILD_BENCHMARKING`: `buildutil build
+--no-tests` does not parse, gate or generate for headers under `*.test/`.
 
 On the MSVC lanes, reflect targets `x86_64-pc-windows-msvc` with
 `-fms-compatibility -fms-extensions` and explicit system include paths for

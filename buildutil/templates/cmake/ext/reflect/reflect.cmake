@@ -10,12 +10,16 @@
 #       bool verbose{ false };            /* say more */
 #     };
 #
-# and buildutil emits TWO files per tagged header into the generated root:
+# and buildutil emits three files per tagged header into the generated root:
 #
 #   generated/<rel>/x.reflect.hpp   the schemes
-#   generated/<rel>/x.hpp           the DETOUR -- #pragma once, the real
-#                                   header by absolute path, then the
-#                                   schemes
+#   generated/<rel>/x.hpp           the DETOUR -- the real header by absolute
+#                                   path, then the schemes
+#   generated/<rel>/x.package.hpp   the same wrapper for the INSTALLED copy,
+#                                   which has no generated root to hide
+#                                   behind: it ships as include/<rel>/x.hpp
+#                                   and the real header beside it as
+#                                   x.detoured.hpp
 #
 # and puts the generated root AHEAD of sources/ on every include path. So
 # #include "<rel>/x.hpp" -- anywhere, at any depth -- resolves to the detour,
@@ -23,10 +27,6 @@
 # under sources/ is touched, and the real header is still parsed in place, so
 # an error or a goto-definition in class code lands in the file the author
 # edits.
-#
-# The deprecated force-include modes ([reflect] include = source|module)
-# remain one release; a per-TU delivery can silently miss a transitively
-# reached class.
 #
 # What a declaration says about itself beyond its name -- an external LABEL,
 # free-form META tags -- is written either as a real attribute in buildutil's
@@ -49,8 +49,6 @@
 #               closure is a dependency and not just the header itself.
 
 set(_buildutil_reflect_namespace "@REFLECT_NAMESPACE@")
-set(_buildutil_reflect_scan_mode "@REFLECT_SCAN@")
-set(_buildutil_reflect_include_mode "@REFLECT_INCLUDE@")
 set(_buildutil_reflect_annotation "@REFLECT_ANNOTATION@")
 set(_buildutil_reflect_macros "@REFLECT_MACROS@")
 
@@ -92,12 +90,16 @@ endfunction()
 # Called by the scan's generated .cmake, once per tagged header. Recording
 # into globals rather than parsing a manifest in cmake: the python side
 # already knows the answer, so it emits calls instead of data.
-function(_buildutil_reflect_declare header reflect_rel detour_rel users)
+function(_buildutil_reflect_declare header reflect_rel detour_rel
+                                     package_rel installed)
   set_property(GLOBAL APPEND PROPERTY _buildutil_reflect_headers "${header}")
   _buildutil_reflect_key("${header}" key)
   set_property(GLOBAL PROPERTY _buildutil_reflect_rel_${key} "${reflect_rel}")
   set_property(GLOBAL PROPERTY _buildutil_reflect_detour_${key} "${detour_rel}")
-  set_property(GLOBAL PROPERTY _buildutil_reflect_users_${key} "${users}")
+  set_property(GLOBAL PROPERTY _buildutil_reflect_package_${key}
+               "${package_rel}")
+  set_property(GLOBAL PROPERTY _buildutil_reflect_installed_${key}
+               "${installed}")
 endfunction()
 
 function(_buildutil_reflect_python out_env out_exe)
@@ -111,6 +113,14 @@ function(_buildutil_reflect_python out_env out_exe)
   endif()
   set(${out_env} "PYTHONPATH=${pypath}" PARENT_SCOPE)
   set(${out_exe} "${Python3_EXECUTABLE}" PARENT_SCOPE)
+endfunction()
+
+function(_buildutil_reflect_kind_state variable out)
+  if(DEFINED ${variable})
+    set(${out} "${${variable}}" PARENT_SCOPE)
+  else()
+    set(${out} "ON" PARENT_SCOPE)
+  endif()
 endfunction()
 
 function(_buildutil_reflect_std out)
@@ -128,6 +138,12 @@ function(_buildutil_ext_pre_scan)
   set(declarations "${CMAKE_BINARY_DIR}/_buildutil-reflect.cmake")
   _buildutil_reflect_python(env exe)
   _buildutil_reflect_macro_path(macros)
+  # `buildutil build --no-tests` is -DBUILD_TESTING=OFF, and a scan that
+  # ignored it parsed and gated the headers of suites this build was told
+  # not to build. Defaulted here rather than in the scan, because an
+  # undefined variable is cmake's "yes" and argparse's "".
+  _buildutil_reflect_kind_state(BUILD_TESTING tests)
+  _buildutil_reflect_kind_state(BUILD_BENCHMARKING benches)
 
   execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env "${env}"
@@ -137,11 +153,10 @@ function(_buildutil_ext_pre_scan)
             --generated "${generated}"
             --out "${declarations}"
             --namespace "${_buildutil_reflect_namespace}"
-            --scan "${_buildutil_reflect_scan_mode}"
-            --include "${_buildutil_reflect_include_mode}"
             --annotation "${_buildutil_reflect_annotation}"
             --macros "${macros}"
-            --compiler "${CMAKE_CXX_COMPILER}"
+            --tests "${tests}"
+            --benches "${benches}"
     RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE errors)
   if(NOT result EQUAL 0)
     message(FATAL_ERROR
@@ -181,25 +196,14 @@ function(_buildutil_ext_pre_scan)
     return()
   endif()
 
-  if(_buildutil_reflect_include_mode STREQUAL "detour")
-    # The whole delivery mechanism, in one line: the generated root goes in
-    # FRONT of everything, so <rel>/x.hpp finds the detour and not the real
-    # header. At DIRECTORY scope from sources/ rather than per target,
-    # because a target's include path STARTS with its directory's -- which
-    # is the only way to also get in front of the roots a test or bench
-    # executable restates for itself when it links nothing (see the
-    # MODULE_LIBRARY branch in buildutil.cmake).
-    include_directories(BEFORE "${generated}")
-  else()
-    # WARNING and not DEPRECATION: message(DEPRECATION) prints nothing
-    # unless CMAKE_WARN_DEPRECATED is on, and a deprecation nobody is shown
-    # is not one.
-    message(WARNING
-      "buildutil reflect: [reflect] include = \"${_buildutil_reflect_include_mode}\" "
-      "is the force-include path, which cannot deliver a scheme reached "
-      "transitively. Drop the key to take the "
-      "default \"detour\"; this mode goes away next release.")
-  endif()
+  # The whole delivery mechanism, in one line: the generated root goes in
+  # FRONT of everything, so <rel>/x.hpp finds the detour and not the real
+  # header. At DIRECTORY scope from sources/ rather than per target, because
+  # a target's include path STARTS with its directory's -- which is the only
+  # way to also get in front of the roots a test or bench executable restates
+  # for itself when it links nothing (see the MODULE_LIBRARY branch in
+  # buildutil.cmake).
+  include_directories(BEFORE "${generated}")
 
   # Every command is created HERE, in one directory, rather than in each
   # module: add_custom_command(OUTPUT) needs no target, only a consumer, and
@@ -221,11 +225,14 @@ function(_buildutil_ext_pre_scan)
     list(APPEND outputs "${generated}/${rel}")
     set_source_files_properties("${generated}/${rel}"
                                 PROPERTIES GENERATED TRUE)
-    if(detour)
-      list(APPEND outputs "${generated}/${detour}")
-      set_source_files_properties("${generated}/${detour}"
-                                  PROPERTIES GENERATED TRUE)
-    endif()
+    get_property(package GLOBAL PROPERTY _buildutil_reflect_package_${key})
+    foreach(extra IN ITEMS "${detour}" "${package}")
+      if(extra)
+        list(APPEND outputs "${generated}/${extra}")
+        set_source_files_properties("${generated}/${extra}"
+                                    PROPERTIES GENERATED TRUE)
+      endif()
+    endforeach()
   endforeach()
 
   # Same DEFER argument trap as _buildutil_reflect_whole_module below: a
@@ -313,6 +320,52 @@ function(_buildutil_reflect_include_flags libs out)
   set(${out} "${flags}" PARENT_SCOPE)
 endfunction()
 
+# The macro state of a target, as --define arguments. Same genex-and-JOIN
+# shape as the include path above, and read at generate time for the same
+# reason: the evaluated property also carries the INTERFACE definitions of
+# everything the target links.
+function(_buildutil_reflect_define_flags libs out)
+  set(flags "")
+  foreach(lib IN LISTS libs)
+    if(NOT TARGET ${lib})
+      continue()
+    endif()
+    set(defs "$<TARGET_PROPERTY:${lib},COMPILE_DEFINITIONS>")
+    list(APPEND flags
+      "$<$<BOOL:${defs}>:--define\;$<JOIN:${defs},\;--define\;>>")
+  endforeach()
+  set(${out} "${flags}" PARENT_SCOPE)
+endfunction()
+
+# The same macro state where a project spelled it as an OPTION instead --
+# target_compile_options(lib PRIVATE -DFOO=1), which lands in a different
+# property and reaches the compiler just the same.
+#
+# Read RAW, so an entry that is itself a generator expression can be seen and
+# skipped: nothing can inspect one before generate time, and this list is
+# built while targets are still being described. Only the macro forms travel.
+# A warning or error flag is not macro state, and forwarding one would turn a
+# parse whose diagnostics exist to explain a shortfall into a lint.
+function(_buildutil_reflect_option_defines libs out)
+  set(flags "")
+  foreach(lib IN LISTS libs)
+    if(NOT TARGET ${lib})
+      continue()
+    endif()
+    get_target_property(options ${lib} COMPILE_OPTIONS)
+    foreach(option IN LISTS options)
+      if(option MATCHES "\\$<")
+        continue()
+      elseif(option MATCHES "^[-/]D(.+)$")
+        list(APPEND flags --define "${CMAKE_MATCH_1}")
+      elseif(option MATCHES "^[-/]U(.+)$")
+        list(APPEND flags --undefine "${CMAKE_MATCH_1}")
+      endif()
+    endforeach()
+  endforeach()
+  set(${out} "${flags}" PARENT_SCOPE)
+endfunction()
+
 # Deferred to the end of the sources directory: every module CMakeLists has
 # run by now, so every module target and every Link_dependencies() edge that
 # feeds an include path exists.
@@ -351,15 +404,19 @@ function(_buildutil_reflect_emit_commands)
 
     _buildutil_reflect_owner("${header_abs}" owners)
     _buildutil_reflect_include_flags("${owners}" inherited)
+    _buildutil_reflect_define_flags("${owners}" defined)
+    _buildutil_reflect_option_defines("${owners}" defined_as_options)
 
-    # Both files come out of ONE parse. A second rule for the detour would
-    # buy nothing -- its content is derived from paths alone -- and would
-    # cost a second python start per header.
+    # All three files come out of ONE parse. A second rule for the two
+    # wrappers would buy nothing -- their content is derived from paths
+    # alone -- and would cost a second python start per header.
+    get_property(package_rel GLOBAL PROPERTY _buildutil_reflect_package_${key})
     set(detour_args "")
     set(detour_out "")
     if(detour_rel)
-      set(detour_out "${generated}/${detour_rel}")
-      set(detour_args --detour "${detour_out}"
+      set(detour_out "${generated}/${detour_rel}" "${generated}/${package_rel}")
+      set(detour_args --detour "${generated}/${detour_rel}"
+                      --package "${generated}/${package_rel}"
                       --sources "${CMAKE_SOURCE_DIR}/sources")
     endif()
 
@@ -381,7 +438,7 @@ function(_buildutil_reflect_emit_commands)
               --include-spelling "${spelling}"
               --include-dir "${CMAKE_SOURCE_DIR}/sources"
               --include-dir "${generated}"
-              ${inherited}
+              ${inherited} ${defined} ${defined_as_options}
       DEPENDS "${header_abs}" ${macro_dep}
       DEPFILE "${output}.d"
       COMMENT "reflect ${spelling}"
@@ -415,99 +472,63 @@ function(_buildutil_ext_module lib target)
   _buildutil_reflect_key("${CMAKE_CURRENT_SOURCE_DIR}" owner)
   set_property(GLOBAL PROPERTY _buildutil_reflect_dirlib_${owner} "${lib}")
 
-  if(_buildutil_reflect_include_mode STREQUAL "detour")
-    # Nothing to place. The header the TU already includes carries its own
-    # schemes, so there is no per-TU flag, no .cpp -> header mapping, and
-    # nothing here that can be got wrong for one translation unit and right
-    # for the next. That absence IS the fix.
-    return()
-  endif()
-
-  if(_buildutil_reflect_include_mode STREQUAL "module")
-    # Deferred: Link_dependencies() runs AFTER Init_submodule() in a module's
-    # CMakeLists, so the dependency edges this mode needs do not exist yet.
-    #
-    # The call takes no arguments and the state rides globals, because a
-    # DEFERred call's arguments expand in the DEFERRED scope -- where a
-    # function local like ${lib} is simply empty. Same rule the component
-    # manifest writer follows.
-    _buildutil_reflect_key("${CMAKE_CURRENT_SOURCE_DIR}" here)
-    set_property(GLOBAL PROPERTY _buildutil_reflect_lib_${here} "${lib}")
-    set_property(GLOBAL PROPERTY _buildutil_reflect_target_${here} "${target}")
-    cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-                   CALL _buildutil_reflect_whole_module)
-  else()
-    _buildutil_reflect_per_source()
-  endif()
+  # Nothing to place: the header the TU already includes carries its own
+  # schemes, so there is no per-TU flag and no .cpp -> header mapping that
+  # can be got wrong for one translation unit and right for the next.
+  #
+  # DEFERred because this hook runs BEFORE the module's own header install
+  # and the last rule to write a name is the one that survives: the detour
+  # has to be that rule.
+  cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                 CALL _buildutil_reflect_install)
 endfunction()
 
-function(_buildutil_reflect_forced rel out)
-  if(MSVC)
-    set(${out} "/FI${rel}" PARENT_SCOPE)
-  else()
-    set(${out} "-include" "${rel}" PARENT_SCOPE)
-  endif()
-endfunction()
+# --- phase 3: what ships ----------------------------------------------------
 
-# include = source: DEPRECATED. Each .cpp is force-included with exactly the
-# reflect headers it asked for; a header reached only transitively is
-# silently missed. Kept one release for a project that
-# cannot move yet.
-function(_buildutil_reflect_per_source)
-  get_property(headers GLOBAL PROPERTY _buildutil_reflect_headers)
-  foreach(header IN LISTS headers)
-    _buildutil_reflect_key("${header}" key)
-    get_property(rel GLOBAL PROPERTY _buildutil_reflect_rel_${key})
-    get_property(users GLOBAL PROPERTY _buildutil_reflect_users_${key})
-    _buildutil_reflect_forced("${rel}" flag)
-    foreach(user IN LISTS users)
-      set(user_abs "${CMAKE_SOURCE_DIR}/${user}")
-      # Source properties are directory-scoped, and a module's sources all
-      # live in its own directory (its *.test/ subtree included -- those are
-      # globbed, not add_subdirectory'd), so setting them from here is right.
-      string(FIND "${user_abs}" "${CMAKE_CURRENT_SOURCE_DIR}/" at)
-      if(at EQUAL 0)
-        set_property(SOURCE "${user_abs}" APPEND PROPERTY
-                     COMPILE_OPTIONS ${flag})
-      endif()
-    endforeach()
+# A generated artifact ships where the header it shadows ships, and nowhere
+# else -- the module's header install skips a private `_*` name, a *.test/ or
+# *.bench/ subtree, data directories and dot directories, so this skips the
+# same ones.
+function(_buildutil_reflect_exported rel out)
+  string(REPLACE "/" ";" parts "${rel}")
+  foreach(part IN LISTS parts)
+    if(part MATCHES "^[_.]"
+       OR part MATCHES "\\.(test|bench|install|embed)(\\.|$)")
+      set(${out} FALSE PARENT_SCOPE)
+      return()
+    endif()
   endforeach()
+  set(${out} TRUE PARENT_SCOPE)
 endfunction()
 
-# include = module: DEPRECATED. Every TU of the module gets every reflect
-# header of the module and of the modules it links. No mapping needed, and
-# nothing is missed WITHIN the closure of modules a target links -- but a
-# header travelling further than that still arrives bare, and the cost in
-# the meantime is that every TU parses reflect headers it never uses.
-function(_buildutil_reflect_whole_module)
-  _buildutil_reflect_key("${CMAKE_CURRENT_SOURCE_DIR}" here)
-  get_property(lib GLOBAL PROPERTY _buildutil_reflect_lib_${here})
-  get_property(target GLOBAL PROPERTY _buildutil_reflect_target_${here})
-  if(NOT lib)
-    return()
-  endif()
-  set(wanted "${CMAKE_CURRENT_SOURCE_DIR}")
-  get_property(needs GLOBAL PROPERTY _buildutil_cmp_needs_${target})
-  foreach(need IN LISTS needs)
-    list(APPEND wanted "${CMAKE_SOURCE_DIR}/sources/${need}")
-  endforeach()
-
+# The installed layout, per header of THIS module: the schemes beside the
+# header, the header itself under the name the packaged wrapper reaches it
+# by, and the wrapper at the header's own spelling -- so one #include reaches
+# the schemes in a consumer exactly as it does in-tree.
+function(_buildutil_reflect_install)
   get_property(headers GLOBAL PROPERTY _buildutil_reflect_headers)
-  set(flags "")
+  get_property(generated GLOBAL PROPERTY _buildutil_reflect_generated)
   foreach(header IN LISTS headers)
     set(header_abs "${CMAKE_SOURCE_DIR}/${header}")
-    foreach(dir IN LISTS wanted)
-      string(FIND "${header_abs}" "${dir}/" at)
-      if(at EQUAL 0)
-        _buildutil_reflect_key("${header}" key)
-        get_property(rel GLOBAL PROPERTY _buildutil_reflect_rel_${key})
-        _buildutil_reflect_forced("${rel}" flag)
-        list(APPEND flags ${flag})
-        break()
-      endif()
-    endforeach()
+    string(FIND "${header_abs}" "${CMAKE_CURRENT_SOURCE_DIR}/" at)
+    if(NOT at EQUAL 0)
+      continue()
+    endif()
+    file(RELATIVE_PATH rel "${CMAKE_SOURCE_DIR}/sources" "${header_abs}")
+    _buildutil_reflect_exported("${rel}" exported)
+    if(NOT exported)
+      continue()
+    endif()
+    _buildutil_reflect_key("${header}" key)
+    get_property(schemes GLOBAL PROPERTY _buildutil_reflect_rel_${key})
+    get_property(package GLOBAL PROPERTY _buildutil_reflect_package_${key})
+    get_property(installed GLOBAL PROPERTY _buildutil_reflect_installed_${key})
+    get_filename_component(dir "${rel}" DIRECTORY)
+    get_filename_component(name "${rel}" NAME)
+    install(FILES "${generated}/${schemes}" DESTINATION "include/${dir}")
+    install(FILES "${header_abs}" DESTINATION "include/${dir}"
+            RENAME "${installed}")
+    install(FILES "${generated}/${package}" DESTINATION "include/${dir}"
+            RENAME "${name}")
   endforeach()
-  if(flags)
-    target_compile_options(${lib} PRIVATE ${flags})
-  endif()
 endfunction()

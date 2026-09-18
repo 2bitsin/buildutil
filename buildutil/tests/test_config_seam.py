@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 PKG_PARENT = str(Path(__file__).resolve().parents[2])
 
 PROBE = (
@@ -15,7 +17,7 @@ PROBE = (
   "print(json.dumps({'root': str(c.REPO_ROOT), 'have': c.HAVE_PROJECT,"
   " 'name': c.PROJECT_NAME, 'cmake': c.CMAKE_PREFIX,"
   " 'mod': c.MODULE_DEFINE_PREFIX, 'deps': c.VENV_DEPS,"
-  " 'bridges': c.PROJECT['coverage_bridge_dirs'], 'bench': c.PROJECT['bench_suite'], 'copts': c.PROJECT['conan_options_os'], 'cconf': c.PROJECT['conan_conf'], 'covx': c.PROJECT['coverage_exclude'], 'export': c.PROJECT['export_module_headers'], 'dormant': c.PROJECT['modules_dormant'], 'rns': c.PROJECT['reflect_namespace'], 'rscan': c.PROJECT['reflect_scan'], 'rinc': c.PROJECT['reflect_include'], 'rann': c.PROJECT['reflect_annotation'], 'rmac': c.PROJECT['reflect_macros']}))"
+  " 'bridges': c.PROJECT['coverage_bridge_dirs'], 'bench': c.PROJECT['bench_suite'], 'copts': c.PROJECT['conan_options_os'], 'cconf': c.PROJECT['conan_conf'], 'covx': c.PROJECT['coverage_exclude'], 'export': c.PROJECT['export_module_headers'], 'dormant': c.PROJECT['modules_dormant'], 'rns': c.PROJECT['reflect_namespace'], 'rann': c.PROJECT['reflect_annotation'], 'rmac': c.PROJECT['reflect_macros']}))"
 )
 
 
@@ -23,9 +25,12 @@ def _probe(cwd, env_extra=None):
   env = {**os.environ, "PYTHONPATH": PKG_PARENT, **(env_extra or {})}
   env.pop("BUILDUTIL_ROOT", None) if not (env_extra or {}).get(
     "BUILDUTIL_ROOT") else None
-  out = subprocess.check_output(
-    [sys.executable, "-c", PROBE], cwd=cwd, env=env, text=True)
-  return json.loads(out)
+  out = subprocess.run([sys.executable, "-c", PROBE], cwd=cwd, env=env,
+                       text=True, capture_output=True)
+  if out.returncode:
+    raise subprocess.CalledProcessError(
+      out.returncode, PROBE, out.stdout, out.stderr)
+  return json.loads(out.stdout)
 
 
 def test_root_is_nearest_ancestor_with_toml(tmp_path):
@@ -125,3 +130,22 @@ def test_the_reflect_annotation_switch_is_project_policy(tmp_path):
   got = _probe(tmp_path)
   assert got["rann"] == "attribute"
   assert got["rmac"] == "sources/labels.hpp"
+
+
+def test_a_removed_reflect_include_mode_is_refused(tmp_path):
+  # the force-include modes warned for a release that they were going away;
+  # a project still pinned to one must be told, not silently built the other
+  # way
+  (tmp_path / "buildutil.toml").write_text(
+    '[cmake]\nextensions = ["reflect"]\n[reflect]\ninclude = "source"\n')
+  with pytest.raises(subprocess.CalledProcessError) as refused:
+    _probe(tmp_path)
+  assert "include" in refused.value.stderr
+
+
+def test_the_scan_key_that_only_served_them_is_refused_too(tmp_path):
+  (tmp_path / "buildutil.toml").write_text(
+    '[cmake]\nextensions = ["reflect"]\n[reflect]\nscan = "preprocess"\n')
+  with pytest.raises(subprocess.CalledProcessError) as refused:
+    _probe(tmp_path)
+  assert "scan" in refused.value.stderr

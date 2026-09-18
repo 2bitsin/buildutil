@@ -316,28 +316,6 @@ def _tree(tmp_path):
   return sources, module, header
 
 
-def test_a_qualified_include_maps_a_source_to_its_header(tmp_path):
-  sources, module, header = _tree(tmp_path)
-  user = module / "user.cpp"
-  user.write_text('#include <demo/thing/thing.hpp>\n')
-  mapping = reflect.sources_needing([user], [header], sources)
-  assert mapping == {user: [header]}
-
-
-def test_a_quoted_sibling_include_maps_too(tmp_path):
-  sources, module, header = _tree(tmp_path)
-  user = module / "user.cpp"
-  user.write_text('#include "thing.hpp"\n')
-  assert reflect.sources_needing([user], [header], sources) == {user: [header]}
-
-
-def test_a_source_that_includes_nothing_reflected_is_left_alone(tmp_path):
-  sources, module, header = _tree(tmp_path)
-  bystander = module / "bystander.cpp"
-  bystander.write_text("#include <string>\nint f() { return 0; }\n")
-  assert reflect.sources_needing([bystander], [header], sources) == {}
-
-
 # --- comments ---------------------------------------------------------------
 
 def test_a_trailing_block_comment_loses_its_markers():
@@ -516,25 +494,15 @@ def test_generated_code_is_fully_qualified():
 
 
 def test_declarations_are_cmake_calls_not_data(tmp_path):
+  # every path the extension needs, worked out on this side: the schemes,
+  # the in-tree detour, the wrapper that ships, and the name the real header
+  # takes once the wrapper has its spelling
   sources, module, header = _tree(tmp_path)
-  user = module / "user.cpp"
-  user.write_text('#include "thing.hpp"\n')
-  text = reflect.declarations([header], sources, tmp_path, {user: [header]},
-                              detours=False)
+  text = reflect.declarations([header], sources, tmp_path)
   assert '_buildutil_reflect_declare("sources/demo/thing/thing.hpp" ' \
          '"demo/thing/thing.reflect.hpp" ' \
-         '"" "sources/demo/thing/user.cpp")' in text
-
-
-def test_the_declaration_names_the_detour_and_no_users(tmp_path):
-  # The detour needs no .cpp -> header mapping, so the users field that the
-  # force-include path lives on is simply empty -- there is nothing to
-  # place, per TU or otherwise.
-  sources, module, header = _tree(tmp_path)
-  text = reflect.declarations([header], sources, tmp_path, {})
-  assert '_buildutil_reflect_declare("sources/demo/thing/thing.hpp" ' \
-         '"demo/thing/thing.reflect.hpp" ' \
-         '"demo/thing/thing.hpp" "")' in text
+         '"demo/thing/thing.hpp" "demo/thing/thing.package.hpp" ' \
+         '"thing.detoured.hpp")' in text
 
 
 # --- what the generated root stops owning -----------------------------------
@@ -555,11 +523,12 @@ def _generated(root: Path, *paths: str) -> Path:
 def test_the_manifest_records_what_the_scan_owns(tmp_path):
   sources, module, header = _tree(tmp_path)
   where = tmp_path / "generated"
-  reflect.prune(where, reflect.owned([header], sources, detours=True))
+  reflect.prune(where, reflect.owned([header], sources))
   assert (where / reflect.MANIFEST).read_text().split() == [
     "_buildutil/reflect-macros.hpp",
     "_buildutil/reflect.hpp",
     "demo/thing/thing.hpp",
+    "demo/thing/thing.package.hpp",
     "demo/thing/thing.reflect.hpp",
     "demo/thing/thing.reflect.hpp.d"]
 
@@ -568,11 +537,11 @@ def test_a_file_the_scan_no_longer_owns_is_removed(tmp_path):
   sources, module, header = _tree(tmp_path)
   where = _generated(tmp_path, "demo/thing/thing.reflect.hpp",
                      "demo/thing/thing.reflect.hpp.d", "demo/thing/thing.hpp")
-  reflect.prune(where, reflect.owned([header], sources, detours=True))
+  reflect.prune(where, reflect.owned([header], sources))
 
   # the header is renamed, deleted or untagged: it is out of the scan, and
   # so is everything that was generated from it
-  gone = reflect.prune(where, reflect.owned([], sources, detours=True))
+  gone = reflect.prune(where, reflect.owned([], sources))
   assert sorted(gone) == ["demo/thing/thing.hpp",
                           "demo/thing/thing.reflect.hpp",
                           "demo/thing/thing.reflect.hpp.d"]
@@ -584,8 +553,8 @@ def test_what_another_generator_wrote_is_left_alone(tmp_path):
   # so ownership is read from the manifest and never inferred from the tree
   sources, module, header = _tree(tmp_path)
   where = _generated(tmp_path, "demo/thing/theirs.hpp")
-  reflect.prune(where, reflect.owned([header], sources, detours=True))
-  reflect.prune(where, reflect.owned([], sources, detours=True))
+  reflect.prune(where, reflect.owned([header], sources))
+  reflect.prune(where, reflect.owned([], sources))
   assert (where / "demo" / "thing" / "theirs.hpp").is_file()
 
 
@@ -599,7 +568,7 @@ def test_before_there_is_a_manifest_the_two_known_shapes_still_go(tmp_path):
   (where / "demo" / "old" / "x.hpp").write_text(
     reflect.detour(sources / "demo" / "old" / "x.hpp", sources))
 
-  gone = reflect.prune(where, reflect.owned([header], sources, detours=True))
+  gone = reflect.prune(where, reflect.owned([header], sources))
   assert sorted(gone) == ["demo/old/x.hpp", "demo/old/x.reflect.hpp",
                           "demo/old/x.reflect.hpp.d"]
   assert (where / "demo" / "other" / "theirs.hpp").is_file()
@@ -1085,6 +1054,74 @@ def test_the_message_says_where_to_look_when_clang_said_nothing():
   assert "another header" in text
 
 
+# --- a build told to skip tests skips their headers too ---------------------
+# `buildutil build --no-tests` sets BUILD_TESTING=OFF, and the scan honoured
+# nothing about it: a *.test/ header was parsed, gated and generated for by a
+# build that was told not to build tests at all.
+
+def _with_a_test_header(tmp_path):
+  sources, module, header = _tree(tmp_path)
+  unit = module / "unit.test"
+  unit.mkdir()
+  fixture = unit / "fixture.hpp"
+  fixture.write_text(
+    "struct F { friend constexpr auto reflect_scheme(F*); };")
+  return sources, header, fixture
+
+
+def test_a_test_directory_header_is_scanned_when_tests_are_on(tmp_path):
+  sources, header, fixture = _with_a_test_header(tmp_path)
+  assert reflect.tagged_headers(sources) == sorted([header, fixture])
+
+
+def test_a_test_directory_header_is_not_scanned_when_they_are_off(tmp_path):
+  sources, header, fixture = _with_a_test_header(tmp_path)
+  assert reflect.tagged_headers(sources, (".test",)) == [header]
+
+
+def test_cmake_truth_reads_the_spellings_cmake_writes():
+  for on in ("ON", "on", "1", "TRUE", "YES", "y"):
+    assert reflect.cmake_flag(on)
+  for off in ("", "OFF", "0", "NO", "FALSE", "N", "IGNORE", "Boost-NOTFOUND"):
+    assert not reflect.cmake_flag(off)
+
+
+# --- a missing host toolchain is not a missing project include dir ----------
+# The generator parses on the HOST whatever the build targets, so a cross
+# image with no host libstdc++ loses every standard header -- and the advice
+# used to point at the project include path, which in that case is complete
+# and correct. That misdirection cost a full CI investigation.
+
+def test_a_standard_header_miss_is_read_as_a_toolchain_shortfall():
+  assert reflect.standard_headers_missing([
+    "command.hpp:15:10: error: 'compare' file not found",
+    "command.hpp:16:10: error: 'stdint.h' file not found"]) == [
+      "compare", "stdint.h"]
+
+
+def test_a_project_header_miss_is_not_read_as_one():
+  # a project header is spelled sources-relative and carries a suffix; the
+  # standard library is the only thing that is neither
+  assert reflect.standard_headers_missing([
+    "thing.hpp:2:10: error: 'vendor/marker.hpp' file not found",
+    "thing.hpp:3:10: error: 'marker.hpp' file not found",
+    "thing.hpp:4:1: warning: something else entirely"]) == []
+
+
+def test_the_message_names_the_toolchain_and_stops_blaming_the_includes():
+  text = reflect.shortfall_message(
+    Path("/x/sources/near/command.hpp"),
+    promised=["PrintVersion"], emitted=[], missing=["PrintVersion"],
+    includes=["/x/sources", "/x/b/generated"],
+    said=["command.hpp:15:10: error: 'compare' file not found"])
+  assert "C++ standard library" in text and "compare" in text
+  assert "on the HOST" in text
+  # the project include path is complete and correct here: not the cause,
+  # and not the thing to send a reader off to check
+  assert "directory the generator was not given" not in text
+  assert "/x/b/generated" not in text
+
+
 # --- the generate step's include path ---------------------------------------
 
 def _rendered(tmp_path) -> str:
@@ -1399,9 +1436,9 @@ def test_an_unreadable_file_names_itself(tmp_path):
 def test_the_scan_owns_the_macro_header_and_only_when_it_writes_one(tmp_path):
   sources, module, header = _tree(tmp_path)
   assert "_buildutil/reflect-macros.hpp" in reflect.owned(
-    [header], sources, detours=True)
+    [header], sources)
   assert "_buildutil/reflect-macros.hpp" not in reflect.owned(
-    [header], sources, detours=True, macros=reflect.macro_source("none"))
+    [header], sources, reflect.macro_source("none"))
 
 
 # --- the support types the tags land in -------------------------------------
@@ -1641,6 +1678,16 @@ def test_parse_args_carries_the_sysroot_only_when_there_is_one():
   assert reflect.parse_args("c++20", ["/inc"], None) == without
 
 
+def test_parse_args_carries_the_modules_macro_state():
+  args = reflect.parse_args("c++23", ["/inc"], None, None, None,
+                            ["FEATURE=1", "PLAIN"], ["OFF"])
+  assert "-DFEATURE=1" in args and "-DPLAIN" in args and "-UOFF" in args
+  # before the include dirs, so a guarded #include is guarded the same way
+  assert args.index("-DFEATURE=1") < args.index("-I/inc")
+  assert reflect.parse_args("c++23", ["/inc"], None) == \
+    reflect.parse_args("c++23", ["/inc"], None, None, None, [], [])
+
+
 @pytest.mark.parametrize("spelling", [
   '_Help(tip)', '_Help("tip")', '[[buildutil::help("tip")]]'])
 def test_help_is_read_in_both_spellings(spelling):
@@ -1732,3 +1779,39 @@ def test_generate_reports_a_missing_clang_in_one_line(monkeypatch, tmp_path, cap
   assert reflect._cmd_generate(opts) == 1
   assert "apt install clang" in capsys.readouterr().err
   assert not (tmp_path / "x.reflect.hpp").exists()
+
+
+# --- the depfile ------------------------------------------------------------
+# Ninja reads a depfile as make syntax: an unescaped space SEPARATES two
+# paths, so a checkout under `C:\Users\First Last\` silently yields two
+# dependencies, both wrong, and the reflect file stops being invalidated by
+# the header it was generated from. No runner in the fleet has a space in its
+# paths, so nothing else here would ever notice.
+
+def _includes(*names) -> SimpleNamespace:
+  found = [SimpleNamespace(include=SimpleNamespace(name=str(name)))
+           for name in names]
+  return SimpleNamespace(get_includes=lambda: found)
+
+
+def _entries(text: str) -> list[str]:
+  """Every path in a depfile, with the line continuations taken out, so a
+  stray space shows up as a split rather than as a character."""
+  return [line.strip() for line in text.replace(" \\\n", "\n").splitlines()]
+
+
+def test_a_depfile_escapes_a_space_rather_than_splitting_on_it(tmp_path):
+  header = tmp_path / "My Project" / "thing.hpp"
+  output = tmp_path / "My Build" / "thing.reflect.hpp"
+  text = reflect.depfile(output, _includes(header.parent / "other one.hpp"),
+                         header)
+  for entry in _entries(text):
+    assert entry.count(" ") == entry.count("\\ "), entry
+  assert "My\\ Project" in text and "other\\ one.hpp" in text
+  assert "My\\ Build" in text
+
+
+def test_a_depfile_escapes_what_else_make_syntax_claims(tmp_path):
+  header = tmp_path / "a#b" / "c$d.hpp"
+  text = reflect.depfile(tmp_path / "out.reflect.hpp", _includes(), header)
+  assert "a\\#b" in text and "c$$d.hpp" in text

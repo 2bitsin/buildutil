@@ -184,6 +184,19 @@ def require_project() -> Path:
   return REPO_ROOT
 
 
+# Keys a project may still be carrying that no longer mean anything. Refused
+# rather than ignored: the modes they configured warned for a release that
+# they were going away, and a clone that silently built the other way is the
+# failure [reflect] is committed to the repo to prevent.
+REMOVED_REFLECT_KEYS = {
+  "include": "the detour is the only delivery; the force-include modes "
+             "could not deliver a scheme reached transitively. "
+             "Drop the key.",
+  "scan": "it only chose how the force-include modes mapped a .cpp to its "
+          "headers, and the detour needs no mapping. Drop the key.",
+}
+
+
 def _load_project() -> dict:
   """buildutil.toml, flattened over the defaults. tomllib is the price
   of the seam: stdlib since 3.11, and the guard here beats a stack
@@ -219,8 +232,6 @@ def _load_project() -> dict:
     "runtime_dirs": [],          # [runtime] dirs: repo-relative payload
     "bundle_macos": {},          # [bundle.macos]
     "reflect_namespace": "reflect",  # [reflect] namespace
-    "reflect_scan": "direct",        # [reflect] scan: direct|preprocess
-    "reflect_include": "detour",     # [reflect] include: detour|source|module
     "reflect_annotation": "macro",   # [reflect] annotation: macro|attribute
     "reflect_macros": "auto",        # [reflect] macros: auto|none|<path>
   }
@@ -245,13 +256,14 @@ def _load_project() -> dict:
     raw.get("cmake", {}).get("extensions", []))
   cfg["export_module_headers"] = bool(
     raw.get("cmake", {}).get("export_module_headers", False))
-  # [reflect] is project POLICY, not a local preference: a project pinned to
-  # a deprecated force-include mode must carry that fact in the repo, or a
-  # fresh clone quietly builds something else.
+  # [reflect] is project POLICY, not a local preference: a fresh clone that
+  # quietly built something else is the failure this table prevents.
   reflect = raw.get("reflect", {})
+  for gone, why in REMOVED_REFLECT_KEYS.items():
+    if gone in reflect:
+      sys.exit("buildutil.toml: [reflect] {} was removed -- {}".format(
+        gone, why))
   cfg["reflect_namespace"] = str(reflect.get("namespace", "reflect"))
-  cfg["reflect_scan"] = str(reflect.get("scan", "direct"))
-  cfg["reflect_include"] = str(reflect.get("include", "detour"))
   cfg["reflect_annotation"] = str(reflect.get("annotation", "macro"))
   cfg["reflect_macros"] = str(reflect.get("macros", "auto"))
   cfg["modules_dormant"] = list(raw.get("modules", {}).get("dormant", []))

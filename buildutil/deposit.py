@@ -100,8 +100,6 @@ def _render(src: Path, cfg: dict, version: str,
     .replace("@PLATFORM_TAGS@", naming.platform_alternation())
     .replace("@EXTENSIONS@", extensions)
     .replace("@REFLECT_NAMESPACE@", cfg.get("reflect_namespace") or "reflect")
-    .replace("@REFLECT_SCAN@", cfg.get("reflect_scan") or "direct")
-    .replace("@REFLECT_INCLUDE@", cfg.get("reflect_include") or "detour")
     .replace("@REFLECT_ANNOTATION@", cfg.get("reflect_annotation") or "macro")
     .replace("@REFLECT_MACROS@", cfg.get("reflect_macros") or "auto")
     .replace("@RESOURCE_NAMESPACE@", _resource_namespace(cfg))

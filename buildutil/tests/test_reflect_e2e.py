@@ -320,19 +320,19 @@ def _tree(root: Path, *, extension: bool = True, reflect_cfg: dict = None):
   return root
 
 
-def _configure(root: Path) -> subprocess.CompletedProcess:
+def _configure(root: Path, *extra: str) -> subprocess.CompletedProcess:
   import sys
   return subprocess.run(
     ["cmake", "-S", str(root), "-B", str(root / "b"), "-G", "Ninja",
      "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
      f"-DPython3_EXECUTABLE={sys.executable}",
      f"-DBUILDUTIL_PYSUPPORT={PYSUPPORT}",
-     f"-DBUILDUTIL_PYPATH={PYPATH}"],
+     f"-DBUILDUTIL_PYPATH={PYPATH}", *extra],
     capture_output=True, text=True)
 
 
-def _build(root: Path) -> subprocess.CompletedProcess:
-  done = _configure(root)
+def _build(root: Path, *extra: str) -> subprocess.CompletedProcess:
+  done = _configure(root, *extra)
   assert done.returncode == 0, done.stdout + done.stderr
   return subprocess.run(["cmake", "--build", str(root / "b")],
                         capture_output=True, text=True)
@@ -397,21 +397,13 @@ def test_bases_reach_the_compiler_as_types(tmp_path):
 
 # --- delivery ---------------------------------------------------------------
 
-def test_the_forced_include_lands_only_on_the_translation_units_that_ask(
-    tmp_path):
-  # the DEPRECATED path, pinned by config: what it does is not in dispute,
-  # only whether it is enough (it is not -- see the transitive test below)
-  root = _tree(tmp_path, reflect_cfg={"reflect_include": "source"})
-  entries = _compile_commands(root)
-  assert "thing.reflect.hpp" in _command_for(entries, "thing.cpp")
-  assert "reflect.hpp" not in _command_for(entries, "bystander.cpp")
-
-
-def test_module_mode_forces_every_translation_unit(tmp_path):
-  root = _tree(tmp_path, reflect_cfg={"reflect_include": "module"})
-  entries = _compile_commands(root)
-  # module mode needs no mapping, so the bystander gets it too
-  assert "thing.reflect.hpp" in _command_for(entries, "bystander.cpp")
+def test_no_translation_unit_is_force_included_with_anything(tmp_path):
+  # the detour delivers through the include path, so nothing is placed per
+  # TU and the bystander -- which includes no reflected header -- is not
+  # made to parse one
+  entries = _compile_commands(_tree(tmp_path))
+  for stem in ("thing.cpp", "bystander.cpp"):
+    assert "reflect.hpp" not in _command_for(entries, stem)
 
 
 # --- the failure mode this design exists to avoid ---------------------------
@@ -515,6 +507,156 @@ def test_an_untagged_header_stops_being_reflected(tmp_path):
   assert not (generated / "extra.reflect.hpp").exists()
   assert not (generated / "extra.hpp").exists(), \
     "the detour went on shadowing the header it no longer describes"
+
+
+# --- a build told to skip tests skips their headers -------------------------
+
+def _with_a_test_fixture(root: Path) -> Path:
+  unit = root / "sources" / "demo" / "thing" / "unit.test"
+  unit.mkdir()
+  (unit / "fixture.hpp").write_text(
+    "#pragma once\nnamespace demo {\n  struct Fixture\n  {\n"
+    "    friend constexpr auto reflect_scheme(Fixture*);\n"
+    "    int slot { 0 };   /* a slot */\n  };\n}\n")
+  return (root / "b" / "generated" / "demo" / "thing" / "unit.test"
+          / "fixture.reflect.hpp")
+
+
+def test_a_test_fixture_is_reflected_when_tests_are_built(tmp_path):
+  root = _tree(tmp_path)
+  produced = _with_a_test_fixture(root)
+  assert _build(root).returncode == 0
+  assert produced.is_file()
+
+
+def test_no_tests_does_not_reflect_a_test_fixture(tmp_path):
+  # the lane that found this ran `buildutil build --release --no-tests` and
+  # ninja still scheduled the reflect steps of headers under unit.test/ --
+  # a build doing work it was told to skip, and failing on it
+  root = _tree(tmp_path)
+  produced = _with_a_test_fixture(root)
+  done = _build(root, "-DBUILD_TESTING=OFF")
+  assert done.returncode == 0, done.stdout + done.stderr
+  assert not produced.exists()
+
+
+# --- the module's macro state reaches the parse -----------------------------
+# The generator parses the header on its own; a type behind an #ifdef simply
+# is not there unless the parse is given the same defines the compiler has.
+# The tag count then fails the build -- correctly, and for a reason nothing
+# could name.
+
+GUARDED_HPP = """\
+#pragma once
+#include <_buildutil/reflect.hpp>
+
+namespace demo {
+
+#ifdef DEMO_FEATURE
+  struct Guarded
+  {
+    friend constexpr auto reflect_scheme(Guarded*);
+    int slot { 0 };   /* only there when the feature is on */
+  };
+#endif
+
+}
+"""
+
+
+def _guarded(root: Path, declaration: str) -> Path:
+  module = root / "sources" / "demo" / "thing"
+  (module / "guarded.hpp").write_text(GUARDED_HPP)
+  (module / "CMakeLists.txt").write_text(
+    "Init_submodule()\n{}\n".format(declaration))
+  return root / "b" / "generated" / "demo" / "thing" / "guarded.reflect.hpp"
+
+
+def test_a_guarded_type_is_reflected_when_the_module_defines_it(tmp_path):
+  root = _tree(tmp_path)
+  produced = _guarded(
+    root, "target_compile_definitions(demo-thing PUBLIC DEMO_FEATURE=1)")
+  done = _build(root)
+  assert done.returncode == 0, done.stdout + done.stderr
+  assert "reflect_scheme(Guarded*)" in produced.read_text()
+
+
+def test_a_macro_spelled_as_a_compile_option_reaches_the_parse_too(tmp_path):
+  root = _tree(tmp_path)
+  produced = _guarded(
+    root, "target_compile_options(demo-thing PUBLIC -DDEMO_FEATURE=1)")
+  done = _build(root)
+  assert done.returncode == 0, done.stdout + done.stderr
+  assert "reflect_scheme(Guarded*)" in produced.read_text()
+
+
+# --- across the package boundary -------------------------------------------
+
+def _install(root: Path) -> Path:
+  assert _build(root).returncode == 0
+  prefix = root / "p"
+  done = subprocess.run(
+    ["cmake", "--install", str(root / "b"), "--prefix", str(prefix)],
+    capture_output=True, text=True)
+  assert done.returncode == 0, done.stdout + done.stderr
+  return prefix
+
+
+def _consume(prefix: Path, body: str) -> subprocess.CompletedProcess:
+  """Compile one translation unit against the INSTALLED package and nothing
+  else: no source tree, no generated root, no reflect extension."""
+  unit = prefix.parent / "consumer.cpp"
+  unit.write_text(body)
+  compiler = shutil.which("g++") or shutil.which("clang++") or "c++"
+  return subprocess.run(
+    [compiler, "-std=c++23", "-fsyntax-only", f"-I{prefix / 'include'}",
+     str(unit)], capture_output=True, text=True)
+
+
+CONSUMER_CPP = """\
+#include <demo/thing/thing.hpp>
+
+static_assert(reflect::reflected<demo::Options>);
+constexpr auto S = reflect::scheme_of<demo::Options>();
+static_assert(reflect::scheme_size(S) == 5);
+static_assert(decltype(reflect::scheme_item<0>(S))::NAME_STRING == "verbose");
+static_assert(decltype(reflect::scheme_item<2>(S))::LABEL ==
+              "display-name");
+"""
+
+
+def test_a_packaged_library_is_still_reflected_for_its_consumers(tmp_path):
+  # The detour works because the generated root sits ahead of sources/ on the
+  # include path. An installed package has no generated root, so a consumer
+  # that got only the real header would compile a program in which nothing is
+  # reflected -- silently, and across the boundary where nobody is looking.
+  prefix = _install(_tree(tmp_path))
+  done = _consume(prefix, CONSUMER_CPP)
+  assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_the_packaged_detour_names_no_path_from_the_publishing_machine(
+    tmp_path):
+  # the in-tree detour reaches its header by absolute path, which is the one
+  # thing that cannot survive being shipped
+  prefix = _install(_tree(tmp_path))
+  shipped = (prefix / "include" / "demo" / "thing" / "thing.hpp").read_text()
+  assert str(tmp_path) not in shipped
+
+
+def test_a_test_only_reflected_header_is_not_packaged(tmp_path):
+  # reflect scans the whole tree; the module's header install does not ship
+  # a *.test/ subtree, and the artifacts must not ship where the header does
+  # not
+  root = _tree(tmp_path)
+  unit = root / "sources" / "demo" / "thing" / "unit.test"
+  unit.mkdir()
+  (unit / "fixture.hpp").write_text(
+    "#pragma once\nnamespace demo {\n  struct Fixture\n  {\n"
+    "    friend constexpr auto reflect_scheme(Fixture*);\n"
+    "    int slot { 0 };   /* a slot */\n  };\n}\n")
+  prefix = _install(root)
+  assert not (prefix / "include" / "demo" / "thing" / "unit.test").exists()
 
 
 def test_a_project_without_the_extension_is_untouched(tmp_path):
@@ -908,15 +1050,6 @@ def test_a_transitively_reached_scheme_is_present_in_that_tu(tmp_path):
   assert done.returncode == 0, done.stdout + done.stderr
 
 
-def test_the_force_include_path_still_loses_it(tmp_path):
-  # the same tree, one config key different. This is the bug, reproduced --
-  # and what makes the test above mean something.
-  root = _inherited(tmp_path, reflect_cfg={"reflect_include": "source"})
-  done = _build(root)
-  assert done.returncode != 0, "the transitive miss did not reproduce"
-  assert "not reflected" in done.stdout + done.stderr
-
-
 def test_the_detour_wraps_the_real_header_and_takes_its_spelling(tmp_path):
   root = _inherited(tmp_path)
   assert _build(root).returncode == 0
@@ -1123,6 +1256,57 @@ def test_a_members_inline_comment_is_not_its_help_text(tmp_path):
   text = _emitted(tmp_path, INSIDE_HPP)
   assert '"member", &Agent::member, "the member help"' in text
   assert "among the tokens" not in text
+
+
+# --- a design note above a member is not that member's help text -----------
+# Field report: a 40-line design note written above
+# `_Label(--) std::vector<std::string> chromium_switches;` was attributed to
+# the member and rendered under `--` on the --help screen, because a leading
+# block became help whenever the declaration line carried no trailing
+# comment. Adjacency alone does not separate the two -- the note was directly
+# above the member -- so the rule is adjacency AND brevity.
+
+LEADING_LENGTH_HPP = """\
+#pragma once
+#include <string>
+#include <vector>
+namespace demo {
+  struct Notes
+  {
+    friend constexpr auto reflect_scheme(Notes*);
+
+    // say more about what is happening
+    bool verbose { false };
+
+    // a note that runs to three lines is still
+    // a sentence about the member, and three
+    // is as far as that goes
+    int retries { 3 };
+
+    /* Why the switch list is a vector of strings and not a parsed structure:
+       chromium takes them verbatim, the set is version-dependent, and every
+       attempt to model it here has gone stale within a release. Whoever
+       changes this should read the CEF notes first, because the ordering
+       rules are not what they look like, and the --disable- family in
+       particular is order-sensitive in ways the docs do not say. */
+    std::vector<std::string> switches;
+  };
+}
+"""
+
+
+def test_a_short_leading_comment_is_still_the_members_help(tmp_path):
+  text = _emitted(tmp_path, LEADING_LENGTH_HPP)
+  assert '"verbose", &Notes::verbose, ' \
+         '"say more about what is happening"' in text
+  assert '"retries", &Notes::retries, "a note that runs to three lines ' \
+         'is still' in text
+
+
+def test_a_design_note_above_a_member_is_not_its_help(tmp_path):
+  text = _emitted(tmp_path, LEADING_LENGTH_HPP)
+  assert '"switches", &Notes::switches, ""' in text
+  assert "chromium takes them verbatim" not in text
 
 
 def test_an_operators_parameter_comment_is_still_the_parameters(tmp_path):
