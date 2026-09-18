@@ -731,6 +731,14 @@ write separate host and build profiles: dependencies target the requested
 platform, while build tools use the shared `cross-build-linux` profile
 with native gcc/g++ (or the minimal compiler-less fallback when gcc is absent).
 
+The **wine-msvc** lane (`--compiler wine-msvc`) cross-builds
+Windows/x86_64 with the genuine MSVC toolchain under Wine. It is claimed
+automatically only when the `cl` on PATH really is the msvc-wine wrapper
+— `msvcenv.sh` beside it, or a wine exec inside it — so an unrelated `cl`
+(OpenCL, Common Lisp) cannot silently turn a native build into a Windows
+cross-build. `BUILDUTIL_WINE_MSVC=1` claims the lane anyway, `0`
+suppresses it; the driver prints the lane when it takes it.
+
 The **osxcross** lane (`--compiler osxcross`, Linux with `oa64-clang++`
 on PATH) builds Macos/armv8 with apple-clang settings. Its SDK path comes
 from `osxcross-conf`; compiler wrappers, Darwin ar/ranlib, and the Mach-O
@@ -1210,6 +1218,14 @@ is not the same thing, since the plist is what names the sub-process
 bundles and `LSUIElement` only applies to a launched app.
 
 ## Reflection — the `reflect` extension
+
+The generator parses C++ with libclang, so a project that declares this
+extension needs **a clang on PATH**: buildutil pip-installs the bindings, but
+that wheel ships the library with none of clang's builtin headers, and the
+resource directory they live in can only come from a real clang (`apt install
+clang`, `xcode-select --install`) or from `BUILDUTIL_RESOURCE_DIR`. Without one
+buildutil says so and stops, rather than parsing every header without
+`stddef.h` and reporting the wreckage as a missing project include.
 
 Declare it (`buildutil extend reflect`) and a type opts in with one line:
 

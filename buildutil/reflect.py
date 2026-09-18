@@ -1290,6 +1290,16 @@ class ClangUnavailable(RuntimeError):
   pass
 
 
+NO_RESOURCE_DIR = (
+  "the reflect extension needs a clang on PATH: its builtin headers "
+  "(stddef.h, stdarg.h and the intrinsics) are what every parse starts from, "
+  "the pip libclang wheel ships none of them, and without them a parse "
+  "collapses on \"'stddef.h' file not found\" and reports the loss as a "
+  "missing project include. Install one (debian: apt install clang; macOS: "
+  "xcode-select --install), or point BUILDUTIL_RESOURCE_DIR at the resource "
+  "directory of a clang you already have")
+
+
 def load_clang():
   """System libclang first, bundled wheel second.
 
@@ -1313,7 +1323,10 @@ def load_clang():
       ci.Config.set_library_file(library)
     except Exception:                                       # pragma: no cover
       pass
-  return ci, resource_dir()
+  resource = resource_dir()
+  if resource is None:
+    raise ClangUnavailable(NO_RESOURCE_DIR)
+  return ci, resource
 
 
 def _bindings_major() -> int:
@@ -1418,6 +1431,9 @@ def resource_dir() -> str | None:
   Without this the parse of any real header collapses; the pip wheel does not
   ship one, so it has to come from a clang on PATH either way.
   """
+  told = os.environ.get("BUILDUTIL_RESOURCE_DIR")
+  if told:
+    return told if Path(told).is_dir() else None
   for name in ("clang", "clang++"):
     exe = shutil.which(name)
     if exe:
@@ -2956,7 +2972,11 @@ def _cmd_generate(opts) -> int:
   header = Path(opts.header).resolve()
   output = Path(opts.output)
   includes = opts.include_dir or []
-  ci, resource = load_clang()
+  try:
+    ci, resource = load_clang()
+  except ClangUnavailable as missing:
+    sys.stderr.write("buildutil reflect: {}\n".format(missing))
+    return 1
   args = parse_args(opts.std, includes, resource, sdk_path(), msvc_args())
   tu = parse(ci, header, args)
 

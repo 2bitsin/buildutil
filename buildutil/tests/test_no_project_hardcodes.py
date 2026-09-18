@@ -1,15 +1,15 @@
-"""No bossdeux artifact may appear in CODE — string constants the
-driver would act on (binary names, module paths, suite modules,
-vendored-path filters). Docstrings and comments may cite bossdeux as
-the worked example of the seam; code may not fall back to it."""
+"""No artifact of the project or the deployment buildutil was extracted
+from may appear in CODE — string constants the driver would act on.
+Docstrings and comments may cite bossdeux as the worked example."""
 import ast
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parents[1]
 
-# names of bossdeux things the extraction moved behind buildutil.toml
+# what the extraction moved behind buildutil.toml, an env var, or a probe
 BANNED = ("bdxmcp", "bdxgui", "bdx86emu", "decodex86", "corex86",
-          "inspector.bench", "image/contrib", "BOSSDEUX_")
+          "inspector.bench", "image/contrib", "BOSSDEUX_",
+          "MDEV_", "VSBT18")
 
 
 def _code_strings(tree: ast.AST) -> list[str]:
@@ -28,7 +28,7 @@ def _code_strings(tree: ast.AST) -> list[str]:
           and id(node) not in docstrings]
 
 
-def test_no_bossdeux_names_in_code_strings():
+def test_no_private_names_in_code_strings():
   offenders = []
   for src in sorted(PKG.rglob("*.py")):
     parts = src.relative_to(PKG).parts

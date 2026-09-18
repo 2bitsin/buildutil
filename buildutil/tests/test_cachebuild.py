@@ -9,6 +9,7 @@ dispatch stays on the stdlib lane (no venv bootstrap, no typer), the
 deposit is rendered, the buildinfo stub exists, and the configure line
 carries the driver contract (toolchain, prefixes, defines, BUILDUTIL
 env for the guard)."""
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -57,6 +58,23 @@ def _run_cache_build(root, bin_dir, gen, log, extra=()):
     cwd=root, capture_output=True, text=True,
     env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(root),
          "PYTHONPATH": str(PKG_PARENT), "CMAKE_LOG": str(log)})
+
+
+def test_a_relative_toolchain_reaches_cmake_absolute(cache_tree):
+  """cache-build chdirs into the cache source folder, and cmake resolves
+  a relative toolchain against the BUILD tree first."""
+  root, bin_dir, gen, log = cache_tree
+  relative = Path(os.path.relpath(gen / "conan_toolchain.cmake", root))
+  proc = subprocess.run(
+    [sys.executable, "-m", "buildutil", "cache-build",
+     "--build-dir", str(root / "_build" / "cache"),
+     "--toolchain", str(relative), "--build-type", "Debug"],
+    cwd=root, capture_output=True, text=True,
+    env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(root),
+         "PYTHONPATH": str(PKG_PARENT), "CMAKE_LOG": str(log)})
+  assert proc.returncode == 0, proc.stdout + proc.stderr
+  configure = next(l for l in log.read_text().splitlines() if " -S " in f" {l}")
+  assert f"-DCMAKE_TOOLCHAIN_FILE={gen / 'conan_toolchain.cmake'}" in configure
 
 
 def test_cache_build_configures_and_builds_against_the_toolchain(cache_tree):

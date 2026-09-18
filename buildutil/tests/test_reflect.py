@@ -9,6 +9,8 @@ emitted definition that would stop it matching the friend declaration.
 from __future__ import annotations
 
 import re
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1692,3 +1694,41 @@ def test_msvc_parse_arguments(monkeypatch, tmp_path, lane):
     target += ["-isystem", str(path)]
   assert reflect.parse_args("c++23", ["/project"], "/resource",
                             msvc=reflect.msvc_args()) == base + target + ["-I/project"]
+
+
+def _fake_bindings(monkeypatch):
+  package = types.ModuleType("clang")
+  cindex = types.ModuleType("clang.cindex")
+  cindex.Config = type("Config", (), {"set_library_file": staticmethod(print)})
+  package.cindex = cindex
+  monkeypatch.setitem(sys.modules, "clang", package)
+  monkeypatch.setitem(sys.modules, "clang.cindex", cindex)
+
+
+def test_a_machine_without_clang_is_told_so_before_the_parse(monkeypatch):
+  # The pip libclang wheel carries no builtin headers, so a box with the
+  # bindings and no clang parses every header without stddef.h and reports
+  # the wreckage as a missing project include -- a fresh-machine trap.
+  _fake_bindings(monkeypatch)
+  monkeypatch.setattr(reflect, "_usable_system_libclang", lambda _: None)
+  monkeypatch.setattr(reflect, "resource_dir", lambda: None)
+  with pytest.raises(reflect.ClangUnavailable, match="clang on PATH"):
+    reflect.load_clang()
+
+
+def test_the_resource_directory_can_be_told_and_is_verified(monkeypatch, tmp_path):
+  monkeypatch.setenv("BUILDUTIL_RESOURCE_DIR", str(tmp_path))
+  assert reflect.resource_dir() == str(tmp_path)
+  monkeypatch.setenv("BUILDUTIL_RESOURCE_DIR", str(tmp_path / "nowhere"))
+  assert reflect.resource_dir() is None
+
+
+def test_generate_reports_a_missing_clang_in_one_line(monkeypatch, tmp_path, capsys):
+  def absent():
+    raise reflect.ClangUnavailable(reflect.NO_RESOURCE_DIR)
+  monkeypatch.setattr(reflect, "load_clang", absent)
+  opts = SimpleNamespace(header=str(tmp_path / "x.hpp"),
+                         output=str(tmp_path / "x.reflect.hpp"), include_dir=[])
+  assert reflect._cmd_generate(opts) == 1
+  assert "apt install clang" in capsys.readouterr().err
+  assert not (tmp_path / "x.reflect.hpp").exists()

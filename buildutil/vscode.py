@@ -25,7 +25,7 @@ import platform
 import shlex
 from pathlib import Path
 
-from .config import PROJECT_NAME, REPO_ROOT
+from .config import PROJECT_NAME, REPO_ROOT, VENV_PY, cmake_path
 
 # ===========================================================================
 # CONFIG -- what to generate and its general shape. Edit here, not the JSON.
@@ -427,6 +427,16 @@ def _installed(mirror: str, binary: str, *, bundle: bool = False) -> str:
   return path
 
 
+def _venv_python() -> str:
+  """The interpreter buildutil itself uses, as vscode reads it.
+  $BUILDUTIL_VENV_DIR may put the venv outside the workspace."""
+  try:
+    inside = VENV_PY.relative_to(REPO_ROOT)
+  except ValueError:
+    return cmake_path(VENV_PY)
+  return f"${{workspaceFolder}}/{cmake_path(inside)}"
+
+
 def _launch_document(modules: dict, prefix: str | None) -> dict:
   configurations = []
   if prefix:
@@ -446,7 +456,7 @@ def _launch_document(modules: dict, prefix: str | None) -> dict:
           })
   configurations.append({
     "name": "debug: current python file", "type": "debugpy", "request": "launch",
-    "program": "${file}", "python": "${workspaceFolder}/_pyvenv/bin/python",
+    "program": "${file}", "python": _venv_python(),
     "console": "integratedTerminal", "cwd": "${workspaceFolder}", "justMyCode": True,
   })
   return {"version": "0.2.0", "configurations": configurations, "inputs": []}

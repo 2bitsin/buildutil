@@ -25,6 +25,8 @@ import sys
 from importlib import metadata
 from pathlib import Path
 
+from . import redact
+
 PKG_DIR = Path(__file__).resolve().parent
 
 _PUBLIC_HOSTS = ("pypi.org", "pypi.python.org", "pythonhosted.org")
@@ -249,8 +251,7 @@ def update(argv: list[str]) -> None:
       fetch = [sys.executable, "-E", "-m", "pip", "install",
                "--target", scratch, "--no-deps",
                "--index-url", index, spec]
-      shown = " ".join(
-        re.sub(r"//[^@/]+@", "//<credentials>@", part) for part in fetch)
+      shown = " ".join(redact.credentials(part) for part in fetch)
       print(f"+ {shown}")
       if a.dry_run:
         return
@@ -270,12 +271,7 @@ def update(argv: list[str]) -> None:
   # the upgrade of the real environment (found live, 0.6.0 era)
   cmd = [sys.executable, "-E", "-m", "pip", "install", "--upgrade",
          "--index-url", index, spec]
-  env_pin = os.environ.get("MDEV_BUILDUTIL_PIN", "")
-  if env_pin and env_pin != a.pin:
-    print(f"note: MDEV_BUILDUTIL_PIN={env_pin} is set — on a managed box "
-          "reconcile will reinstall that version within minutes")
-  shown = " ".join(
-    re.sub(r"//[^@/]+@", "//<credentials>@", part) for part in cmd)
+  shown = " ".join(redact.credentials(part) for part in cmd)
   print(f"+ {shown}")
   if a.dry_run:
     return

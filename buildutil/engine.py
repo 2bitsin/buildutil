@@ -217,6 +217,14 @@ _COMPILER_PREFERENCE = ("gcc", "clang", "apple-clang", "msvc", "wine-msvc",
 
 
 
+def _lane_override_hint(want: str) -> str:
+  if want != "wine-msvc":
+    return ""
+  return (f" A `cl` on PATH claims this lane only when it is the msvc-wine "
+          f"wrapper (msvcenv.sh beside it, or a wine exec in it); set "
+          f"{WINE_MSVC_ENV}=1 to claim it anyway, 0 to suppress it.")
+
+
 def _select_compiler(choice: str | None, default: str) -> None:
   """Resolve a --compiler selection and pin CC/CXX for the build.
 
@@ -238,7 +246,7 @@ def _select_compiler(choice: str | None, default: str) -> None:
     have = ", ".join(sorted(available)) or "none"
     typer.echo(
       f"buildutil: compiler '{want}' is not installed on this host "
-      f"(available: {have}).", err=True)
+      f"(available: {have}).{_lane_override_hint(want)}", err=True)
     raise typer.Exit(code=2)
   cc = available[want]
   if want == "emscripten":
@@ -247,6 +255,8 @@ def _select_compiler(choice: str | None, default: str) -> None:
     os.environ["CXX"] = conf["cpp"]
     return
   if want == "wine-msvc":
+    print(f"buildutil: cross-compiling for Windows through the msvc-wine "
+          f"lane ({cc}); {WINE_MSVC_ENV}=0 suppresses it")
     return                                     # cmake gets cl explicitly
   if want == "osxcross":
     os.environ["CC"] = "oa64-clang"            # the arm64 wrappers; conan +
@@ -257,49 +267,90 @@ def _select_compiler(choice: str | None, default: str) -> None:
 
 
 
-def _ensure_msvc_env_on_path() -> None:
-  """If on Windows and `cl` isn't already on PATH, locate vcvars64.bat
-  for the project's expected MSVC install, source it via cmd, and
-  pull the resulting environment into our own process. Mirrors what
-  a Visual Studio Developer Prompt does for an interactive user, so
-  buildutil works the same whether invoked from a regular shell, a
-  Dev Prompt, or a CI runner with no shell init at all.
+_VCVARS_REL = Path("VC", "Auxiliary", "Build", "vcvars64.bat")
+_VS_YEARS = ("2026", "2022", "2019")
+_VS_EDITIONS = ("BuildTools", "Community", "Professional", "Enterprise")
+_VSWHERE_ARGS = ["-latest", "-products", "*", "-requires",
+                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"]
 
-  Path resolution order:
-    1. $VCVARS_PATH (explicit override)
-    2. A short list of common install layouts (BuildTools / Community
-       / Professional / Enterprise / the VSBT18 portable layout).
+
+_PROGRAM_FILES = {"ProgramFiles": r"C:\Program Files",
+                  "ProgramFiles(x86)": r"C:\Program Files (x86)"}
+
+
+def _program_files(var: str) -> Path:
+  return Path(os.environ.get(var) or _PROGRAM_FILES[var])
+
+
+def _program_files_roots() -> list[Path]:
+  return list(dict.fromkeys(_program_files(var) for var in _PROGRAM_FILES))
+
+
+def _vswhere() -> Path:
+  return (_program_files("ProgramFiles(x86)") / "Microsoft Visual Studio" /
+          "Installer" / "vswhere.exe")
+
+
+def _vswhere_installs() -> list[Path]:
+  """The install roots Visual Studio's own locator reports, newest first.
+
+  vswhere.exe ships with every VS installer since 2017 and is the
+  vendor-supported way to find an install on any drive, year and edition.
+  Its absence is not an error: the conventional layouts still get probed.
+  """
+  try:
+    out = subprocess.check_output([str(_vswhere()), *_VSWHERE_ARGS],
+                                  text=True, errors="replace")
+  except (OSError, subprocess.SubprocessError):
+    return []
+  return [Path(line.strip()) for line in out.splitlines() if line.strip()]
+
+
+def _vcvars_candidates() -> list[Path]:
+  """Where vcvars64.bat may live, most authoritative first: the explicit
+  override, then what the installer reports, then the conventional
+  per-year, per-edition layouts under both Program Files roots."""
+  override = os.environ.get("VCVARS_PATH")
+  candidates = [Path(override)] if override else []
+  candidates += [install / _VCVARS_REL for install in _vswhere_installs()]
+  candidates += [root / "Microsoft Visual Studio" / year / edition / _VCVARS_REL
+                 for root in _program_files_roots()
+                 for year in _VS_YEARS for edition in _VS_EDITIONS]
+  return list(dict.fromkeys(candidates))
+
+
+def _find_vcvars() -> Path:
+  candidates = _vcvars_candidates()
+  found = next((c for c in candidates if c.exists()), None)
+  if found is not None:
+    return found
+  probed = "\n  ".join(str(c) for c in candidates)
+  raise RuntimeError(
+    f"cl.exe not on PATH and no vcvars64.bat found.\n"
+    f"Probed $VCVARS_PATH, {_vswhere()}, and:\n  {probed}\n"
+    f"Set $VCVARS_PATH to your install's vcvars64.bat, or run from a "
+    f"Visual Studio Developer Prompt."
+  )
+
+
+def _ensure_msvc_env_on_path() -> None:
+  """If on Windows and `cl` isn't already on PATH, locate vcvars64.bat,
+  source it via cmd, and pull the resulting environment into our own
+  process. Mirrors what a Visual Studio Developer Prompt does for an
+  interactive user, so buildutil works the same whether invoked from a
+  regular shell, a Dev Prompt, or a CI runner with no shell init at all.
   """
   if platform.system() != "Windows":
     return
   import shutil
   if shutil.which("cl") is not None:
     return
+  vcvars = _find_vcvars()
 
-  candidates: list[Path] = []
-  override = os.environ.get("VCVARS_PATH")
-  if override:
-    candidates.append(Path(override))
-  candidates += [
-    Path(r"C:\Devel\VSBT18\VC\Auxiliary\Build\vcvars64.bat"),
-    Path(r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"),
-    Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"),
-    Path(r"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"),
-    Path(r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"),
-  ]
-  vcvars = next((c for c in candidates if c.exists()), None)
-  if vcvars is None:
-    raise RuntimeError(
-      "cl.exe not on PATH and no vcvars64.bat found. Set $VCVARS_PATH "
-      "to your install's vcvars64.bat or run from a Visual Studio "
-      "Developer Prompt."
-    )
-
-  # Source the bat in cmd, dump its env via `set`, and propagate every
-  # KEY=VALUE back into our process. Read as bytes + decode with mbcs
-  # (Windows ANSI codepage, what cmd actually emits) + errors=replace
-  # — a strict cp1252/utf-8 decode trips on non-ASCII bytes that VS
-  # injects into env values like LIB and INCLUDE.
+  # Read as bytes + decode with mbcs (the Windows ANSI codepage, what cmd
+  # actually emits) + errors=replace -- a strict cp1252/utf-8 decode trips
+  # on non-ASCII bytes VS injects into env values like LIB and INCLUDE.
   print(f"+ sourcing {vcvars}", flush=True)
   raw = subprocess.check_output(
     f'cmd /c ""{vcvars}" >NUL && set"', shell=True,
@@ -309,7 +360,6 @@ def _ensure_msvc_env_on_path() -> None:
     if "=" in line:
       key, _, value = line.partition("=")
       os.environ[key] = value.rstrip("\r")
-
 
 
 def _detect_user_session_id() -> int | None:
@@ -398,11 +448,36 @@ def _detect_compiler() -> tuple[str, str]:
 
 
 
+WINE_MSVC_ENV = "BUILDUTIL_WINE_MSVC"
+_WINE_EXEC = re.compile(r"\bwine\d*\b")
+
+
+def _is_msvc_wine_wrapper(cl: Path) -> bool:
+  """msvc-wine's `cl` is a shell wrapper that sources msvcenv.sh beside
+  it and execs wine; reflect.py already reads that file, so the marker is
+  load-bearing. The name alone proves nothing — OpenCL and Common Lisp
+  launchers are called `cl` too."""
+  if (cl.parent / "msvcenv.sh").is_file():
+    return True
+  try:
+    with cl.open("rb") as handle:
+      head = handle.read(4096).decode("utf-8", errors="replace")
+  except OSError:
+    return False
+  return "msvcenv.sh" in head or _WINE_EXEC.search(head) is not None
+
+
 def _wine_msvc_live() -> bool:
-  """The msvc-wine container: the wrapped genuine cl on PATH of a
-  Linux host. Selects the Windows/msvc cross settings below."""
-  return (platform.system() == "Linux" and not _emscripten_live()
-          and shutil.which("cl") is not None)
+  """The msvc-wine container: the wrapped genuine cl on PATH of a Linux
+  host. Selects the Windows/msvc cross settings below. $BUILDUTIL_WINE_MSVC
+  settles it either way for a host the probe reads wrong."""
+  override = os.environ.get(WINE_MSVC_ENV)
+  if override:
+    return override.strip().lower() not in ("0", "off", "false", "no")
+  if platform.system() != "Linux" or _emscripten_live():
+    return False
+  cl = shutil.which("cl")
+  return cl is not None and _is_msvc_wine_wrapper(Path(cl).resolve())
 
 
 def _wine_msvc_version() -> str:
@@ -994,6 +1069,41 @@ def _ccache_launcher_args() -> list[str]:
           for lang in languages]
 
 
+_CACHED_TOOLCHAIN = re.compile(r"(?m)^CMAKE_TOOLCHAIN_FILE:[^=]*=(.*)$")
+
+
+def _cached_toolchain(cmake_cache: Path) -> str | None:
+  match = _CACHED_TOOLCHAIN.search(cmake_cache.read_text(errors="replace"))
+  return match.group(1).strip() if match else None
+
+
+def _drop_unusable_cache(build_dir: Path, toolchain: Path,
+                         toolchain_text: str) -> bool:
+  """Whether cmake will see this as a FIRST configure, dropping what it
+  must not keep.
+
+  conan folds its toolchain flags in through *_INIT seeds that take
+  effect only on a first configure, so a toolchain whose CONTENT moved is
+  ignored by a configured dir. A cache recording a RELATIVE toolchain
+  path is worse: cmake resolves it against the BUILD tree before the
+  source tree, so debris at <build>/<profile>/_build/<profile>/ captures
+  every compile against an old dependency with nothing warning — and
+  cmake caches its answer in CMakeFiles/, so that goes too.
+  """
+  cmake_cache = build_dir / "CMakeCache.txt"
+  if not cmake_cache.exists():
+    return True
+  if _cached_toolchain(cmake_cache) != cmake_path(toolchain):
+    cmake_cache.unlink()
+    shutil.rmtree(build_dir / "CMakeFiles", ignore_errors=True)
+    return True
+  stamp = build_dir / ".buildutil-toolchain.stamp"
+  if not stamp.exists() or stamp.read_text() != toolchain_text:
+    cmake_cache.unlink()
+    return True
+  return False
+
+
 def _cmake_configure(build_dir: Path, build_type: str, *,
                      tests: bool, bench: bool,
                      coverage: bool = False, gc_sections: bool = False) -> None:
@@ -1005,23 +1115,14 @@ def _cmake_configure(build_dir: Path, build_type: str, *,
   cmake rejects the duplicate. This is conan's documented no-preset
   equivalent.
 
-  conan regenerates conan_toolchain.cmake on every install; cmake
-  folds its flags in through *_INIT cache seeds that take effect only
-  on a build dir's first configure, so a toolchain flag change is
-  silently ignored by an already-configured dir — drop the stale
-  cache when the toolchain content actually changed.
-
   Every build-shaping option is passed explicitly so a re-configure
   of a shared dir (coverage vs plain build, say) can't inherit a
   stale cached value."""
   _stamp_build_info()
-  toolchain = build_dir / "generators" / "conan_toolchain.cmake"
-  cmake_cache = build_dir / "CMakeCache.txt"
+  toolchain = (build_dir / "generators" / "conan_toolchain.cmake").resolve()
   stamp = build_dir / ".buildutil-toolchain.stamp"
   toolchain_text = toolchain.read_text() if toolchain.exists() else ""
-  if cmake_cache.exists() and (
-      not stamp.exists() or stamp.read_text() != toolchain_text):
-    cmake_cache.unlink()
+  first_configure = _drop_unusable_cache(build_dir, toolchain, toolchain_text)
   wine_cross = (
     [f"-DCMAKE_C_COMPILER={shutil.which('cl')}",
      f"-DCMAKE_CXX_COMPILER={shutil.which('cl')}",
@@ -1063,7 +1164,9 @@ def _cmake_configure(build_dir: Path, build_type: str, *,
     "cmake", "-S", ".", "-B", cmake_path(build_dir), "-G", "Ninja",
     *wine_cross,
     *_ccache_launcher_args(),
-    f"-DCMAKE_TOOLCHAIN_FILE={cmake_path(toolchain)}",
+    # cmake caches the toolchain and calls a re-passed one unused
+    *([f"-DCMAKE_TOOLCHAIN_FILE={cmake_path(toolchain)}"]
+      if first_configure else []),
     # Configure-time codegen (configure.py) runs under find_package(Python3);
     # point it at the venv interpreter so a script's venv-installed deps
     # ([venv] extra_deps) resolve.

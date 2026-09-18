@@ -148,6 +148,24 @@ def test_ensure_force_always_registers(clean_env, registration, monkeypatch):
 # ------------------------------------------------------------ register flow
 
 @pytest.fixture
+def conan_runs(monkeypatch):
+  """Every conan invocation with the environment it was handed."""
+  runs = []
+  monkeypatch.setattr(bootstrap, "_conan_bin", lambda: "/usr/bin/conan")
+  def record(cmd, env=None, check=None, **kwargs):
+    runs.append({"argv": cmd, "env": dict(env or {})})
+    class R:
+      returncode = 0
+      stdout = ""
+      stderr = ""
+    return R()
+  monkeypatch.setattr(bootstrap.subprocess, "check_call",
+                      lambda cmd, env=None: record(cmd, env) and None)
+  monkeypatch.setattr(bootstrap.subprocess, "run", record)
+  return runs
+
+
+@pytest.fixture
 def conan_calls(monkeypatch):
   calls = []
   monkeypatch.setattr(bootstrap, "_conan_bin", lambda: "/usr/bin/conan")
@@ -184,8 +202,49 @@ def test_register_custom_name_logs_in_and_drops_conancenter(clean_env,
   assert bootstrap.register_conan_remote() is True
   assert ["remote", "add", "mirror",
           "https://repo.example/conan", "--force"] in conan_calls
-  assert ["remote", "login", "mirror", "alice", "-p", "s3cret"] in conan_calls
+  assert ["remote", "login", "mirror", "alice"] in conan_calls
   assert ["remote", "remove", "conancenter"] in conan_calls
+
+
+def test_login_never_puts_the_password_on_argv(clean_env, conan_runs,
+                                              monkeypatch):
+  """argv is readable in the process table and lands in every log."""
+  monkeypatch.setenv("CONAN_REMOTE_NAME", "my-mirror")
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+  monkeypatch.setenv("CONAN_REMOTE_USER", "alice")
+  monkeypatch.setenv("CONAN_REMOTE_PASS", "s3cret")
+  assert bootstrap.register_conan_remote() is True
+  for run in conan_runs:
+    assert "s3cret" not in " ".join(run["argv"]), run["argv"]
+
+
+def test_login_hands_the_password_to_the_child_environment(clean_env,
+                                                           conan_runs,
+                                                           monkeypatch):
+  """conan 2 reads per-remote credentials from the environment; the
+  remote name is upper-cased with dashes as underscores."""
+  monkeypatch.setenv("CONAN_REMOTE_NAME", "my-mirror")
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+  monkeypatch.setenv("CONAN_REMOTE_USER", "alice")
+  monkeypatch.setenv("CONAN_REMOTE_PASS", "s3cret")
+  bootstrap.register_conan_remote()
+  logins = [r for r in conan_runs if r["argv"][1:3] == ["remote", "login"]]
+  assert len(logins) == 1
+  assert logins[0]["env"]["CONAN_PASSWORD_MY_MIRROR"] == "s3cret"
+  assert logins[0]["env"]["CONAN_LOGIN_USERNAME_MY_MIRROR"] == "alice"
+  others = [r for r in conan_runs if r is not logins[0]]
+  assert not any("CONAN_PASSWORD_MY_MIRROR" in r["env"] for r in others)
+
+
+def test_the_remote_url_prints_masked(clean_env, conan_runs, monkeypatch,
+                                      capsys):
+  """Credentials in the authority are an artifactory/GitLab idiom."""
+  monkeypatch.setenv("CONAN_REMOTE_URL",
+                     "https://oauth2:sekrit@repo.example/conan")
+  bootstrap.register_conan_remote()
+  out = capsys.readouterr().out
+  assert "sekrit" not in out
+  assert "https://<credentials>@repo.example/conan" in out
 
 
 def test_register_skips_cleanly_without_url(clean_env, conan_calls):

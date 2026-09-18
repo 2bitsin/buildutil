@@ -154,6 +154,15 @@ def test_update_dry_run_masks_credentials(tmp_path):
   assert "<credentials>" in cp.stdout
 
 
+def test_update_mentions_no_foreign_deployment(tmp_path):
+  """update never advises about infrastructure the reader lacks."""
+  cp = _cli(["update", "--dry-run", "--index-url", "https://x/simple"],
+            tmp_path, {"PIP_CONFIG_FILE": os.devnull,
+                       "MDEV_BUILDUTIL_PIN": "9.9.9"})
+  assert cp.returncode == 0, cp.stderr
+  assert "MDEV" not in cp.stdout and "reconcile" not in cp.stdout
+
+
 def test_update_guards_a_live_build(tmp_path, monkeypatch):
   from buildutil import config
   pid_file = tmp_path / "_build" / ".build.pid"

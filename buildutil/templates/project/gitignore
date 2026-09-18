@@ -3,8 +3,10 @@
 # convention; `buildutil clean --nuke` wipes exactly this set).
 _*
 
-# conan writes it on every install; buildutil drives cmake directly
+# conan writes these; buildutil drives cmake directly, and the package
+# test builds under test_package/ with conan's own cmake_layout
 CMakeUserPresets.json
+test_package/build/
 
 # local secrets (CONAN_REMOTE_* etc.), read by buildutil's dotenv
 .env

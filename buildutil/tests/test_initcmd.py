@@ -78,6 +78,12 @@ def test_gitignore_covers_derived_state(fresh):
   assert "CMakeUserPresets.json" in lines
 
 
+def test_gitignore_covers_the_package_test_build_tree(fresh):
+  initcmd.main(["--name", "demo"])
+  lines = (fresh / ".gitignore").read_text().splitlines()
+  assert "test_package/build/" in lines
+
+
 def test_rerun_never_overwrites(fresh):
   initcmd.main(["--name", "demo"])
   marker = "# project-owned edit\n"

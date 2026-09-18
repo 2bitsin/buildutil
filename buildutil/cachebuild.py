@@ -50,6 +50,9 @@ def main(argv: list[str]) -> None:
                   help="linkage for untagged modules; the recipe maps "
                        "its conan `shared` option here")
   a = ap.parse_args(argv)
+  # before the chdir, and absolute: cmake resolves a relative toolchain
+  # against the BUILD tree before the source tree
+  toolchain = Path(a.toolchain).resolve()
 
   from . import config, deposit, modules
   root = config.require_project()
@@ -77,15 +80,12 @@ def main(argv: list[str]) -> None:
   defines = modules.enabled_definitions(root / "sources",
                                         config.MODULES_INI)
   prefix = config.CMAKE_PREFIX
-  # Path-valued -D arguments go through config.cmake_path() here for the
-  # same reason the driver's configure does: a backslash is an escape in
-  # the cmake code try_compile writes, so a Windows consumer's
-  # --build=missing would die in the compiler probe before it built
-  # anything. This lane is the one a consumer runs, so it is the one that
-  # would fail on THEIR machine.
+  # Path-valued -D arguments go through config.cmake_path() for the reason
+  # given there, and this is the lane a CONSUMER runs: it would fail on
+  # their machine, in the compiler probe, before building anything.
   subprocess.check_call([
     "cmake", "-S", ".", "-B", config.cmake_path(build_dir), "-G", "Ninja",
-    f"-DCMAKE_TOOLCHAIN_FILE={config.cmake_path(a.toolchain)}",
+    f"-DCMAKE_TOOLCHAIN_FILE={config.cmake_path(toolchain)}",
     "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
     f"-DCMAKE_BUILD_TYPE={a.build_type}",
     # a consumer's cache build ships binaries, not this package's QA

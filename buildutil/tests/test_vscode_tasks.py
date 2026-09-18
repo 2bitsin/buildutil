@@ -4,6 +4,7 @@ debug-info flavors, remembered prompt values, and an UPSERTED
 c_cpp_properties with the just-built profile on top."""
 import json
 import re
+from pathlib import PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -363,3 +364,36 @@ def test_nested_module_args_default_reads_the_app_key(store):
   doc = vscode._tasks_document(MODS, has_pytests=False)
   inputs = {i["id"]: i for i in doc["inputs"]}
   assert inputs["args-mstools-rc"]["default"] == "--verbose"
+
+
+def _python_config(doc):
+  return next(c for c in doc["configurations"]
+              if c["name"] == "debug: current python file")
+
+
+def test_python_launch_names_the_venv_interpreter(store, monkeypatch):
+  monkeypatch.setattr(vscode, "REPO_ROOT", PurePosixPath("/w/project"))
+  monkeypatch.setattr(vscode, "VENV_PY",
+                      PurePosixPath("/w/project/_pyvenv/bin/python"))
+  doc = vscode._launch_document(MODS, "x86_64-linux-gcc")
+  assert _python_config(doc)["python"] == (
+    "${workspaceFolder}/_pyvenv/bin/python")
+
+
+def test_python_launch_on_windows_names_scripts_python_exe(store, monkeypatch):
+  monkeypatch.setattr(vscode, "REPO_ROOT", PureWindowsPath(r"C:\w\project"))
+  monkeypatch.setattr(vscode, "VENV_PY",
+                      PureWindowsPath(r"C:\w\project\_pyvenv\Scripts\python.exe"))
+  doc = vscode._launch_document(MODS, "x86_64-linux-gcc")
+  assert _python_config(doc)["python"] == (
+    "${workspaceFolder}/_pyvenv/Scripts/python.exe")
+
+
+def test_python_launch_falls_back_to_an_absolute_relocated_venv(store,
+                                                                monkeypatch):
+  """$BUILDUTIL_VENV_DIR may put the venv outside the workspace, where no
+  workspace-relative spelling exists."""
+  monkeypatch.setattr(vscode, "REPO_ROOT", PurePosixPath("/w/project"))
+  monkeypatch.setattr(vscode, "VENV_PY", PurePosixPath("/opt/venv/bin/python"))
+  doc = vscode._launch_document(MODS, "x86_64-linux-gcc")
+  assert _python_config(doc)["python"] == "/opt/venv/bin/python"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "buildutil"
-version = "0.80.1"
+version = "0.81.0"
 description = "Config-seamed C++ build driver: conan + cmake + ctest + gcovr behind one CLI, project policy in buildutil.toml"
 requires-python = ">=3.11"
 readme = "README.md"

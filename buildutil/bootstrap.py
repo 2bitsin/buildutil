@@ -19,7 +19,7 @@ import sysconfig
 import time
 from pathlib import Path
 
-from . import config
+from . import config, redact
 
 
 def _run(cmd: list[str], env: dict | None = None) -> None:
@@ -107,6 +107,49 @@ def _login_failure_kind(output: str) -> str:
   return "transient"
 
 
+def _login_credentials(name: str, user: str, pw: str) -> dict:
+  """The per-remote credential env vars conan 2 reads: the password
+  reaches conan without ever appearing in argv. conan upper-cases the
+  remote name with dashes as underscores (remote_credentials.py)."""
+  suffix = name.replace("-", "_").upper()
+  return {f"CONAN_LOGIN_USERNAME_{suffix}": user,
+          f"CONAN_PASSWORD_{suffix}": pw}
+
+
+def _login_with_retries(conan: str, name: str, user: str, pw: str,
+                        env: dict) -> bool:
+  """Log in, retrying ONLY connection-level failures: the mac shell
+  runners have an intermittent link to the remote (recurring "no route to
+  host"), while a definitive auth rejection has answered the question and
+  re-sending the same bad credential arms JFrog's brute-force lockout —
+  after which even the CORRECT password gets a 403 that masquerades as
+  'wrong user or password', and every further retry re-arms the block."""
+  login_env = {**env, **_login_credentials(name, user, pw)}
+  for attempt in range(6):
+    proc = subprocess.run([conan, "remote", "login", name, user],
+                          env=login_env, capture_output=True, text=True)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    if proc.returncode == 0:
+      return True
+    kind = _login_failure_kind(proc.stdout + proc.stderr)
+    if kind == "auth":
+      print(f"ERROR: {name} REJECTED the credentials — not retrying "
+            "(retries against a wrong password trip the server's "
+            "brute-force lockout). Fix CONAN_REMOTE_USER/PASS (.env / "
+            "CI_ARTIFACTORY_*) and re-run.")
+      return False
+    if kind == "lockout":
+      print(f"ERROR: {name} is refusing logins after repeated failures "
+            "(server lockout) — stopping: every retry re-arms the "
+            "block. Wait out the server's retry-after above, verify "
+            "the credentials, then re-run.")
+      return False
+    print(f"  remote login failed (flaky link) -- retry {attempt + 1}/6 in 10s")
+    time.sleep(10)
+  return False
+
+
 def register_conan_remote() -> bool:
   """Register + log into the project's conan remote from the env seam
   (conan_remote_env — CONAN_REMOTE_* / .env / CI_ARTIFACTORY_*). No URL
@@ -138,43 +181,12 @@ def register_conan_remote() -> bool:
     gconf.write_text(text + "core.download:retry=8\ncore.download:retry_wait=15\n")
   env = {**os.environ, "CONAN_HOME": str(home)}
 
-  print(f"+ conan remote add {name} {url} --force")
+  print(f"+ conan remote add {name} {redact.credentials(url)} --force")
   subprocess.check_call(
     [conan, "remote", "add", name, url, "--force"], env=env)
   if user and pw:
     print(f"+ conan remote login {name} {user} (password from env)")
-    # the mac shell runners have an intermittent link to the remote (recurring
-    # "no route to host"); retry the login so a brief drop doesn't fail setup.
-    # Retry ONLY connection-level failures: a definitive auth rejection
-    # answered the question, and re-sending the same bad credential arms
-    # JFrog's brute-force lockout — after which even the CORRECT password
-    # gets a 403 that masquerades as 'wrong user or password', and every
-    # further retry re-arms the block.
-    remote_reachable = False
-    for _attempt in range(6):
-      proc = subprocess.run(
-        [conan, "remote", "login", name, user, "-p", pw],
-        env=env, capture_output=True, text=True)
-      sys.stdout.write(proc.stdout)
-      sys.stderr.write(proc.stderr)
-      if proc.returncode == 0:
-        remote_reachable = True
-        break
-      kind = _login_failure_kind(proc.stdout + proc.stderr)
-      if kind == "auth":
-        print(f"ERROR: {name} REJECTED the credentials — not retrying "
-              "(retries against a wrong password trip the server's "
-              "brute-force lockout). Fix CONAN_REMOTE_USER/PASS (.env / "
-              "CI_ARTIFACTORY_*) and re-run.")
-        break
-      if kind == "lockout":
-        print(f"ERROR: {name} is refusing logins after repeated failures "
-              "(server lockout) — stopping: every retry re-arms the "
-              "block. Wait out the server's retry-after above, verify "
-              "the credentials, then re-run.")
-        break
-      print(f"  remote login failed (flaky link) -- retry {_attempt + 1}/6 in 10s")
-      time.sleep(10)
+    remote_reachable = _login_with_retries(conan, name, user, pw, env)
   else:
     # no credentials: an anonymous mirror. There is nothing to probe
     # without a login round-trip, so trust the URL as given.
