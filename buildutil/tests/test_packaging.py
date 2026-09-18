@@ -1,0 +1,530 @@
+"""Conan packaging (owner req): init wizard/switches record a committed
+[package] choice (kind + name — NEVER a version: the version never
+lives in the package source), the recipe grows packaging methods from
+that same section, test_package/ is scaffolded per kind, old projects
+upgrade via the same wizard, publish derives the version from git tags
+plus a bumped build number, and the publish/test plumbing assembles the
+right conan commands. Everything below runs without conan or git — the
+calls go through packaging.py's injectable seams, and the recipe is
+exec'd against stub conan modules (the established template pattern)."""
+import importlib.util
+import subprocess
+import sys
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from buildutil import initcmd, packaging
+
+TEMPLATES = Path(initcmd.__file__).resolve().parent / "templates"
+
+
+# ------------------------------------------------------- the recipe --
+
+def _conan_stubs():
+  for name, attrs in (("conan", {"ConanFile": object}),
+                      ("conan.tools", {}),
+                      ("conan.tools.cmake", {"CMakeDeps": object,
+                                             "CMakeToolchain": object,
+                                             "cmake_layout": lambda *a: None})):
+    mod = types.ModuleType(name)
+    for k, v in attrs.items():
+      setattr(mod, k, v)
+    sys.modules.setdefault(name, mod)
+
+
+def _recipe_module(tmp_path, toml_text=None):
+  """Render the conanfile template INTO tmp_path (beside an optional
+  buildutil.toml) and import it — _package_section reads beside
+  __file__, exactly as in a real project root."""
+  _conan_stubs()
+  if toml_text is not None:
+    (tmp_path / "buildutil.toml").write_text(toml_text)
+  src = (TEMPLATES / "project" / "conanfile.py").read_text().replace(
+    "@CONAN_NAME@", "fallbackname").replace("@CMAKE_OPTION_PREFIX@", "X")
+  path = tmp_path / "conanfile.py"
+  path.write_text(src)
+  spec = importlib.util.spec_from_file_location(
+    f"recipe_{tmp_path.name}", path)
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+def test_recipe_without_package_section_is_the_old_consumer(tmp_path):
+  mod = _recipe_module(tmp_path, '[project]\nname = "x"\n')
+  assert mod.ProjectRecipe.name == "fallbackname"
+  assert not hasattr(mod.ProjectRecipe, "exports_sources")
+
+
+def test_recipe_reads_package_identity_from_the_toml(tmp_path):
+  mod = _recipe_module(
+    tmp_path, '[package]\nkind = "library"\nname = "serialize"\n')
+  assert mod.ProjectRecipe.name == "serialize"
+  assert mod.ProjectRecipe.package_type == "library"
+  # the conan-standard shared option, linked to module_linkage
+  assert mod.ProjectRecipe.options == {"shared": [True, False]}
+  assert mod.ProjectRecipe.default_options == {"shared": False}
+  assert "sources/*" in mod.ProjectRecipe.exports_sources
+
+
+def test_generated_junk_under_sources_is_excluded_from_the_export(tmp_path):
+  """conan hashes what it exports into the RECIPE REVISION, and sources/*
+  goes in wholesale -- so a generated file that exists on one machine and
+  not another splits a release across two revisions, and consumers see
+  only the latest, which hides every binary published under the other.
+
+  One package shipped exactly that: a second revision from its
+  Windows runner whose manifest differed by five
+  cmake_test_discovery_<hash>.json files. The machinery no longer writes
+  them into the source tree; these patterns are the belt to that brace,
+  and they cover the same class -- __pycache__, .pyc -- that every publish
+  job already sets PYTHONDONTWRITEBYTECODE for."""
+  mod = _recipe_module(
+    tmp_path, '[package]\nkind = "library"\nname = "serialize"\n')
+  excluded = set(mod.ProjectRecipe.exports_sources)
+  for pattern in ("!sources/**/cmake_test_discovery_*.json",
+                  "!sources/**/__pycache__/**",
+                  "!sources/**/*.pyc"):
+    assert pattern in excluded, pattern
+  # the exclusions must come after the includes -- conan applies them in
+  # order, and a `!` before its include matches nothing
+  patterns = list(mod.ProjectRecipe.exports_sources)
+  assert patterns.index("sources/*") < min(
+    patterns.index(p) for p in patterns if p.startswith("!"))
+
+
+def test_recipe_adopts_the_driver_version_never_its_own(tmp_path):
+  """set_version: the CLI --version the driver passes wins; without one
+  (consumer flows) the placeholder applies. No version is ever read
+  from any committed file."""
+  mod = _recipe_module(
+    tmp_path, '[package]\nkind = "library"\nname = "s"\n')
+  r = mod.ProjectRecipe()
+  r.version = "1.2.3.4"                       # what --version delivers
+  r.set_version()
+  assert r.version == "1.2.3.4"
+  r2 = mod.ProjectRecipe()
+  r2.version = None
+  r2.set_version()
+  assert r2.version == "0.0.0"
+
+
+def test_recorded_none_is_not_a_packaging_config(tmp_path):
+  mod = _recipe_module(tmp_path, '[package]\nkind = "none"\n')
+  assert mod.ProjectRecipe.name == "fallbackname"
+
+
+def test_package_info_discovers_the_library_mirror(tmp_path):
+  mod = _recipe_module(
+    tmp_path, '[package]\nkind = "library"\nname = "s"\n')
+  pkg = tmp_path / "pkg"
+  (pkg / "ser" / "core").mkdir(parents=True)
+  (pkg / "ser" / "core" / "libserial.a").write_bytes(b"!<arch>\n")
+  (pkg / "include" / "ser").mkdir(parents=True)
+  (pkg / "include" / "ser" / "api.h").write_text("")
+  r = mod.ProjectRecipe()
+  r.package_folder = str(pkg)
+  r.cpp_info = SimpleNamespace(libs=None, libdirs=None, includedirs=None)
+  r.package_info()
+  assert r.cpp_info.libs == ["serial"]
+  assert r.cpp_info.libdirs == ["ser/core"]
+  assert r.cpp_info.includedirs == ["include"]
+
+
+def test_cache_source_build_is_refused_with_the_story(tmp_path):
+  mod = _recipe_module(
+    tmp_path, '[package]\nkind = "library"\nname = "s"\n')
+  errors = types.ModuleType("conan.errors")
+  class ConanException(Exception): ...
+  errors.ConanException = ConanException
+  sys.modules["conan.errors"] = errors
+  class Settings:
+    def get_safe(self, name):
+      return {"build_type": "Debug", "compiler": "gcc",
+              "compiler.version": "14", "compiler.cppstd": "23"}.get(name)
+  r = mod.ProjectRecipe()
+  r.version = "0.3.0.1"
+  r.settings = Settings()
+  with pytest.raises(ConanException) as excinfo:
+    r.build()
+  story = str(excinfo.value)
+  assert "buildutil publish" in story
+  # the refusal names the consumer's OWN profile, tells them to list
+  # what is published, and puts the build_type miss BEFORE the
+  # package_id-drift explanation — a Debug consumer of a Release-only
+  # publish must not be sent on a ranged-dependency hunt.
+  assert "build_type=Debug" in story
+  assert 'conan list "s/0.3.0.1:*"' in story
+  assert story.index("build_type=Debug") < story.index("package_id")
+
+
+def test_the_refusal_survives_a_bare_recipe_without_settings(tmp_path):
+  """conan populates settings/version late; the refusal must not crash
+  when raised from a barely-constructed recipe (that would replace the
+  story with an AttributeError)."""
+  mod = _recipe_module(
+    tmp_path, '[package]\nkind = "library"\nname = "s"\n')
+  errors = types.ModuleType("conan.errors")
+  class ConanException(Exception): ...
+  errors.ConanException = ConanException
+  sys.modules["conan.errors"] = errors
+  with pytest.raises(ConanException, match="buildutil publish"):
+    mod.ProjectRecipe().build()
+
+
+# --------------------------------------------- the version model --
+
+def _fake_project(monkeypatch, **cfg):
+  from buildutil import config
+  base = {"package_kind": "", "package_name": "", "name": "proj"}
+  base.update(cfg)
+  monkeypatch.setattr(config, "PROJECT", {**config.PROJECT, **base})
+
+
+def _git_tags(*tags):
+  def fake_run(cmd, **kw):
+    assert cmd[:2] == ["git", "tag"]
+    return SimpleNamespace(returncode=0,
+                           stdout="".join(t + "\n" for t in tags))
+  return fake_run
+
+
+def test_version_is_last_semver_tag_plus_publish_build(tmp_path, monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  git = _git_tags("wip-branch-tag", "v1.2.3", "1.0.0")
+  v1, commit = packaging.resolve_version(bump=True, git=git, root=tmp_path)
+  assert v1 == "1.2.3.1"        # non-semver skipped, v-prefix stripped
+  commit()
+  v2, commit2 = packaging.resolve_version(bump=True, git=git, root=tmp_path)
+  assert v2 == "1.2.3.2", "every publish bumps the build number"
+  commit2()
+  # --no-version-autoincrement: republish the current number
+  v3, _ = packaging.resolve_version(bump=False, git=git, root=tmp_path)
+  assert v3 == "1.2.3.2"
+
+
+def test_an_uncommitted_bump_consumes_nothing(tmp_path, monkeypatch):
+  """A failed or dry-run publish never eats a build number: the bump
+  only persists through the commit callback."""
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  git = _git_tags("1.0.0")
+  v1, _never_committed = packaging.resolve_version(
+    bump=True, git=git, root=tmp_path)
+  v2, _ = packaging.resolve_version(bump=True, git=git, root=tmp_path)
+  assert v1 == v2 == "1.0.0.1"
+
+
+def test_a_new_tag_resets_the_build_counter(tmp_path, monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  _, commit = packaging.resolve_version(
+    bump=True, git=_git_tags("1.0.0"), root=tmp_path)
+  commit()
+  v, _ = packaging.resolve_version(
+    bump=True, git=_git_tags("2.0.0", "1.0.0"), root=tmp_path)
+  assert v == "2.0.0.1"
+
+
+def test_version_override_wins_and_persists_nothing(tmp_path, monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  v, commit = packaging.resolve_version(
+    bump=True, override="7.7.7", git=_git_tags("1.0.0"), root=tmp_path)
+  assert v == "7.7.7"
+  commit()
+  assert not packaging._state_file(tmp_path).exists()
+
+
+def test_no_tag_prompts_at_a_tty_and_the_answer_sticks(tmp_path, monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  answers = iter(["not-a-version", "3.1.4"])
+  v, commit = packaging.resolve_version(
+    bump=True, git=_git_tags(), ask=lambda p: next(answers),
+    isatty=True, root=tmp_path)
+  assert v == "3.1.4.1", "invalid input re-asked, then accepted"
+  commit()
+  # saved: the next resolve needs no prompt and no tag
+  v2, _ = packaging.resolve_version(
+    bump=False, git=_git_tags(),
+    ask=lambda p: (_ for _ in ()).throw(AssertionError("re-prompted")),
+    isatty=True, root=tmp_path)
+  assert v2 == "3.1.4.1"
+
+
+def test_no_tag_no_tty_is_a_refusal(tmp_path, monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  with pytest.raises(SystemExit, match="cannot infer"):
+    packaging.resolve_version(bump=True, git=_git_tags(),
+                              isatty=False, root=tmp_path)
+
+
+# ------------------------------------------ ranged runtime Requires --
+
+def _sources_with(tmp_path, text):
+  (tmp_path / "sources").mkdir(exist_ok=True)
+  (tmp_path / "sources" / "CMakeLists.txt").write_text(text)
+  return tmp_path
+
+
+def test_ranged_runtime_requires_flags_only_the_drifters(tmp_path):
+  """The BossDeux failure: the published binary embedded pugixml 1.16,
+  a consumer's warm cache resolved the same range to 1.15 → different
+  package_id → 'no binary' → the misleading source-build refusal.
+  Exact pins and non-runtime deps must NOT be flagged."""
+  root = _sources_with(
+    tmp_path,
+    'Require(pugixml VERSION ">=1.15 <2" CONAN pugixml)\n'
+    'Require(yaml-cpp VERSION "0.9.0" CONAN yaml-cpp)\n'
+    'Require(nlohmann_json VERSION "~3.12" PUBLIC)\n'
+    'Require(GTest VERSION ">=1.17.0" TEST CONAN gtest)\n'
+    'Require(benchmark VERSION ">=1.9.0" BENCH CONAN benchmark)\n'
+    'Require(cmake VERSION ">=3.29" TOOL)\n'
+    'Require(ZLIB VERSION ">=1.3" SYSTEM)\n'
+    'Require(anything VERSION "*")\n')
+  assert packaging.ranged_runtime_requires(root) == [
+    ("pugixml", ">=1.15 <2"),
+    ("nlohmann_json", "~3.12"),
+    ("anything", "*"),
+  ]
+
+
+def test_ranged_requires_tolerate_a_missing_listing(tmp_path):
+  assert packaging.ranged_runtime_requires(tmp_path) == []
+
+
+@pytest.mark.skipif(importlib.util.find_spec("click") is None,
+                    reason="needs click/typer (CLI-level test)")
+def test_publish_refuses_ranged_runtime_requires(tmp_path, monkeypatch):
+  """The guard sits in the publish command, before any version is
+  derived or any build starts — the range is a fact of the committed
+  listing, not of the build."""
+  from click.testing import CliRunner
+  from typer.main import get_command
+  from buildutil.app import app as cli_app
+  from buildutil import config
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  _sources_with(tmp_path, 'Require(pugixml VERSION ">=1.15 <2")\n')
+  monkeypatch.setattr(config, "REPO_ROOT", tmp_path)
+  monkeypatch.setattr("buildutil.commands.publish._enter",
+                      lambda *a, **k: None)
+  result = CliRunner().invoke(get_command(cli_app), ["publish", "--no-upload"])
+  assert result.exit_code == 2
+  assert "version RANGES" in result.output
+  assert "pugixml" in result.output
+
+
+# ----------------------------------------------- command assembly --
+
+def test_export_and_test_carry_version_and_profiles(monkeypatch):
+  _fake_project(monkeypatch, package_kind="application",
+                package_name="tool")
+  calls = []
+  packaging.export_pkg("0.3.0.2", Path("/p/host"), Path("/p/build"),
+                       run=calls.append)
+  packaging.run_package_test("0.3.0.2", Path("/p/host"), Path("/p/build"),
+                             run=calls.append)
+  assert calls[0][:3] == ["conan", "export-pkg", "."]
+  assert "--version=0.3.0.2" in calls[0]
+  assert "--profile:host=/p/host" in calls[0]
+  assert "--profile:build=/p/build" in calls[0]
+  assert calls[1][:4] == ["conan", "test", "test_package", "tool/0.3.0.2"]
+  assert "--build=missing" in calls[1]
+
+
+def test_upload_refuses_without_a_remote(monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  from buildutil import bootstrap
+  monkeypatch.setattr(bootstrap, "conan_remote_env",
+                      lambda: ("conancenter", None, None, None))
+  with pytest.raises(SystemExit, match="nowhere to publish"):
+    packaging.upload("1.0.0.1")
+  monkeypatch.setattr(bootstrap, "conan_remote_env",
+                      lambda: ("site", "https://x", "u", "p"))
+  calls = []
+  packaging.upload("1.0.0.1", run=calls.append)
+  assert calls == [["conan", "upload", "s/1.0.0.1", "-r", "site",
+                    "--confirm"]]
+
+
+def test_ref_falls_back_to_the_project_name(monkeypatch):
+  _fake_project(monkeypatch, package_kind="library")
+  assert packaging.ref("1.0.0.1") == "proj/1.0.0.1"
+
+
+def test_configured_treats_none_as_unconfigured(monkeypatch):
+  _fake_project(monkeypatch, package_kind="none")
+  assert not packaging.configured()
+  _fake_project(monkeypatch, package_kind="library")
+  assert packaging.configured()
+
+
+# --------------------------------------------------- init wizard --
+
+def test_package_switch_records_the_choice_and_scaffolds(tmp_path, monkeypatch):
+  monkeypatch.chdir(tmp_path)
+  initcmd.main(["--name", "acme", "--package", "library",
+                "--package-name", "serialize", "--no-agents"])
+  toml = (tmp_path / "buildutil.toml").read_text()
+  assert 'kind = "library"' in toml
+  assert 'name = "serialize"' in toml
+  section = toml.split("[package]")[1]
+  assert "version" not in section, "the version never lives in the source"
+  smoke = tmp_path / "test_package" / "smoke.cpp"
+  assert smoke.is_file()
+  assert "serialize" in (tmp_path / "test_package" / "CMakeLists.txt").read_text()
+  # the fresh conanfile is already the [package]-aware template
+  assert "_package_section" in (tmp_path / "conanfile.py").read_text()
+  assert not (tmp_path / "conanfile.py.bak").exists()
+
+
+def test_application_kind_scaffolds_the_app_test(tmp_path, monkeypatch):
+  monkeypatch.chdir(tmp_path)
+  initcmd.main(["--name", "tool", "--package", "application", "--no-agents"])
+  test_cf = (tmp_path / "test_package" / "conanfile.py").read_text()
+  assert "executables" in test_cf
+  assert not (tmp_path / "test_package" / "smoke.cpp").exists()
+
+
+def test_wizard_asks_at_a_tty_and_dont_package_is_remembered(tmp_path, monkeypatch):
+  monkeypatch.chdir(tmp_path)
+  monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+  answers = iter(["acme", "", "", "3"])       # name, prefixes, don't package
+  monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+  initcmd.main(["--bare", "--no-agents"])
+  assert 'kind = "none"' in (tmp_path / "buildutil.toml").read_text()
+  # re-running init must NOT re-ask: the recorded "none" answers it
+  monkeypatch.setattr("builtins.input",
+                      lambda prompt="": (_ for _ in ()).throw(
+                        AssertionError("re-asked despite recorded choice")))
+  initcmd.main(["--bare", "--no-agents"])
+
+
+def test_wizard_full_library_answers(tmp_path, monkeypatch):
+  monkeypatch.chdir(tmp_path)
+  monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+  # name, prefixes ×2, choice=library, package name (default accepted);
+  # NO version question — the version never lives in the source
+  answers = iter(["ser", "", "", "1", ""])
+  monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+  initcmd.main(["--bare", "--no-agents"])
+  toml = (tmp_path / "buildutil.toml").read_text()
+  assert 'kind = "library"' in toml
+  assert 'name = "ser"' in toml               # default accepted
+  assert "version" not in toml.split("[package]")[1]
+
+
+def test_no_package_never_asks_nor_records(tmp_path, monkeypatch):
+  monkeypatch.chdir(tmp_path)
+  monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+  monkeypatch.setattr("builtins.input",
+                      lambda prompt="": (_ for _ in ()).throw(
+                        AssertionError("asked despite --no-package")))
+  initcmd.main(["--name", "acme", "--bare", "--no-package", "--no-agents"])
+  assert "[package]" not in (tmp_path / "buildutil.toml").read_text()
+
+
+def test_upgrading_an_old_project_regenerates_the_conanfile(tmp_path, monkeypatch):
+  """The upgrade path (owner req): a project initialized before
+  packaging gains it via the same switches; its pre-packaging recipe is
+  kept as .bak, never silently lost."""
+  monkeypatch.chdir(tmp_path)
+  (tmp_path / "buildutil.toml").write_text('[project]\nname = "old"\n')
+  (tmp_path / "conanfile.py").write_text(
+    "# ancient hand-maintained recipe\nclass R: pass\n")
+  initcmd.main(["--bare", "--package", "library", "--no-agents"])
+  assert 'kind = "library"' in (tmp_path / "buildutil.toml").read_text()
+  assert (tmp_path / "conanfile.py.bak").read_text().startswith(
+    "# ancient hand-maintained recipe")
+  assert "_package_section" in (tmp_path / "conanfile.py").read_text()
+  assert (tmp_path / "test_package" / "conanfile.py").is_file()
+
+
+def test_a_recorded_choice_survives_switch_disagreement(tmp_path, monkeypatch):
+  monkeypatch.chdir(tmp_path)
+  (tmp_path / "buildutil.toml").write_text(
+    '[project]\nname = "p"\n[package]\nkind = "library"\nname = "p"\n')
+  initcmd.main(["--bare", "--package", "application", "--no-agents"])
+  # the committed record wins; changing it is a toml edit, not a re-init
+  assert 'kind = "library"' in (tmp_path / "buildutil.toml").read_text()
+
+
+# ------------------------------------------------- CLI plumbing --
+
+@pytest.mark.skipif(importlib.util.find_spec("click") is None,
+                    reason="the CLI lane needs typer/click")
+def test_publish_help_reaches_the_cli(tmp_path):
+  """publish is registered on the typer app — proven from the stdlib
+  lane via --help in a throwaway project (no conan, no build)."""
+  (tmp_path / "buildutil.toml").write_text('[project]\nname = "x"\n')
+  pkg_parent = Path(initcmd.__file__).resolve().parents[1]
+  proc = subprocess.run(
+    [sys.executable, "-m", "buildutil", "publish", "--help"],
+    cwd=tmp_path, capture_output=True, text=True,
+    env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+         "PYTHONPATH": str(pkg_parent), "BUILDUTIL_SYSTEM": "1"})
+  assert proc.returncode == 0, proc.stdout + proc.stderr
+  assert "--no-version-autoincrement" in proc.stdout
+
+
+# --------------------------------- the static-archive gap (e2e) --
+
+import shutil
+
+from buildutil import deposit
+
+CFG = {"cmake_option_prefix": "ACME", "module_define_prefix": "ACM"}
+
+e2e = pytest.mark.skipif(
+  shutil.which("cmake") is None or shutil.which("ninja") is None or
+  not (shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")),
+  reason="needs cmake, ninja and a C++ compiler")
+
+ROOT_CMAKE = """\
+cmake_minimum_required(VERSION 3.25)
+project(pkglibs CXX)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/_bdudata/cmake")
+include(buildutil)
+add_subdirectory(sources)
+"""
+
+
+def _lib_tree(tmp_path, package_kind):
+  deposit.ensure(tmp_path, {**CFG, "package_kind": package_kind})
+  (tmp_path / "CMakeLists.txt").write_text(ROOT_CMAKE)
+  src = tmp_path / "sources"
+  src.mkdir()
+  (src / "CMakeLists.txt").write_text("Scan_subdirectories()\n")
+  mod = src / "ser" / "core"
+  mod.mkdir(parents=True)
+  (mod / "CMakeLists.txt").write_text("Init_submodule()\n")
+  (mod / "impl.cpp").write_text("int core_answer() { return 42; }\n")
+  for cmd in (["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "b"),
+               "-G", "Ninja"],
+              ["cmake", "--build", str(tmp_path / "b")],
+              ["cmake", "--install", str(tmp_path / "b"),
+               "--prefix", str(tmp_path / "prefix")]):
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+  return tmp_path / "prefix"
+
+
+@e2e
+def test_a_library_package_ships_its_static_archives(tmp_path):
+  """The flagship use case (a standalone serialization library): a
+  packaged LIBRARY project must ship the .a of every module at its
+  mirrored, leaf-named spot — without this the package holds headers
+  and nothing to link."""
+  prefix = _lib_tree(tmp_path, "library")
+  archive = prefix / "ser" / "libcore.a"
+  assert archive.is_file(), "\n".join(
+    str(p) for p in prefix.rglob("*"))
+
+
+@e2e
+def test_an_unpackaged_project_install_does_not_move(tmp_path):
+  """The other half of the gate: no [package] (or kind none) keeps the
+  pre-0.47 mirror byte-identical — no stray archives appear in any
+  existing project's install output."""
+  prefix = _lib_tree(tmp_path, "")
+  assert not list(prefix.rglob("*.a")), list(prefix.rglob("*"))

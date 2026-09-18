@@ -1,0 +1,224 @@
+"""Conan packaging of the project itself (0.47): export, package test,
+publish, and the version model.
+
+A project opts in through `[package]` in buildutil.toml (kind = library
+| application, name) — written by init's packaging wizard and read by
+BOTH the driver (here) and the scaffolded conanfile.
+
+THE VERSION IS DERIVED, not declared (owner ruling): base = the last
+git tag that is a valid semantic version, plus a build number bumped on
+every publish (`--no-version-autoincrement` holds it). The pair
+persists in _bdudata/package-version.ini — checkout-local state, like
+every other _bdudata fact; a new tag resets the build counter. When no
+semver tag exists the base is PROMPTED at a tty (and saved), refused
+otherwise. An explicit `version` in [package] pins everything and
+disables the derivation — the escape hatch for projects that version
+some other way.
+
+The flow is export-pkg-based: the tree buildutil already built IS the
+package source — `conan export-pkg` runs the recipe's package() against
+the local build/install layout (the driver passes --version, the recipe
+adopts it via set_version), test_package/ consumes the cached package
+like a real consumer, and publish uploads recipe + binaries.
+
+Every conan/git invocation goes through injectable seams so command
+assembly and version derivation are testable without either tool.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+from . import config
+
+SEMVER_TAG = re.compile(r"^v?(\d+\.\d+\.\d+)$")
+
+
+def configured() -> bool:
+  # "none" is a recorded wizard answer, not a packaging config
+  return config.PROJECT["package_kind"] in ("library", "application")
+
+
+def package_name() -> str:
+  return config.PROJECT["package_name"] or config.PROJECT["name"].lower()
+
+
+def has_package_test(root: Path | None = None) -> bool:
+  root = root or config.REPO_ROOT
+  return (root / "test_package" / "conanfile.py").is_file()
+
+
+def _state_file(root: Path | None = None) -> Path:
+  return (root or config.REPO_ROOT) / "_bdudata" / "package-version.ini"
+
+
+def _load_state(root: Path | None = None) -> tuple[str, int]:
+  """(base, build) as last persisted; ("", 0) when never published."""
+  path = _state_file(root)
+  base, build = "", 0
+  if path.is_file():
+    for line in path.read_text().splitlines():
+      key, _, value = line.partition("=")
+      if key.strip() == "base":
+        base = value.strip()
+      elif key.strip() == "build":
+        try:
+          build = int(value.strip())
+        except ValueError:
+          build = 0
+  return base, build
+
+
+def _save_state(base: str, build: int, root: Path | None = None) -> None:
+  path = _state_file(root)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("# last published package version (buildutil publish)\n"
+                  f"base = {base}\nbuild = {build}\n")
+
+
+def _git_semver_base(run=subprocess.run) -> str:
+  """The newest reachable tag that is a valid semver, '' when none.
+  --merged HEAD: a tag on an unmerged branch is not this build's
+  version; newest-first so 'last tag' means what it says."""
+  proc = run(["git", "tag", "--merged", "HEAD", "--sort=-creatordate"],
+             capture_output=True, text=True)
+  if proc.returncode != 0:
+    return ""                                  # not a git repo
+  for line in proc.stdout.splitlines():
+    m = SEMVER_TAG.match(line.strip())
+    if m:
+      return m.group(1)
+  return ""
+
+
+def resolve_version(bump: bool, override: str = "", git=subprocess.run,
+                    ask=input, isatty=None,
+                    root: Path | None = None):
+  """The version to package as, and a `commit` callback that persists
+  the state — called by publish AFTER the upload succeeded, so a failed
+  or dry-run publish never consumes a build number.
+
+  THE VERSION NEVER LIVES IN THE PACKAGE SOURCE (owner ruling) — there
+  is no committed version key anywhere. Order: an explicit `override`
+  (publish --version) wins verbatim, no state touched; else base = last
+  semver git tag (a base CHANGE resets the counter); else the persisted
+  base from a previous prompt; else prompt at a tty and refuse anywhere
+  else. The build number is the persisted one +1 when `bump`, unchanged
+  otherwise."""
+  if override:
+    return override, lambda: None
+  saved_base, saved_build = _load_state(root)
+  base = _git_semver_base(git)
+  if base and base != saved_base:
+    saved_build = 0                            # a new tag restarts builds
+  if not base:
+    base = saved_base
+  if not base:
+    import sys
+    tty = sys.stdin.isatty() if isatty is None else isatty
+    if not tty:
+      raise SystemExit(
+        "buildutil: cannot infer the package version — no git tag is a "
+        "valid semantic version (x.y.z), nothing was entered before, "
+        "and this is not a terminal to ask at. Tag the repo (git tag "
+        "1.0.0), set [package] version in buildutil.toml to pin, or "
+        "run interactively to be prompted.")
+    entered = ""
+    while not SEMVER_TAG.match(entered):
+      entered = ask("package base version (semver x.y.z): ").strip()
+    base = SEMVER_TAG.match(entered).group(1)
+  build = saved_build + 1 if bump else max(saved_build, 1)
+  final_base, final_build = base, build
+  return (f"{base}.{build}",
+          lambda: _save_state(final_base, final_build, root))
+
+
+def ref(version: str) -> str:
+  return f"{package_name()}/{version}"
+
+
+_REQUIRE_RE = re.compile(
+  r'^\s*Require\s*\(\s*([\w-]+)\s+VERSION\s+"([^"]+)"(.*?)\)',
+  re.MULTILINE | re.DOTALL)
+
+# the tokens that keep a dep OUT of the consumer-facing graph — exact
+# case, like the template parser and cmake_parse_arguments (a lowercase
+# `system` is Boost's component, not the keyword)
+_NON_RUNTIME = {"SYSTEM", "TOOL", "TEST", "BENCH"}
+
+
+def ranged_runtime_requires(root: Path | None = None) -> list[tuple[str, str]]:
+  """Runtime Require() entries whose VERSION is a range — the publish
+  footgun: the published binary embeds ONE resolution of the
+  range, but every consumer re-resolves it against their own cache and
+  remotes. Any drift (a newer pugixml in a warm cache) computes a
+  different package_id, conan finds no binary, --build=missing kicks
+  in, and the recipe's source-build refusal fires — blaming driver
+  discipline for what is really version drift. SYSTEM/TOOL/TEST/BENCH
+  deps stay out: they never reach a consumer's graph."""
+  root = root or config.REPO_ROOT
+  path = root / "sources" / "CMakeLists.txt"
+  if not path.is_file():
+    return []
+  ranged = []
+  for name, version, extra in _REQUIRE_RE.findall(path.read_text()):
+    if _NON_RUNTIME & set(extra.split()):
+      continue
+    v = version.strip()
+    if v == "*" or v.startswith((">", "<", "~", "^")):
+      ranged.append((name, v))
+  return ranged
+
+
+def shared_requested() -> bool:
+  """Library packaging follows the module_linkage config: shared
+  linkage publishes the conan-standard shared=True package_id.
+  Applications declare no shared option — always False there."""
+  from . import configopts
+  return (config.PROJECT["package_kind"] == "library"
+          and configopts.get("module_linkage") == "shared")
+
+
+def export_pkg(version: str, profile: Path, build_profile: Path,
+               shared: bool = False,
+               run=subprocess.check_call) -> str:
+  """Package the locally built tree into the conan cache. The recipe's
+  layout() points at the same _build/<profile> dir buildutil built, so
+  package() (cmake --install) packages exactly what was just built.
+  --version is the ONE derivation reaching conan — the recipe adopts it
+  in set_version(), never re-deriving. -tf= : export-pkg would auto-run
+  test_package, and the callers here invoke `conan test` explicitly —
+  once, not twice."""
+  run(["conan", "export-pkg", ".", f"--version={version}", "-tf=",
+       *((["-o", "&:shared=True"]) if shared else []),
+       f"--profile:host={profile}", f"--profile:build={build_profile}"])
+  return ref(version)
+
+
+def run_package_test(version: str, profile: Path, build_profile: Path,
+                     shared: bool = False,
+                     run=subprocess.check_call) -> None:
+  """Consume the cached package the way a consumer would: build and run
+  test_package/ against the reference — requesting the same shared
+  option the export packaged, or the test computes the other
+  package_id and misses the binary. --build=missing lets the test's
+  own scaffolding deps resolve without demanding a prebuilt cache."""
+  run(["conan", "test", "test_package", ref(version),
+       *((["-o", f"{package_name()}/*:shared=True"]) if shared else []),
+       f"--profile:host={profile}", f"--profile:build={build_profile}",
+       "--build=missing"])
+
+
+def upload(version: str, run=subprocess.check_call) -> None:
+  """Recipe + binaries to the project remote; a missing remote is an
+  ERROR here (unlike the dependency-cache upload, which skips): publish
+  without a destination did not publish, and must say so."""
+  from . import bootstrap
+  name, url, _, _ = bootstrap.conan_remote_env()
+  if not url:
+    raise SystemExit(
+      "buildutil publish: no conan remote configured (CONAN_REMOTE_URL "
+      "/ .env / CI_ARTIFACTORY_*) — there is nowhere to publish to. "
+      "Configure the remote seam and re-run.")
+  run(["conan", "upload", ref(version), "-r", name, "--confirm"])

@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "buildutil"
+version = "0.80.1"
+description = "Config-seamed C++ build driver: conan + cmake + ctest + gcovr behind one CLI, project policy in buildutil.toml"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Aleksandr Ševčenko" }]
+keywords = ["cmake", "conan", "c++", "build", "ctest", "coverage"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Build Tools",
+  "Operating System :: OS Independent",
+]
+# An install_requires would drag conan onto machines that carry only the driver.
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/2bitsin/buildutil"
+
+[project.scripts]
+buildutil = "buildutil.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["buildutil", "buildutil.commands"]
+
+[tool.setuptools.package-data]
+# The cmake machinery rides inside the wheel; init and extend render it per project.
+buildutil = ["templates/cmake/**/*", "templates/project/**/*",
+             "templates/skill/**/*", "templates/package/**/*",
+             "pysupport/*.py"]
