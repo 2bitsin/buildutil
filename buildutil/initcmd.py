@@ -63,6 +63,63 @@ def _package_wizard(default_name: str) -> tuple[str, str]:
   return kind, pkg_name
 
 
+def _remote_wizard() -> dict[str, str]:
+  """The conan remote, asked at a terminal. The URL comes first because
+  an empty one means there is no remote and the rest is moot; the
+  password is read without echo and only ever reaches the .env."""
+  url = input("conan remote URL (empty = none): ").strip()
+  if not url:
+    return {}
+  name = input("conan remote name [conancenter]: ").strip() or "conancenter"
+  values = {"CONAN_REMOTE_URL": url, "CONAN_REMOTE_NAME": name}
+  user = input("conan remote user (empty = anonymous): ").strip()
+  if user:
+    import getpass
+    values["CONAN_REMOTE_USER"] = user
+    password = getpass.getpass("conan remote password: ")
+    if password:
+      values["CONAN_REMOTE_PASS"] = password
+  return values
+
+
+def _ensure_env_ignored(root: Path) -> None:
+  """A .env holding a password that git can see is the one mistake this
+  onboarding could introduce, so the ignore rule is verified, not
+  assumed — `--bare` scaffolds no .gitignore at all."""
+  path = root / ".gitignore"
+  lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+  if ".env" in [line.strip() for line in lines]:
+    return
+  with path.open("a", encoding="utf-8") as f:
+    f.write("\n# local secrets (CONAN_REMOTE_* etc.), read by buildutil's "
+            "dotenv\n.env\n")
+  print("  .gitignore: .env added")
+
+
+def _write_env(root: Path, values: dict[str, str]) -> None:
+  """CONAN_REMOTE_* into the repo-root .env — the file buildutil's
+  dotenv feeds the remote seam from. A key the file already declares is
+  the project's answer, not ours; only key NAMES are ever printed."""
+  if not values:
+    return
+  _ensure_env_ignored(root)
+  path = root / ".env"
+  text = path.read_text(encoding="utf-8") if path.is_file() else ""
+  declared = {line.partition("=")[0].strip() for line in text.splitlines()
+              if not line.lstrip().startswith("#")}
+  added = {key: value for key, value in values.items() if key not in declared}
+  if not added:
+    print("  .env declares the conan remote already — kept")
+    return
+  if not text:
+    text = "# local secrets, read by buildutil's dotenv — never committed\n"
+  elif not text.endswith("\n"):
+    text += "\n"
+  path.write_text(text + "".join(f"{k}={v}\n" for k, v in added.items()),
+                  encoding="utf-8")
+  print(f"  .env: {', '.join(added)} written (gitignored)")
+
+
 def _package_toml_section(kind: str, pkg_name: str) -> str:
   # no version key, ever: the version never lives in the package source
   lines = ["", "[package]",
@@ -157,6 +214,32 @@ def _scaffold(root: Path, name: str, cmake_prefix: str,
     print("  sources/ already exists — example hello module skipped")
 
 
+def _settings_wizard(a) -> dict[str, str]:
+  """The prompted settings, and the remote env the run will write.
+
+  Interactive when it can be: creating a toml at a real terminal with
+  nothing specified on the line asks for the key settings, defaults in
+  brackets, enter accepts -- run init and you are ready to go. Every
+  non-tty caller (CI, install --no-init'd siblings, tests) gets exactly
+  the flag/default behaviour; prompting a pipeline would hang it.
+  """
+  flagged = ({"CONAN_REMOTE_URL": a.conan_remote,
+              "CONAN_REMOTE_NAME": a.conan_remote_name or "conancenter"}
+             if a.conan_remote else {})
+  if ((Path.cwd() / "buildutil.toml").exists() or not sys.stdin.isatty()
+      or a.name != Path.cwd().name or a.cmake_prefix or a.module_prefix):
+    return flagged
+  entered = input(f"project name [{a.name}]: ").strip()
+  if entered:
+    a.name = entered
+  default_prefix = _prefix(a.name)
+  entered = input(f"cmake option prefix [{default_prefix}]: ").strip()
+  a.cmake_prefix = entered or default_prefix
+  entered = input(f"module define prefix [{a.cmake_prefix}]: ").strip()
+  a.module_prefix = entered or a.cmake_prefix
+  return flagged or _remote_wizard()
+
+
 def main(argv: list[str]) -> None:
   ap = argparse.ArgumentParser(
     prog="buildutil init",
@@ -186,27 +269,19 @@ def main(argv: list[str]) -> None:
                   help="never ask about conan packaging")
   ap.add_argument("--package-name", default="",
                   help="conan package name (default: the project name)")
+  ap.add_argument("--conan-remote", default="", metavar="URL",
+                  help="conan remote for this project, written as "
+                       "CONAN_REMOTE_URL into the gitignored .env. "
+                       "Credentials have no flag: the prompted run asks "
+                       "for them, CI passes CONAN_REMOTE_USER/PASS in "
+                       "the environment")
+  ap.add_argument("--conan-remote-name", default="", metavar="NAME",
+                  help="name to register that remote under (default: "
+                       "conancenter, so the mirror replaces the public "
+                       "default)")
   a = ap.parse_args(argv)
 
-  # Interactive when it can be: creating a toml at a real terminal with
-  # nothing specified on the line prompts for the three key settings,
-  # defaults in brackets, enter accepts -- run init and you are ready to
-  # go. Every non-tty caller (CI, install --no-init'd siblings, tests)
-  # gets exactly the old flag/default behaviour; prompting a pipeline
-  # would hang it.
-  toml_exists = (Path.cwd() / "buildutil.toml").exists()
-  if (not toml_exists and sys.stdin.isatty()
-      and not (a.name != Path.cwd().name or a.cmake_prefix
-               or a.module_prefix)):
-    entered = input(f"project name [{a.name}]: ").strip()
-    if entered:
-      a.name = entered
-    default_prefix = _prefix(a.name)
-    entered = input(f"cmake option prefix [{default_prefix}]: ").strip()
-    a.cmake_prefix = entered or default_prefix
-    entered = input(
-      f"module define prefix [{a.cmake_prefix}]: ").strip()
-    a.module_prefix = entered or a.cmake_prefix
+  remote_env = _settings_wizard(a)
 
   cmake_prefix = a.cmake_prefix or _prefix(a.name)
   module_prefix = a.module_prefix or cmake_prefix
@@ -258,6 +333,8 @@ def main(argv: list[str]) -> None:
     # fresh clone whether or not the project also vendors the package
     from .installcmd import write_launcher
     write_launcher(root)
+
+  _write_env(root, remote_env)
 
   # ---- conan packaging: the committed [package] choice ----
   # An explicit --package wins; otherwise, at a tty and with no choice

@@ -2312,6 +2312,23 @@ function(_buildutil_install_one_runtime_tree root level
   set(${io_levels} "${_it_levels}" PARENT_SCOPE)
 endfunction()
 
+# One staged runtime file, in BOTH in-tree locations.
+#
+# The overlay is prefix-rooted, so the build root is where the install
+# tree's shape is reproduced -- but executables link into <build>/bin,
+# and a program that resolves its assets relative to its own executable
+# (the Pascal-parity shape, and the only one a dlopen'ed library's
+# neighbours can use) looked beside the binary and found nothing.
+# Installed, the same lookup works, because there the app sits at the
+# prefix root with the data. Mirroring under bin/ makes the in-tree run
+# answer the way the installed one does; both copies are the build
+# system's, so the duplication costs a configure-time copy and no
+# decision by anyone reading the tree.
+function(_buildutil_stage_runtime_file rel src)
+  configure_file("${src}" "${CMAKE_BINARY_DIR}/${rel}" COPYONLY)
+  configure_file("${src}" "${CMAKE_BINARY_DIR}/bin/${rel}" COPYONLY)
+endfunction()
+
 # EMIT phase: the winners, staged over the build root and installed.
 function(_buildutil_emit_runtime_data names files)
   list(LENGTH names count)
@@ -2326,10 +2343,8 @@ function(_buildutil_emit_runtime_data names files)
     # a PREFIX-ROOTED overlay: the path inside the *.install tree IS the
     # shipped path -- data.install/a/b/c lands at <prefix>/a/b/c, so a
     # module places data anywhere in the install tree by mirroring that
-    # location, and no destination rule exists to learn. Staged over the
-    # BUILD root the same way, so the two trees agree about data even
-    # though executables sit in <build>/bin.
-    configure_file("${f}" "${CMAKE_BINARY_DIR}/${rel}" COPYONLY)
+    # location, and no destination rule exists to learn.
+    _buildutil_stage_runtime_file("${rel}" "${f}")
     if(rel_dir)
       install(FILES "${f}" DESTINATION "${rel_dir}")
     else()
@@ -4162,6 +4177,12 @@ function(Add_generated_source)
       add_dependencies(${_data_lib} ${_data_wrap})
     endif()
     foreach(_data_out IN ITEMS "${GEN_OUTPUT}" ${GEN_SIDE_OUTPUTS})
+      # the same both-locations rule as a *.install/ file, one phase
+      # later: this one only exists once the generator has run
+      add_custom_command(TARGET ${_data_wrap} POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${CMAKE_BINARY_DIR}/${_data_out}"
+                "${CMAKE_BINARY_DIR}/bin/${_data_out}")
       get_filename_component(_data_dir "${_data_out}" DIRECTORY)
       if(_data_dir)
         install(FILES "${CMAKE_BINARY_DIR}/${_data_out}" DESTINATION "${_data_dir}")

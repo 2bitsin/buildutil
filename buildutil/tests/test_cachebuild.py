@@ -135,3 +135,61 @@ def test_cache_build_refuses_outside_a_project(tmp_path):
          "PYTHONPATH": str(PKG_PARENT)})
   assert proc.returncode != 0
   assert "no buildutil.toml" in proc.stderr + proc.stdout
+
+
+# ------------------------------------------ [venv] extra_deps on this lane
+# A cache build runs under the CONSUMER's conan interpreter, inside
+# their cache, so it may neither build a venv there nor pip-install
+# behind their back. What it must not do either is let the declaration
+# fail as a missing cmake package three steps later.
+
+def _declaring(root, deps):
+  root.joinpath("buildutil.toml").write_text(
+    '[project]\nname = "p"\ncmake_option_prefix = "PX"\n'
+    'module_define_prefix = "PM"\n'
+    f"[venv]\nextra_deps = {deps!r}\n"
+    '[package]\nkind = "library"\nname = "p"\n'.replace("'", '"'))
+
+
+def test_a_missing_declared_dependency_is_named_before_cmake(cache_tree):
+  root, bin_dir, gen, log = cache_tree
+  _declaring(root, ["nosuchdist-buildutil==9.9.9"])
+  proc = _run_cache_build(root, bin_dir, gen, log)
+  assert proc.returncode != 0
+  message = proc.stdout + proc.stderr
+  assert "extra_deps" in message
+  assert "nosuchdist-buildutil==9.9.9" in message
+  assert not log.exists(), "cmake ran despite the missing declaration"
+
+
+def test_a_satisfied_declaration_builds_as_before(cache_tree):
+  root, bin_dir, gen, log = cache_tree
+  _declaring(root, ["pytest"])
+  proc = _run_cache_build(root, bin_dir, gen, log)
+  assert proc.returncode == 0, proc.stdout + proc.stderr
+  assert log.exists()
+
+
+def test_the_opt_in_installs_into_the_running_interpreter(monkeypatch,
+                                                          tmp_path):
+  from buildutil import cachebuild, config
+  monkeypatch.setattr(config, "PROJECT",
+                      {**config.PROJECT,
+                       "venv_extra_deps": ["nosuchdist-buildutil==9.9.9"]})
+  monkeypatch.setenv("BUILDUTIL_CACHE_BUILD_DEPS", "install")
+  installed = []
+  monkeypatch.setattr(cachebuild.subprocess, "check_call",
+                      lambda cmd, **kw: installed.append(cmd))
+  cachebuild._require_declared_deps()
+  assert installed == [[sys.executable, "-m", "pip", "install",
+                        "nosuchdist-buildutil==9.9.9"]]
+
+
+def test_no_declaration_installs_nothing(monkeypatch):
+  from buildutil import cachebuild, config
+  monkeypatch.setattr(config, "PROJECT",
+                      {**config.PROJECT, "venv_extra_deps": []})
+  monkeypatch.setattr(cachebuild.subprocess, "check_call",
+                      lambda cmd, **kw: (_ for _ in ()).throw(
+                        AssertionError("installed without a declaration")))
+  cachebuild._require_declared_deps()

@@ -310,6 +310,59 @@ def test_the_install_tree_installs_as_a_prefix_overlay(tmp_path):
   assert (prefix / "helper" / "en.nls").is_file()
 
 
+EXE_RELATIVE_MAIN = """\
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+int main(int, char** argv) {
+  auto const beside = std::filesystem::path(argv[0]).parent_path();
+  std::ifstream in(beside / "helper" / "en.nls");
+  std::string line;
+  std::getline(in, line);
+  return line == "nested" ? 0 : 1;
+}
+"""
+
+
+def test_an_exe_relative_lookup_finds_its_data_in_tree(tmp_path):
+  """The in-tree run has to behave like the installed one. Apps run from
+  <build>/bin while the overlay stages at the build root, so a program
+  resolving its assets relative to its own executable -- the common
+  shape, and the only one for a dlopen'ed library's neighbours -- found
+  nothing in-tree and everything after install. Proved by RUNNING it."""
+  _tree(tmp_path, {"tool": {"main.cpp": EXE_RELATIVE_MAIN}})
+  data = tmp_path / "sources" / "tool" / "runtime.install"
+  (data / "helper").mkdir(parents=True)
+  (data / "helper" / "en.nls").write_text("nested\n")
+  built = _build(tmp_path)
+  assert built.returncode == 0, built.stdout + built.stderr
+  app = tmp_path / "b" / "bin" / "tool"
+  ran = subprocess.run([str(app)], capture_output=True, text=True)
+  assert ran.returncode == 0, (
+    "the app found no data beside itself in the build tree")
+  # and the staged build-root overlay is still there: it is the
+  # documented contract, and the install tree is rooted the same way
+  assert (tmp_path / "b" / "helper" / "en.nls").is_file()
+
+
+def test_the_installed_layout_answers_the_same_lookup(tmp_path):
+  """The same binary, installed, resolves the same relative path -- the
+  two trees agreeing is the whole point."""
+  _tree(tmp_path, {"tool": {"main.cpp": EXE_RELATIVE_MAIN}})
+  data = tmp_path / "sources" / "tool" / "runtime.install"
+  (data / "helper").mkdir(parents=True)
+  (data / "helper" / "en.nls").write_text("nested\n")
+  assert _build(tmp_path).returncode == 0
+  prefix = tmp_path / "inst"
+  done = subprocess.run(["cmake", "--install", str(tmp_path / "b"),
+                         "--prefix", str(prefix)],
+                        capture_output=True, text=True)
+  assert done.returncode == 0, done.stdout + done.stderr
+  ran = subprocess.run([str(prefix / "tool")], capture_output=True, text=True)
+  assert ran.returncode == 0
+
+
 def test_sources_under_install_are_data_not_code(tmp_path):
   """The source glob is recursive, so without an exclusion a .cpp in the
   data tree would be compiled into the module — silently, and only for

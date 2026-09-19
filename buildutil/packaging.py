@@ -26,6 +26,7 @@ assembly and version derivation are testable without either tool.
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -92,9 +93,61 @@ def _git_semver_base(run=subprocess.run) -> str:
   return ""
 
 
+_VERSION_RE = re.compile(r"^(\d+\.\d+\.\d+)\.(\d+)$")
+
+
+def remote_builds(base: str, run=subprocess.run) -> list[int] | None:
+  """The build numbers this base already has ON THE REMOTE, or None
+  when the remote cannot answer (unconfigured, unreachable, or an
+  output this cannot read). The whole package is listed and filtered
+  here rather than passed as a version pattern: a pattern conan
+  declines to match looks exactly like an empty remote, and seeding
+  from an empty remote is the bug."""
+  from . import bootstrap
+  name, url, _, _ = bootstrap.conan_remote_env()
+  if not url:
+    return None
+  proc = run(["conan", "list", f"{package_name()}/*", "-r", name,
+              "--format=json"], capture_output=True, text=True)
+  if proc.returncode != 0:
+    return None
+  try:
+    listing = json.loads(proc.stdout)
+  except ValueError:
+    return None
+  builds = []
+  for refs in listing.values():
+    if not isinstance(refs, dict):
+      continue
+    for ref in refs:
+      pkg, _, version = str(ref).partition("/")
+      m = _VERSION_RE.match(version)
+      if pkg == package_name() and m and m.group(1) == base:
+        builds.append(int(m.group(2)))
+  return builds
+
+
+def _seed_build(base: str, saved: int, conan) -> int:
+  """The highest build number this base is known to have anywhere: the
+  counter alone is per-checkout state, so two boxes on the same tag
+  both produce x.y.z.1 and conan resolves the range to the higher one
+  — the older code winning. The remote is the shared ledger; when it
+  cannot answer, the local state still bounds the answer from below."""
+  from . import bootstrap
+  if not bootstrap.conan_remote_env()[1]:
+    return saved
+  published = remote_builds(base, run=conan)
+  if published is None:
+    print("conan remote could not be asked for published build numbers "
+          "— using this checkout's counter (a publish from another box "
+          "may shadow this one; --version overrides).")
+    return saved
+  return max([saved, *published])
+
+
 def resolve_version(bump: bool, override: str = "", git=subprocess.run,
                     ask=input, isatty=None,
-                    root: Path | None = None):
+                    root: Path | None = None, conan=subprocess.run):
   """The version to package as, and a `commit` callback that persists
   the state — called by publish AFTER the upload succeeded, so a failed
   or dry-run publish never consumes a build number.
@@ -104,8 +157,9 @@ def resolve_version(bump: bool, override: str = "", git=subprocess.run,
   (publish --version) wins verbatim, no state touched; else base = last
   semver git tag (a base CHANGE resets the counter); else the persisted
   base from a previous prompt; else prompt at a tty and refuse anywhere
-  else. The build number is the persisted one +1 when `bump`, unchanged
-  otherwise."""
+  else. The build number is one above the highest this base is known to
+  carry — the remote's published set, floored by the persisted counter
+  — when `bump`, and the persisted one unchanged otherwise."""
   if override:
     return override, lambda: None
   saved_base, saved_build = _load_state(root)
@@ -127,7 +181,10 @@ def resolve_version(bump: bool, override: str = "", git=subprocess.run,
     while not SEMVER_TAG.match(entered):
       entered = ask("package base version (semver x.y.z): ").strip()
     base = SEMVER_TAG.match(entered).group(1)
-  build = saved_build + 1 if bump else max(saved_build, 1)
+  # only a BUMP consults the remote: holding the number means
+  # republishing the one this checkout last used
+  build = (_seed_build(base, saved_build, conan) + 1 if bump
+           else max(saved_build, 1))
   final_base, final_build = base, build
   return (f"{base}.{build}",
           lambda: _save_state(final_base, final_build, root))

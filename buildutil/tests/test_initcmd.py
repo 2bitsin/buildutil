@@ -1,6 +1,8 @@
 """`buildutil init` scaffolds a buildable hello-world tree — and never
 overwrites what a project already owns."""
 import ast
+import shutil
+import subprocess
 
 import pytest
 
@@ -142,3 +144,109 @@ def test_scaffolded_hello_includes_resolve(fresh):
     text = (fresh / "sources" / "demo" / "hello" / rel).read_text()
     assert '#include "demo/hello/hello.hpp"' in text, rel
     assert "@NAME@" not in text
+
+
+# --------------------------------------------- the conan remote seam
+# A project's remote is onboarding, not lore to find in a doc: the
+# prompting run asks for it and writes CONAN_REMOTE_* into the
+# gitignored .env. Credentials have no command-line spelling at all —
+# argv is readable in the process table and lands in every log.
+
+@pytest.fixture
+def prompted(monkeypatch):
+  """Drive init's terminal path with scripted answers."""
+  def drive(answers, secrets=()):
+    typed, hidden = list(answers), list(secrets)
+    monkeypatch.setattr(initcmd.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input",
+                        lambda prompt="": typed.pop(0) if typed else "")
+    import getpass
+    monkeypatch.setattr(getpass, "getpass",
+                        lambda prompt="": hidden.pop(0) if hidden else "")
+  return drive
+
+
+def _env_values(root):
+  out = {}
+  for line in (root / ".env").read_text().splitlines():
+    if "=" in line and not line.startswith("#"):
+      key, _, value = line.partition("=")
+      out[key.strip()] = value.strip()
+  return out
+
+
+def test_the_prompted_run_writes_the_remote_into_env(fresh, prompted):
+  prompted(["demo", "", "", "https://repo.example/conan", "mirror",
+            "alice", "3"], secrets=["s3cret"])
+  initcmd.main([])
+  assert _env_values(fresh) == {
+    "CONAN_REMOTE_URL": "https://repo.example/conan",
+    "CONAN_REMOTE_NAME": "mirror",
+    "CONAN_REMOTE_USER": "alice",
+    "CONAN_REMOTE_PASS": "s3cret"}
+
+
+def test_an_empty_remote_url_writes_no_env(fresh, prompted):
+  prompted(["demo", "", "", "", "3"])
+  initcmd.main([])
+  assert not (fresh / ".env").exists()
+
+
+def test_the_prompted_password_is_never_printed(fresh, prompted, capsys):
+  prompted(["demo", "", "", "https://repo.example/conan", "", "alice", "3"],
+           secrets=["s3cret"])
+  initcmd.main([])
+  assert "s3cret" not in capsys.readouterr().out
+
+
+def test_the_remote_is_flagged_for_a_non_interactive_run(fresh):
+  initcmd.main(["--name", "demo", "--conan-remote",
+                "https://repo.example/conan",
+                "--conan-remote-name", "mirror"])
+  assert _env_values(fresh) == {
+    "CONAN_REMOTE_URL": "https://repo.example/conan",
+    "CONAN_REMOTE_NAME": "mirror"}
+
+
+def test_the_remote_name_defaults_to_conancenter(fresh):
+  initcmd.main(["--name", "demo", "--conan-remote", "https://r.example/c"])
+  assert _env_values(fresh)["CONAN_REMOTE_NAME"] == "conancenter"
+
+
+def test_credentials_have_no_command_line_spelling(fresh):
+  for flag in ("--conan-remote-user", "--conan-remote-pass",
+               "--conan-remote-password"):
+    with pytest.raises(SystemExit):
+      initcmd.main(["--name", "demo", "--conan-remote", "https://r.example/c",
+                    flag, "alice"])
+
+
+def test_an_existing_env_keeps_what_it_declares(fresh):
+  (fresh / ".env").write_text("CONAN_REMOTE_URL=https://mine.example\n")
+  initcmd.main(["--name", "demo", "--conan-remote", "https://other.example",
+                "--conan-remote-name", "mirror"])
+  values = _env_values(fresh)
+  assert values["CONAN_REMOTE_URL"] == "https://mine.example"
+  assert values["CONAN_REMOTE_NAME"] == "mirror"
+
+
+def test_the_scaffolded_gitignore_hides_the_env(fresh):
+  initcmd.main(["--name", "demo"])
+  assert ".env" in (fresh / ".gitignore").read_text().splitlines()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_an_underscored_private_header_is_invisible_to_git(fresh):
+  """The documented collision, proved with git itself: the build
+  system reads a leading underscore as "not exported" and the
+  scaffolded .gitignore reads it as "derived, local working state", so
+  a header marked private by one convention is never committed by the
+  other. Until a marker exists that does not spend the underscore, the
+  docs have to say so."""
+  initcmd.main(["--name", "demo"])
+  subprocess.run(["git", "init", "-q"], cwd=fresh, check=True)
+  header = fresh / "sources" / "demo" / "hello" / "_detail.hpp"
+  header.write_text("#pragma once\n")
+  ignored = subprocess.run(["git", "check-ignore", "-q", str(header)],
+                           cwd=fresh)
+  assert ignored.returncode == 0

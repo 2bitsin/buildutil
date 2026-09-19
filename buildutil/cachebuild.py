@@ -30,6 +30,34 @@ import sys
 from pathlib import Path
 
 
+def _require_declared_deps() -> None:
+  """`[venv] extra_deps` on the cache lane. The declaring project gets
+  them from its own venv; here there is none and must be none — this
+  runs under the CONSUMER's conan interpreter, inside their cache. So
+  the declaration is checked and named up front, where the reader can
+  act on it, instead of surfacing three steps later as a cmake package
+  that cannot be found. BUILDUTIL_CACHE_BUILD_DEPS=install is the
+  consumer saying yes to pip touching that interpreter."""
+  from . import bootstrap, config
+  missing = bootstrap.unsatisfied(config.PROJECT["venv_extra_deps"])
+  if not missing:
+    return
+  if os.environ.get("BUILDUTIL_CACHE_BUILD_DEPS") == "install":
+    print(f"cache-build: installing declared [venv] extra_deps into "
+          f"{sys.executable}: {', '.join(missing)}")
+    subprocess.check_call(
+      [sys.executable, "-m", "pip", "install", *missing])
+    return
+  sys.exit(
+    f"buildutil cache-build: this package declares [venv] extra_deps = "
+    f"{', '.join(missing)}, and the interpreter running the cache build "
+    f"({sys.executable}) does not carry them. A cache build must not "
+    "grow a venv inside the conan cache and will not install into your "
+    "interpreter uninvited, so it stops here rather than failing later "
+    "as a missing cmake package. Install them into that interpreter, or "
+    "re-run with BUILDUTIL_CACHE_BUILD_DEPS=install.")
+
+
 def main(argv: list[str]) -> None:
   ap = argparse.ArgumentParser(
     prog="buildutil cache-build",
@@ -57,6 +85,7 @@ def main(argv: list[str]) -> None:
   from . import config, deposit, modules
   root = config.require_project()
   os.chdir(root)
+  _require_declared_deps()
 
   deposit_dir = deposit.ensure(root, config.PROJECT,
                                config.PROJECT["cmake_extensions"])

@@ -65,9 +65,15 @@ it makes the recipe advertise a library that is not one.
 `buildutil publish` derives it: the base is the last git tag reachable
 from `HEAD` that is a valid semantic version, and the build number is
 bumped **on a successful upload only**, giving a four-component
-`1.2.3.1`. The pair persists in `_bdudata/package-version.ini`, which is
-checkout-local state like everything else under `_bdudata`, and a new tag
-resets the counter. With no semver tag the base is prompted at a terminal
+`1.2.3.1`. The number is one above the highest this base is known to
+carry anywhere — a `conan list` against the configured remote, floored
+by the counter persisted in `_bdudata/package-version.ini` — so two
+boxes publishing the same tag no longer both produce `1.2.3.1`, where
+the second is shadowed by the first for every range consumer. The local
+counter is checkout-local state like everything else under `_bdudata`,
+and a new tag resets it. An unreachable or unconfigured remote falls
+back to that counter with a note, and `--version` remains the offline
+escape. With no semver tag the base is prompted at a terminal
 and saved, and refused otherwise. `--version X.Y.Z.B` overrides and
 persists nothing, `--no-version-autoincrement` holds the number, and a
 dry run consumes nothing. There is deliberately **no `[package] version`
@@ -77,19 +83,30 @@ key**: writing one does nothing.
 
 `buildutil publish` is build → `conan export-pkg` of the built tree →
 `conan test test_package` against the cache → upload of the recipe and
-its binaries. `--release` is the default and `--debug` the alternative,
-and `--no-upload` stops after the package test as a local dry run. An
-unconfigured remote is a hard error for `publish`, unlike the dependency
-upload after an ordinary build, which is merely skipped with a note when
-there is nowhere to send it.
+its binaries, **for both configurations**: Release and then Debug, one
+version and one build number, uploaded together. A package that exists
+Release-only cannot be resolved by a consumer whose profile is Debug —
+conan computes a different `package_id`, finds no binary and lands in
+the recipe's source-build refusal — so covering both is the default and
+publish time is roughly double a single-configuration build. `--release`
+or `--debug` narrows the run to that one configuration, and says at the
+end which consumers it left without a binary. `--no-upload` stops after
+the package test as a local dry run. An unconfigured remote is a hard
+error for `publish`, unlike the dependency upload after an ordinary
+build, which is merely skipped with a note when there is nowhere to send
+it.
 
-Uploads happen by default whenever a remote with credentials is
-configured, and are skipped with a note when one is not: the remote is
-the fleet's binary cache, and a pipeline that quietly rebuilds ffmpeg,
-opencv and x264 from source is what the default exists to prevent. The
-switch that turns it off on a build verb is
-`--skip-dependency-upload-so-everyone-rebuilds-from-source`, which nobody
-types by habit.
+The dependency upload after a build happens by default, because the
+remote is the fleet's binary cache and a pipeline that quietly rebuilds
+ffmpeg, opencv and x264 from source is what the default exists to
+prevent. It runs only where it can succeed: the seam needs a URL,
+`CONAN_REMOTE_USER` and `CONAN_REMOTE_PASS`, and a login the server
+accepted at registration time. No URL, an anonymous remote, or
+credentials the server refused each skip the upload with a one-line
+note, so reading from someone else's remote never pushes a local cache
+at it. The switch that turns the upload off where it would otherwise
+run is `--skip-dependency-upload-so-everyone-rebuilds-from-source`,
+which nobody types by habit.
 
 A runtime `Require(NAME VERSION "…")` whose version is a range — `*`, or
 anything starting `>`, `<`, `~` or `^` — is refused with exit 2 unless
@@ -125,9 +142,18 @@ stdlib-only — no venv, no nested conan, no network — renders the cmake
 machinery and configures and builds against the toolchain conan already
 generated, with the consumer's own resolution of every `Require()`. The
 division of labour is the point: conan owns the dependency graph,
-`cache-build` owns nothing but the machinery. Configure-time code
-generation runs under the consumer's conan python, so a package whose
-generators need `[venv] extra_deps` may still want prebuilt binaries for
+`cache-build` owns nothing but the machinery.
+
+Configure-time code generation runs under the consumer's conan python,
+which has never seen the package's `[venv] extra_deps`. A cache build
+must not grow a venv inside the conan cache, and installing into a
+consumer's interpreter uninvited is not the driver's call either, so a
+declaration that interpreter does not already satisfy stops the build
+up front, naming the requirement — rather than surfacing later as a
+cmake package that cannot be found. The consumer says yes with
+`BUILDUTIL_CACHE_BUILD_DEPS=install`, which pip-installs exactly the
+missing declarations into that interpreter. A package whose generators
+need `[venv] extra_deps` therefore still wants prebuilt binaries for
 exotic consumers.
 
 ## A dependency's runtime payload

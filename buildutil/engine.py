@@ -1479,15 +1479,15 @@ def _install_tree(build_dir: Path, *, tests: bool, bench: bool) -> None:
 def _upload_to_remote() -> None:
   """Push every package in the local conan cache to the project remote.
 
-  Default behaviour for every build-triggering subcommand. Reads the
-  same env seam as the registration (bootstrap.conan_remote_env —
-  CONAN_REMOTE_* / .env / CI_ARTIFACTORY_*). Skips with a one-line note
-  when no remote URL is configured.
+  Default behaviour for every build-triggering subcommand, gated by
+  what the remote seam can actually do (bootstrap.upload_target):
+  no URL, an anonymous remote or a login the server refused all skip
+  with a one-line note rather than failing the build at the server.
   """
   from . import bootstrap
-  name, url, _, _ = bootstrap.conan_remote_env()
-  if not url:
-    print("conan remote unset — skipping upload.", flush=True)
+  name, note = bootstrap.upload_target()
+  if not name:
+    print(note, flush=True)
     return
   # self-heal a vanished remote: the registration lives in CONAN_HOME,
   # and a retried CI job can start on a cache the pipeline's cleanup

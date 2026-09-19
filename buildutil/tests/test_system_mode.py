@@ -134,9 +134,9 @@ def test_system_mode_installs_nothing_without_a_declaration(tmp_path):
 
 def test_an_exact_pin_already_installed_is_satisfied():
   version = importlib.metadata.version("pytest")
-  assert bootstrap._unsatisfied([f"pytest=={version}"]) == []
-  assert bootstrap._unsatisfied(["pytest==0.0.1"]) == ["pytest==0.0.1"]
-  assert bootstrap._unsatisfied(["nosuchdist"]) == ["nosuchdist"]
+  assert bootstrap.unsatisfied([f"pytest=={version}"]) == []
+  assert bootstrap.unsatisfied(["pytest==0.0.1"]) == ["pytest==0.0.1"]
+  assert bootstrap.unsatisfied(["nosuchdist"]) == ["nosuchdist"]
 
 
 def test_system_mode_refuses_an_unwritable_interpreter(monkeypatch, capsys):

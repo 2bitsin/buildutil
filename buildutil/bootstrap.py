@@ -77,6 +77,12 @@ def conan_remote_env() -> tuple[str, str | None, str | None, str | None]:
   return name, url, user, pw
 
 
+def _remote_fingerprint(name: str, url: str, user: str | None,
+                        pw: str | None) -> str:
+  return hashlib.sha256(
+    "\x1f".join([name, url, user or "", pw or ""]).encode()).hexdigest()
+
+
 def _conan_bin() -> str | None:
   """The venv's pinned conan when it exists, else whatever PATH holds
   (BUILDUTIL_SYSTEM images carry conan in the image venv, not _pyvenv)."""
@@ -150,6 +156,49 @@ def _login_with_retries(conan: str, name: str, user: str, pw: str,
   return False
 
 
+def _login_stamp(home: Path) -> Path:
+  return home / "buildutil-remote-login.stamp"
+
+
+def _record_login(name: str, url: str, user: str | None, pw: str | None,
+                  accepted: bool) -> None:
+  """Remember whether the server ACCEPTED this seam's credentials. The
+  registration is stamp-guarded and runs once per credential change, so
+  the answer has to outlive the process that learned it; it is
+  fingerprinted on the whole seam, because a rotated password is a
+  credential nothing has accepted yet."""
+  home = _resolved_conan_home()
+  stamp = _login_stamp(home)
+  if accepted:
+    home.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(_remote_fingerprint(name, url, user, pw))
+  else:
+    stamp.unlink(missing_ok=True)
+
+
+def upload_target() -> tuple[str | None, str]:
+  """The remote a build may push its dependency binaries to, or None
+  with the one-line reason it may not. An upload needs a write
+  credential the server took: an anonymous remote cannot accept one,
+  and a rejected login must not be re-offered once per build."""
+  name, url, user, pw = conan_remote_env()
+  if not url:
+    return None, "conan remote unset — skipping upload."
+  if not (user and pw):
+    return None, (f"conan remote {name!r} is anonymous (no "
+                  "CONAN_REMOTE_USER / CONAN_REMOTE_PASS) — skipping "
+                  "upload.")
+  try:
+    accepted = (_login_stamp(_resolved_conan_home()).read_text()
+                == _remote_fingerprint(name, url, user, pw))
+  except OSError:
+    accepted = False
+  if not accepted:
+    return None, (f"no accepted login to conan remote {name!r} — "
+                  "skipping upload.")
+  return name, ""
+
+
 def register_conan_remote() -> bool:
   """Register + log into the project's conan remote from the env seam
   (conan_remote_env — CONAN_REMOTE_* / .env / CI_ARTIFACTORY_*). No URL
@@ -187,7 +236,9 @@ def register_conan_remote() -> bool:
   if user and pw:
     print(f"+ conan remote login {name} {user} (password from env)")
     remote_reachable = _login_with_retries(conan, name, user, pw, env)
+    _record_login(name, url, user, pw, remote_reachable)
   else:
+    _record_login(name, url, user, pw, False)
     # no credentials: an anonymous mirror. There is nothing to probe
     # without a login round-trip, so trust the URL as given.
     remote_reachable = True
@@ -237,8 +288,7 @@ def ensure_conan_remote(force: bool = False) -> None:
     return
   home = _resolved_conan_home()
   stamp = home / "buildutil-remote.stamp"
-  fingerprint = hashlib.sha256(
-    "\x1f".join([name, url, user or "", pw or ""]).encode()).hexdigest()
+  fingerprint = _remote_fingerprint(name, url, user, pw)
   if not force:
     try:
       registered = any(
@@ -308,7 +358,9 @@ def _create_venv() -> None:
   ensure_conan_remote(force=True)
 
 
-def _unsatisfied(deps: list[str]) -> list[str]:
+def unsatisfied(deps: list[str]) -> list[str]:
+  """The declarations the running interpreter does not already carry;
+  anything but an exact pin is pip's call once the name is present."""
   missing = []
   for dep in deps:
     name = re.split(r"[<>=!~\[; ]", dep, maxsplit=1)[0]
@@ -318,7 +370,6 @@ def _unsatisfied(deps: list[str]) -> list[str]:
     except importlib.metadata.PackageNotFoundError:
       missing.append(dep)
     else:
-      # anything but an exact pin is pip's call once the name is present
       if pin and have != pin:
         missing.append(dep)
   return missing
@@ -328,7 +379,7 @@ def _install_declared_deps() -> None:
   # System mode has no project venv for a declaration to land in, so
   # `[venv] extra_deps` reached cmake as a missing package; the base
   # deps stay unchecked, an image without conan being broken, not a gap.
-  wanted = _unsatisfied(config.PROJECT["venv_extra_deps"])
+  wanted = unsatisfied(config.PROJECT["venv_extra_deps"])
   if "reflect" in config.PROJECT["cmake_extensions"]:
     # by import: the wheel also has to hand over a loadable libclang
     probe = subprocess.run([sys.executable, "-c", "import clang.cindex"],

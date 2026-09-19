@@ -60,7 +60,9 @@ clang). See [toolchains.md](toolchains.md). `--conan-home PATH` moves the
 conan cache off the default `<repo>/_conanhome`.
 
 The dependency upload after a build is the fleet's binary cache, so it
-happens by default. The switch that turns it off is
+happens by default — whenever the remote seam carries credentials the
+server accepted; an unset, anonymous or refusing remote skips it with a
+one-line note. The switch that turns it off is
 `--skip-dependency-upload-so-everyone-rebuilds-from-source`: nobody types
 that casually, which is the point — the old `--no-upload` had become a
 flag people passed out of habit, its warning filtered away, and every
@@ -87,7 +89,14 @@ exists; `--bare` gets the toml and the machinery alone. `--name`,
 `--cmake-prefix` and `--module-prefix` name the project and its prefixes,
 `--package library|application`, `--no-package` and `--package-name`
 answer the packaging question ahead of the prompt, and `--no-agents`
-skips the agent skill.
+skips the agent skill. The prompted run also onboards the conan remote
+— URL (empty means none), name, user and password — and writes the
+answers as `CONAN_REMOTE_*` into the repo-root `.env`, which the
+scaffolded `.gitignore` hides; `--conan-remote URL` and
+`--conan-remote-name NAME` do the same for a script. Credentials have
+no flag anywhere: argv is readable in the process table, so a
+non-interactive run passes `CONAN_REMOTE_USER` and `CONAN_REMOTE_PASS`
+in the environment instead.
 
 **`buildutil install`** vendors the whole running package into a tracked
 `<repo>/.buildutil/` and writes the `./buildutil` launcher, so a fresh

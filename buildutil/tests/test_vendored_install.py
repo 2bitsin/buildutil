@@ -212,13 +212,14 @@ def test_reinstalling_over_the_running_copy_is_a_noop(tmp_path):
 
 
 def test_init_prompts_at_a_terminal(tmp_path, monkeypatch):
-  """Run init, answer three questions, ready to go. Only at a tty with
+  """Run init, answer the questions, ready to go. Only at a tty with
   nothing on the line — a pipeline that got prompted would hang."""
   from buildutil import initcmd
   monkeypatch.chdir(tmp_path)
   monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-  # name, cmake prefix (default), module prefix, packaging choice (no)
-  answers = iter(["acme", "", "ACM", "3"])
+  # name, cmake prefix (default), module prefix, conan remote (none),
+  # packaging choice (no)
+  answers = iter(["acme", "", "ACM", "", "3"])
   monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
   initcmd.main(["--bare"])
   toml = (tmp_path / "buildutil.toml").read_text()

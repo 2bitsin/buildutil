@@ -216,7 +216,20 @@ a sibling cannot compile in the project and break on install. Header
 extensions are `.h .hpp .hxx .hh .inl .ipp`. Export is opt-out: a leading
 underscore on the file or on any directory component keeps a header
 private, as do `*.test/`, `*.bench/`, `*.install/`, `*.embed/` and
-dot-directories. Kind tags are deliberately **not** stripped here, unlike
+dot-directories.
+
+Mind the collision before reaching for the underscore: in a project
+scaffolded by `buildutil init` — every project — the first rule of
+`.gitignore` is `_*`, the derived-state convention above, so a header
+named `_detail.hpp` compiles, tests green and is **never committed**.
+`_posix.hpp` and `_win32.hpp` were written, built on four
+configurations and were invisible in `git status`. Punching a hole in
+the ignore file leaves two rules fighting over one character forever,
+so the working spelling for a private header today is an ordinary name
+that no re-export block names — `native-file.posix.hpp` — which keeps
+it out of the API but not out of the installed package. A marker that
+says "real source, not exported" without spending the underscore is an
+open question, not a feature. Kind tags are deliberately **not** stripped here, unlike
 the binary mirror, because the in-tree spelling resolves through
 `sources/` with literal directory names.
 
@@ -249,7 +262,9 @@ leaf names the file, kind tags stripped from every component. There is no
 destination mapping anywhere: a project that wants a different shipped
 layout moves its *source* directories until the mirror is that layout.
 The *build* tree deliberately does not mirror — `<build>/bin` stays the
-flat working set behind the test and run PATH contracts.
+flat working set behind the test and run PATH contracts, carrying a copy
+of every staged `*.install/` file so an exe-relative lookup answers
+in-tree exactly as it does installed.
 
 ## Dormant modules
 

@@ -240,10 +240,12 @@ reason. → [docs/testing.md](docs/testing.md)
 
 **Shipping as a conan package.** Two lines of declaration; the recipe
 discovers its libraries, headers and binaries from what the build
-produced. The version is derived from the last git tag plus a build
-number that moves only on a successful upload, and `publish
---bake-buildutil` ships the driver inside the package so a consumer's
-`--build=missing` genuinely works. → [docs/packaging.md](docs/packaging.md)
+produced. One publish covers both Release and Debug under one version,
+so a consumer resolves a binary whichever way their profile is set. The
+version is derived from the last git tag plus a build number that moves
+only on a successful upload, and `publish --bake-buildutil` ships the
+driver inside the package so a consumer's `--build=missing` genuinely
+works. → [docs/packaging.md](docs/packaging.md)
 
 **Resources, data and generated sources.** `*.embed/` compiles files
 into the binary behind one generated accessor, `*.install/` ships them

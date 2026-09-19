@@ -46,7 +46,7 @@ greeting = "hello"
 
 | key | default | what it changes |
 |---|---|---|
-| `[venv] extra_deps` | `[]` | extra pip requirements for the project venv, at the project's own pins |
+| `[venv] extra_deps` | `[]` | extra pip requirements for the project venv, at the project's own pins. A consumer's source build in the conan cache refuses rather than installing them uninvited — see [packaging.md](packaging.md) |
 | `[buildutil] version` | `""` | pins what `buildutil update` installs inside this project; `"latest"` or absent means newest, and a pin below 0.12.0 is refused |
 | `[update] source` | `""` | where `buildutil update` installs from: a package index URL, or a git URL. Absent, pip's own configuration decides unless the running copy records where it came from |
 
@@ -171,7 +171,8 @@ and defaults to `conancenter`, so the mirror is registered literally
 under the public remote's name; a custom name additionally removes the
 public remote so resolution never races the mirror.
 `CONAN_REMOTE_USER` and `CONAN_REMOTE_PASS` are optional — absent means
-an anonymous mirror and no login. GitLab CI's `CI_ARTIFACTORY_{HREF,NAME,
+an anonymous mirror, no login, and no dependency upload after a build.
+`buildutil init` asks for all four and writes them here. GitLab CI's `CI_ARTIFACTORY_{HREF,NAME,
 USER,PASS}` are the fallback spellings.
 
 ```
@@ -202,7 +203,9 @@ what a container image sets. `BUILDUTIL_EMBED_FALLBACK=1` forces the
 non-`#embed` resource back end, `BUILDUTIL_PREBUILT_FIRMWARE` points the
 build at prebuilt firmware, `BUILDUTIL_LIBCLANG` and
 `BUILDUTIL_RESOURCE_DIR` aim the reflect generator at a particular
-libclang and its resource headers, and `BUILDUTIL_WINE_MSVC` claims or
-suppresses the wine-msvc lane. `CI` turns the watchdog off by default.
+libclang and its resource headers, `BUILDUTIL_WINE_MSVC` claims or
+suppresses the wine-msvc lane, and `BUILDUTIL_CACHE_BUILD_DEPS=install`
+lets a source build inside the conan cache pip-install the package's
+`[venv] extra_deps` into the interpreter running it. `CI` turns the watchdog off by default.
 Each of these is a diagnostic or a fact about a machine rather than
 something a project decides, which is why none of them is a toml key.

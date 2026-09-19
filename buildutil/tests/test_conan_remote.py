@@ -328,3 +328,78 @@ def test_transient_failures_still_retry_to_success(clean_env, monkeypatch):
     [(1, "no route to host"), (1, "no route to host"), (0, "")])
   assert len(attempts) == 3
   assert ok is True
+
+
+# ---------------------------------------------------- the upload gate
+# Pushing needs a write credential the server accepted. An anonymous
+# remote cannot take an upload and a refused login must not be re-tried
+# once per build, so both skip with a note instead.
+
+def test_upload_target_skips_without_a_url(clean_env):
+  name, note = bootstrap.upload_target()
+  assert name is None
+  assert "conan remote unset" in note
+
+
+def test_upload_target_skips_an_anonymous_remote(clean_env, conan_calls,
+                                                 monkeypatch):
+  monkeypatch.setenv("CONAN_REMOTE_NAME", "mirror")
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+  bootstrap.register_conan_remote()
+  name, note = bootstrap.upload_target()
+  assert name is None
+  assert "anonymous" in note and "mirror" in note
+
+
+def test_upload_target_names_the_remote_after_an_accepted_login(
+    clean_env, conan_calls, monkeypatch):
+  monkeypatch.setenv("CONAN_REMOTE_NAME", "mirror")
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+  monkeypatch.setenv("CONAN_REMOTE_USER", "alice")
+  monkeypatch.setenv("CONAN_REMOTE_PASS", "s3cret")
+  bootstrap.register_conan_remote()
+  assert bootstrap.upload_target() == ("mirror", "")
+
+
+def test_upload_target_skips_a_refused_login(clean_env, monkeypatch):
+  _register_with_login(
+    monkeypatch,
+    [(1, "ERROR: Wrong user or password. [Remote: myremote]")])
+  name, note = bootstrap.upload_target()
+  assert name is None
+  assert "login" in note and "mirror" in note
+
+
+def test_a_rotated_password_invalidates_the_accepted_login(
+    clean_env, conan_calls, monkeypatch):
+  """The stamp is fingerprinted on the whole seam: credentials that
+  never went through a login are not credentials the server accepted."""
+  monkeypatch.setenv("CONAN_REMOTE_NAME", "mirror")
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+  monkeypatch.setenv("CONAN_REMOTE_USER", "alice")
+  monkeypatch.setenv("CONAN_REMOTE_PASS", "s3cret")
+  bootstrap.register_conan_remote()
+  monkeypatch.setenv("CONAN_REMOTE_PASS", "rotated")
+  assert bootstrap.upload_target()[0] is None
+
+
+def test_the_upload_note_never_carries_a_credential(clean_env, monkeypatch):
+  monkeypatch.setenv("CONAN_REMOTE_URL",
+                     "https://oauth2:sekrit@repo.example/conan")
+  monkeypatch.setenv("CONAN_REMOTE_USER", "alice")
+  monkeypatch.setenv("CONAN_REMOTE_PASS", "s3cret")
+  note = bootstrap.upload_target()[1]
+  assert "sekrit" not in note and "s3cret" not in note
+
+
+def test_the_build_upload_obeys_the_gate(clean_env, monkeypatch, capsys):
+  """engine._upload_to_remote is the caller: gated means no conan runs
+  at all, not an upload that fails at the server."""
+  from buildutil import engine
+  ran = []
+  monkeypatch.setattr(engine.subprocess, "check_call", lambda *a, **k: ran.append(a))
+  monkeypatch.setattr(engine.subprocess, "run", lambda *a, **k: ran.append(a))
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+  engine._upload_to_remote()
+  assert ran == []
+  assert "skipping upload" in capsys.readouterr().out

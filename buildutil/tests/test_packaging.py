@@ -273,6 +273,117 @@ def test_the_refusal_never_recommends_a_key_nothing_reads(tmp_path,
   assert "--version" in str(refusal.value)
 
 
+# --------------------------------- the build number and the remote --
+# A counter kept per checkout makes two boxes publish the same
+# x.y.z.1: conan resolves a range to the HIGHEST build number, so the
+# second publish is shadowed by the first — older code winning, which
+# is what happened to every oxbox minor back to 0.14.
+
+def _remote_versions(*refs, returncode=0, stdout=None):
+  """A `conan list --format=json` answer naming these references."""
+  def fake_run(cmd, **kw):
+    assert cmd[:2] == ["conan", "list"], cmd
+    body = json.dumps({"mirror": {ref: {"revisions": {}} for ref in refs}})
+    return SimpleNamespace(returncode=returncode,
+                           stdout=body if stdout is None else stdout)
+  return fake_run
+
+
+@pytest.fixture
+def remote(monkeypatch):
+  monkeypatch.setenv("CONAN_REMOTE_NAME", "mirror")
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+
+
+def test_the_build_number_seeds_from_the_remote(tmp_path, monkeypatch,
+                                                remote):
+  """The other box published .177 from its own counter; this box has
+  never published at all and must not answer .1."""
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  v, _ = packaging.resolve_version(
+    bump=True, git=_git_tags("0.19.0"), root=tmp_path,
+    conan=_remote_versions("s/0.19.0.176", "s/0.19.0.177"))
+  assert v == "0.19.0.178"
+
+
+def test_the_local_counter_still_wins_when_it_is_ahead(tmp_path,
+                                                       monkeypatch, remote):
+  """An upload that did not reach the remote's index yet must not hand
+  the same number out twice."""
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  _, commit = packaging.resolve_version(
+    bump=True, git=_git_tags("1.0.0"), root=tmp_path,
+    conan=_remote_versions("s/1.0.0.1", "s/1.0.0.2"))
+  commit()                                        # local state at .3
+  v, _ = packaging.resolve_version(
+    bump=True, git=_git_tags("1.0.0"), root=tmp_path,
+    conan=_remote_versions("s/1.0.0.1"))
+  assert v == "1.0.0.4"
+
+
+def test_another_base_on_the_remote_is_not_this_base(tmp_path, monkeypatch,
+                                                     remote):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  v, _ = packaging.resolve_version(
+    bump=True, git=_git_tags("2.0.0"), root=tmp_path,
+    conan=_remote_versions("s/1.9.0.42", "other/2.0.0.9", "s/2.0.0.3"))
+  assert v == "2.0.0.4"
+
+
+def test_an_unreachable_remote_falls_back_to_local_state(tmp_path,
+                                                         monkeypatch,
+                                                         remote, capsys):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  v, _ = packaging.resolve_version(
+    bump=True, git=_git_tags("1.0.0"), root=tmp_path,
+    conan=_remote_versions(returncode=1, stdout="ERROR: no route to host"))
+  assert v == "1.0.0.1"
+  assert "remote" in capsys.readouterr().out
+
+
+def test_an_unparseable_answer_falls_back_to_local_state(tmp_path,
+                                                         monkeypatch,
+                                                         remote):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  v, _ = packaging.resolve_version(
+    bump=True, git=_git_tags("1.0.0"), root=tmp_path,
+    conan=_remote_versions(stdout="not json at all"))
+  assert v == "1.0.0.1"
+
+
+def test_no_remote_configured_asks_nothing(tmp_path, monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  monkeypatch.delenv("CONAN_REMOTE_URL", raising=False)
+  monkeypatch.delenv("CI_ARTIFACTORY_HREF", raising=False)
+  def refuse(cmd, **kw):
+    raise AssertionError("queried a remote that is not configured")
+  v, _ = packaging.resolve_version(
+    bump=True, git=_git_tags("1.0.0"), root=tmp_path, conan=refuse)
+  assert v == "1.0.0.1"
+
+
+def test_holding_the_number_never_asks_the_remote(tmp_path, monkeypatch,
+                                                  remote):
+  """--no-version-autoincrement republishes the number this checkout
+  last used; seeding it from the remote would publish a different one."""
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  def refuse(cmd, **kw):
+    raise AssertionError("queried the remote while holding the number")
+  v, _ = packaging.resolve_version(
+    bump=False, git=_git_tags("1.0.0"), root=tmp_path, conan=refuse)
+  assert v == "1.0.0.1"
+
+
+def test_an_override_never_asks_the_remote(tmp_path, monkeypatch, remote):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  def refuse(cmd, **kw):
+    raise AssertionError("queried the remote for an explicit version")
+  v, _ = packaging.resolve_version(
+    bump=True, override="9.9.9.9", git=_git_tags("1.0.0"), root=tmp_path,
+    conan=refuse)
+  assert v == "9.9.9.9"
+
+
 # ------------------------------------------ ranged runtime Requires --
 
 def _sources_with(tmp_path, text):
@@ -403,7 +514,8 @@ def test_application_kind_scaffolds_the_app_test(tmp_path, monkeypatch):
 def test_wizard_asks_at_a_tty_and_dont_package_is_remembered(tmp_path, monkeypatch):
   monkeypatch.chdir(tmp_path)
   monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-  answers = iter(["acme", "", "", "3"])       # name, prefixes, don't package
+  # name, prefixes, no conan remote, don't package
+  answers = iter(["acme", "", "", "", "3"])
   monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
   initcmd.main(["--bare", "--no-agents"])
   assert 'kind = "none"' in (tmp_path / "buildutil.toml").read_text()
@@ -417,9 +529,10 @@ def test_wizard_asks_at_a_tty_and_dont_package_is_remembered(tmp_path, monkeypat
 def test_wizard_full_library_answers(tmp_path, monkeypatch):
   monkeypatch.chdir(tmp_path)
   monkeypatch.setattr("sys.stdin.isatty", lambda: True)
-  # name, prefixes ×2, choice=library, package name (default accepted);
-  # NO version question — the version never lives in the source
-  answers = iter(["ser", "", "", "1", ""])
+  # name, prefixes ×2, no conan remote, choice=library, package name
+  # (default accepted); NO version question — the version never lives
+  # in the source
+  answers = iter(["ser", "", "", "", "1", ""])
   monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
   initcmd.main(["--bare", "--no-agents"])
   toml = (tmp_path / "buildutil.toml").read_text()
