@@ -87,13 +87,41 @@ def test_the_osxcross_profile_names_the_darwin_archiver(in_tmp, monkeypatch,
   assert ("tools.cmake.cmaketoolchain:extra_variables="
           "{'CMAKE_AR': '/opt/osxcross/target/bin/aarch64-apple-darwin25-ar', "
           "'CMAKE_RANLIB': "
-          "'/opt/osxcross/target/bin/aarch64-apple-darwin25-ranlib'}") in text
+          "'/opt/osxcross/target/bin/aarch64-apple-darwin25-ranlib'") in text
+  assert text.count("tools.cmake.cmaketoolchain:extra_variables=") == 1
 
   buildenv_at = text.index("[buildenv]")
   assert "AR=/opt/osxcross/target/bin/aarch64-apple-darwin25-ar" \
          in text[buildenv_at:]
   assert "RANLIB=/opt/osxcross/target/bin/aarch64-apple-darwin25-ranlib" \
          in text[buildenv_at:]
+
+
+def test_the_osxcross_profile_names_the_install_name_tool(in_tmp, monkeypatch,
+                                                          osxcross):
+  # A dependency that enables Objective-C (SDL does) makes cmake search
+  # for install_name_tool AFTER Platform/Darwin is read, and hard-error
+  # when the guessed prefix finds nothing. The driver's own configure
+  # names it; the dependency profile has to as well.
+  _project(monkeypatch)
+  text = engine._ensure_profile(dict(MACOS)).read_text()
+
+  assert ("'CMAKE_INSTALL_NAME_TOOL': '/opt/osxcross/target/bin/"
+          "aarch64-apple-darwin25-install_name_tool'") in text
+
+
+def test_a_missing_install_name_tool_keeps_the_archiver(in_tmp, monkeypatch,
+                                                        osxcross, capsys):
+  # Not part of the archiver's all-or-nothing gate: ar and ranlib must
+  # agree with each other, install_name_tool answers to nothing.
+  _project(monkeypatch)
+  monkeypatch.setattr(engine, "_osxcross_tool",
+                      lambda name: None if name == "install_name_tool"
+                      else f"/opt/osxcross/target/bin/aarch64-apple-darwin25-{name}")
+  text = engine._ensure_profile(dict(MACOS)).read_text()
+
+  assert "CMAKE_AR" in text and "CMAKE_INSTALL_NAME_TOOL" not in text
+  assert "no install_name_tool" in capsys.readouterr().err
 
 
 def test_buildenv_comes_after_every_conf_line(in_tmp, monkeypatch, osxcross):

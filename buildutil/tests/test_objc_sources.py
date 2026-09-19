@@ -260,14 +260,18 @@ def test_the_osxcross_profile_names_an_absolute_objcpp():
   assert 'shutil.which("oa64-clang++")' in source
 
 
-def test_the_osxcross_lane_names_install_name_tool():
+def test_the_osxcross_lane_names_install_name_tool(monkeypatch):
   """CMakeFindBinUtils only looks for it once a language is enabled AFTER
   Platform/Darwin.cmake -- which is exactly what enabling OBJCXX does --
-  and then hard errors."""
+  and then hard errors. Both seams name it: the project's own configure
+  and the profile every dependency is built through."""
   from buildutil import engine
-  source = Path(engine.__file__).read_text()
-  assert '_osxcross_tool("install_name_tool")' in source
-  assert "-DCMAKE_INSTALL_NAME_TOOL=" in source
+  monkeypatch.setattr(engine, "_osxcross_live", lambda: True)
+  monkeypatch.setattr(engine, "_osxcross_tool", lambda name: f"/xc/{name}")
+  assert "-DCMAKE_INSTALL_NAME_TOOL=/xc/install_name_tool" \
+         in engine._osxcross_configure_args()
+  extra, _ = engine._osxcross_binutils()
+  assert extra["CMAKE_INSTALL_NAME_TOOL"] == "/xc/install_name_tool"
 
 
 # ------------------------------------------------------ Apple frameworks --

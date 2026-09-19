@@ -114,7 +114,10 @@ story — it keeps an executable's symbols in the dynamic symbol table and
 lifts the hidden-visibility default, and it is deliberately not tied to
 the build type: a host whose plugins resolve in Debug and fail in Release
 is a binary that works for whoever built it and breaks for whoever ships
-it.
+it. It covers the module's LIBRARY as well, which is how a shared module
+says "export everything" out loud — `WINDOWS_EXPORT_ALL_SYMBOLS` under
+MSVC, default visibility everywhere else. Both halves are settled at
+generate time, so no later flag can quietly take the visibility back.
 
 A shared library can also be selected by presence: `main.so.cpp`,
 `main.dll.cpp` or `main.dylib.cpp` — the file holding `DllMain` or its

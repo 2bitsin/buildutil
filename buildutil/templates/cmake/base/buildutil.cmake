@@ -646,8 +646,27 @@ function(_buildutil_mirror_parent out)
   set(${out} "${_mp_result}" PARENT_SCOPE)
 endfunction()
 
+# A rpath entry relative to the loading binary's own directory, spelled
+# for the TARGET platform: ld.so expands $ORIGIN and ignores
+# @loader_path, dyld expands @loader_path and ignores $ORIGIN, so a
+# computed rpath is wrong on one of them unless it is asked for here.
+# @loader_path rather than @executable_path because the loader of a
+# mirrored artifact may be a dylib beside it, not the executable.
+function(_buildutil_loader_relative out hop)
+  if(APPLE)
+    set(token "@loader_path")
+  else()
+    set(token "$ORIGIN")
+  endif()
+  if(hop STREQUAL "" OR hop STREQUAL ".")
+    set(${out} "${token}" PARENT_SCOPE)
+  else()
+    set(${out} "${token}/${hop}" PARENT_SCOPE)
+  endif()
+endfunction()
+
 # What an INSTALLED binary must find: its shared siblings at the install
-# mirror, $ORIGIN-relative, and the host libraries a SYSTEM Require found
+# mirror, loader-relative, and the host libraries a SYSTEM Require found
 # -- never a conan library, whose cache path here would let an
 # artifact that ships no [runtime] payload start anyway. Deferred to the end
 # of the tree so the full link graph exists; state rides target/global
@@ -687,11 +706,8 @@ function(_buildutil_apply_install_rpaths)
       # both are prefix-relative; anchor them to compute the hop
       file(RELATIVE_PATH hop "/buildutil-prefix/${app_mirror}"
                              "/buildutil-prefix/${dep_mirror}")
-      if(hop STREQUAL "")
-        list(APPEND rpaths "$ORIGIN")
-      else()
-        list(APPEND rpaths "$ORIGIN/${hop}")
-      endif()
+      _buildutil_loader_relative(hop_rpath "${hop}")
+      list(APPEND rpaths "${hop_rpath}")
     endforeach()
     if(rpaths)
       list(REMOVE_DUPLICATES rpaths)
@@ -2043,15 +2059,29 @@ endfunction()
 # not even enabled languages then.
 set(_buildutil_cxx_langs "$<COMPILE_LANGUAGE:CXX,OBJCXX>")
 
+# Whether a target gets the project's hidden-visibility default. Asked as
+# a generator expression because two -fvisibility flags on one command
+# line are resolved by POSITION, and position is not intent: this default
+# is appended after a module library's PUBLISH_SYMBOLS opt-out, and
+# reaches that module's app through the library's INTERFACE later still,
+# so appending anything could never win. A genex is read at GENERATE
+# time, so no call order defeats it; in an INTERFACE copy it is read
+# against the CONSUMER, whose sources are the ones being compiled. MSVC
+# has no visibility flag -- there the question is
+# WINDOWS_EXPORT_ALL_SYMBOLS.
+set(_buildutil_hidden_default "$<AND:$<NOT:$<CXX_COMPILER_ID:MSVC>>,\
+$<NOT:$<BOOL:$<TARGET_PROPERTY:_buildutil_publish_symbols>>>>")
+
 function(_buildutil_apply_cxx_standard target visibility)
   set(cxx "${_buildutil_cxx_langs}")
+  set(hides "${_buildutil_hidden_default}")
   target_compile_options(${target} ${visibility}
     $<$<CXX_COMPILER_ID:MSVC>:/std:c++latest;/bigobj;/constexpr:steps100000000;/utf-8>
     "$<$<AND:${cxx},$<CXX_COMPILER_ID:Clang,AppleClang>>:-fconstexpr-steps=100000000>"
     "$<$<AND:${cxx},$<CXX_COMPILER_ID:GNU>>:-fconstexpr-ops-limit=100000000>"
     $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fdollars-in-identifiers>
-    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fvisibility=hidden>
-    "$<$<AND:${cxx},$<NOT:$<CXX_COMPILER_ID:MSVC>>>:-fvisibility-inlines-hidden>")
+    "$<${hides}:-fvisibility=hidden>"
+    "$<$<AND:${cxx},${hides}>:-fvisibility-inlines-hidden>")
   _buildutil_apply_objc_options(${target} ${visibility})
   # `./buildutil --max-errors N` / `--fail-fast` (== N 1), via -D@CMAKE_OPTION_PREFIX@_MAX_ERRORS:
   # stop each compile after N errors for a tight fix-rebuild loop. 0 / undefined = off.
@@ -2673,7 +2703,8 @@ function(Init_submodule)
   if(MOD_PUBLISH_SYMBOLS)
     target_compile_options(${lib} PRIVATE
       $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fvisibility=default>)
-    set_target_properties(${lib} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    set_target_properties(${lib} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON
+                          _buildutil_publish_symbols ON)
   endif()
   set_target_properties(${lib} PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(${lib} PUBLIC "${CMAKE_SOURCE_DIR}/sources")
@@ -2828,7 +2859,8 @@ function(Init_submodule)
         CALL _buildutil_attach_all_object_deps)
     endif()
     if(MOD_PUBLISH_SYMBOLS)
-      set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON)
+      set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON
+                            _buildutil_publish_symbols ON)
       target_compile_options(${target} PRIVATE
         $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fvisibility=default>)
     endif()
@@ -3501,13 +3533,9 @@ function(_buildutil_add_runtime_payload target do_install)
   # A package's own copy_runtime() sets this too; appending twice is
   # harmless, and a package without one would otherwise install a binary
   # that cannot find the library sitting next to it.
-  if(NOT APPLE)
-    set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "$ORIGIN")
-    set_property(TARGET ${target} APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
-  else()
-    set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "@loader_path")
-    set_property(TARGET ${target} APPEND PROPERTY INSTALL_RPATH "@loader_path")
-  endif()
+  _buildutil_loader_relative(beside "")
+  set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "${beside}")
+  set_property(TARGET ${target} APPEND PROPERTY INSTALL_RPATH "${beside}")
 endfunction()
 
 function(_buildutil_copy_payload_beside target bin_dir res_dir lib_dir)

@@ -111,10 +111,20 @@ after `project()` and cmake refuses a bare name for a language enabled
 that late. The archiver is published through **both** seams, a cmake
 variable and `[buildenv]`, because cmake-shaped dependencies read the
 first and autotools-shaped ones read the second; half an archiver is
-refused with a loud warning rather than half-used. Link flags select
+refused with a loud warning rather than half-used. The Darwin
+`install_name_tool` is named in that same profile, because a dependency
+that enables Objective-C — SDL, for its Cocoa backend — sends cmake
+through a binutil search that hard-errors when the prefix it guesses
+from the compiler name finds nothing; it is independently optional,
+since nothing has to agree with it. Link flags select
 `lld`, since osxcross's ld64 does not synthesise clang's
-`_objc_msgSend$sel` stubs. It is a build-only lane: no emulator exists to
-run Mach-O binaries on Linux.
+`_objc_msgSend$sel` stubs. Targets are linked with their **install**
+rpath (`CMAKE_BUILD_WITH_INSTALL_RPATH`): ld64 ad-hoc signs every arm64
+Mach-O, cmake's install would rewrite the copy's rpath with
+`install_name_tool` and there is no `codesign` on Linux to recompute the
+hashes, so the installed binary would be one the Mac refuses to launch.
+It is a build-only lane — no emulator exists to run Mach-O binaries on
+Linux — so the build-tree rpath that costs is worth nothing here.
 
 ## Windows, native
 
@@ -143,6 +153,13 @@ apple-clang, `libc++`, and the host architecture; a native (non-Rosetta)
 python is what makes the arm64 mapping report itself correctly. The
 Objective-C story and the application bundle story are in
 [platform-apps.md](platform-apps.md).
+
+Every rpath buildutil computes for an installed binary — the directory it
+sits in, and the hop out to a sibling shared module's mirror — is spelled
+`@loader_path` on an Apple target, the osxcross lane included. `$ORIGIN`
+is ELF's token; dyld does not expand it, so a Mach-O carrying it finds
+nothing beside itself and only says so when the artifact is launched on a
+Mac.
 
 ## Open Watcom firmware
 

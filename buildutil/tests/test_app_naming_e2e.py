@@ -262,6 +262,15 @@ def test_publish_symbols_exports_them(tmp_path):
           if "LINK_FLAGS" in l and "rdynamic" in l]
   assert link, ("the plugin host does not export its symbols; no link "
                 "flags carry -rdynamic")
+  # the COMPILE half: published at the link and hidden at the compile is
+  # a host that exports an empty table, and two -fvisibility flags on one
+  # line are resolved by position, not by which was meant
+  lifted = [l for l in ninja.splitlines()
+            if "FLAGS = " in l and "-fvisibility=default" in l]
+  assert lifted, "the hatch does not lift the project's visibility default"
+  assert not [l for l in lifted if "-fvisibility=hidden" in l], (
+    "-fvisibility=hidden lands after the opt-out and wins:\n"
+    + "\n".join(lifted))
 
 
 def test_an_ordinary_app_does_not_export(tmp_path):

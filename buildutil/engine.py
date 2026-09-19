@@ -689,6 +689,67 @@ def _profile_name(settings: dict[str, str], linkage: str | None = None) -> str:
 
 
 
+def _osxcross_binutils() -> tuple[dict[str, str], list[str]]:
+  """The Darwin cctools the dependency graph is told about, as cmake
+  variables and as environment: a cmake-shaped dependency reads CMAKE_AR
+  out of the toolchain conan generates, an autotools-shaped one reads AR
+  out of its environment."""
+  # Without CMAKE_AR a dependency archives with the host's GNU ar, and
+  # ld64 does not read a System-V archive -- it ignores the file, so the
+  # miss surfaces as an undefined symbol in whatever links it, or never
+  # (openssl's fips.dylib could not link providers/libfips.a).
+  archiver = {name: _osxcross_tool(name) for name in ("ar", "ranlib")}
+  extra: dict[str, str] = {}
+  buildenv: list[str] = []
+  if all(archiver.values()):
+    extra |= {"CMAKE_AR": archiver["ar"], "CMAKE_RANLIB": archiver["ranlib"]}
+    buildenv += [f"AR={archiver['ar']}", f"RANLIB={archiver['ranlib']}"]
+  else:
+    # Both or neither -- ar and ranlib have to agree on the format they
+    # write -- but never silently, which is how the failure above hides.
+    missing = ", ".join(sorted(n for n, path in archiver.items() if not path))
+    print(f"buildutil: osxcross profile has no {missing} for the arm64 "
+          "target -- dependency builds will archive with this container's "
+          "own ar, and ld64 does not read those",
+          file=sys.stderr, flush=True)
+  # Independently optional, unlike the archiver pair: nothing has to
+  # agree with it, and only a dependency enabling Objective-C asks.
+  install_name_tool = _osxcross_tool("install_name_tool")
+  if install_name_tool:
+    extra["CMAKE_INSTALL_NAME_TOOL"] = install_name_tool
+  else:
+    print("buildutil: osxcross profile has no install_name_tool for the "
+          "arm64 target -- a dependency that enables Objective-C will fail "
+          "cmake's binutil search", file=sys.stderr, flush=True)
+  return extra, buildenv
+
+
+def _osxcross_profile_entries() -> tuple[list[str], list[str]]:
+  """The osxcross lane's ([conf], [buildenv]) profile entries: the SDK,
+  the compilers and the binutils every dependency is built with."""
+  lines = []
+  # conan's CMakeToolchain resolves an os=Macos SDK by shelling out to
+  # xcrun -- which does not exist on Linux. Hand it the packaged SDK path
+  # outright so it skips xcrun entirely. The oa64-clang wrappers already
+  # inject -isysroot, but cmake's CMAKE_OSX_SYSROOT wants it spelled too.
+  sdk = _osxcross_conf().get("OSXCROSS_SDK", "")
+  if sdk:
+    lines.append(f"tools.apple:sdk_path={sdk}")
+  # Named here, or a dep compiles with whatever CC the shell held.
+  # 'objcpp' is absolute because a language enabled after project() gets
+  # its own compiler search, which finds the HOST c++ and refuses a bare
+  # name ("is not a full path and was not found in the PATH"); 'c'/'cpp'
+  # are resolved against PATH by project() and need no path.
+  objcxx = shutil.which("oa64-clang++") or "oa64-clang++"
+  lines.append("tools.build:compiler_executables="
+               "{'c': 'oa64-clang', 'cpp': 'oa64-clang++', "
+               f"'objcpp': '{objcxx}'}}")
+  extra, buildenv = _osxcross_binutils()
+  if extra:
+    lines.append(f"tools.cmake.cmaketoolchain:extra_variables={extra}")
+  return lines, buildenv
+
+
 def _ensure_profile(settings: dict[str, str]) -> Path:
   profiles_dir = Path("_profiles")
   profiles_dir.mkdir(exist_ok=True)
@@ -744,62 +805,9 @@ def _ensure_profile(settings: dict[str, str]) -> Path:
     lines.append("tools.build:jobs=6")
 
   if _osxcross_live():
-    # conan's CMakeToolchain resolves an os=Macos SDK by shelling out to
-    # xcrun — which does not exist on Linux. Hand it the packaged SDK path
-    # outright so it skips xcrun entirely. The oa64-clang wrappers already
-    # inject -isysroot, but cmake's CMAKE_OSX_SYSROOT wants it spelled too.
-    sdk = _osxcross_conf().get("OSXCROSS_SDK", "")
-    if sdk:
-      lines.append(f"tools.apple:sdk_path={sdk}")
-    # Nail the host-context compiler to the arm64 wrappers so conan writes
-    # them into every dep's conan_toolchain.cmake (CMAKE_C/CXX_COMPILER) —
-    # the mac deps compile with oa64-clang, not whatever CC the shell held.
-    # 'objcpp' is not optional once any module carries a .mm. OBJCXX is
-    # enabled AFTER project(), and CMake does not derive its compiler from
-    # CMAKE_CXX_COMPILER -- it re-runs its own search and picks the HOST
-    # c++, at which point the cross build silently stops being cross. It
-    # also refuses a bare name for a language enabled that late ("is not a
-    # full path and was not found in the PATH"), so this one is absolute
-    # while 'c'/'cpp' (resolved by project(), against PATH) are not.
-    objcxx = shutil.which("oa64-clang++") or "oa64-clang++"
-    lines.append("tools.build:compiler_executables="
-                 "{'c': 'oa64-clang', 'cpp': 'oa64-clang++', "
-                 f"'objcpp': '{objcxx}'}}")
-    # THE ARCHIVER, for the DEPENDENCIES. compiler_executables above
-    # names no archiver and conan's CMakeToolchain sets no CMAKE_AR, so a
-    # dependency built in this container archives with the host's GNU ar:
-    # `!<arch>\n/`, a System-V archive that ld64 does not read -- it
-    # IGNORES the file, and the miss surfaces much later as an undefined
-    # symbol in whatever links it, or never, in a lane that links nothing.
-    # A week of red cross builds went to the loud version of this:
-    # openssl's fips.dylib could not link providers/libfips.a
-    # ("unknown-unsupported file format ( 0x21 0x3C 0x61 0x72 ... )").
-    #
-    # BOTH seams, because dependencies come in two shapes and each reads a
-    # different one: a cmake-built dep takes CMAKE_AR/CMAKE_RANLIB through
-    # the toolchain conan generates for it, an autotools-shaped one
-    # (openssl) takes AR/RANLIB out of the environment -- they are on
-    # openssl's own user-settable cross list. The driver's OWN cmake
-    # invocation already passes -DCMAKE_AR (_cmake_configure); this is the
-    # same two tools, told to the graph underneath.
-    archiver = {name: _osxcross_tool(name) for name in ("ar", "ranlib")}
-    if all(archiver.values()):
-      lines.append(
-        "tools.cmake.cmaketoolchain:extra_variables="
-        "{{'CMAKE_AR': '{ar}', 'CMAKE_RANLIB': '{ranlib}'}}".format(**archiver))
-      buildenv += [f"AR={archiver['ar']}", f"RANLIB={archiver['ranlib']}"]
-    else:
-      # Both or neither -- half an archiver is worse than none, because
-      # ar and ranlib have to agree on the format they write. But a
-      # SILENT neither is how this failure class hides: dependencies go
-      # back to the host's GNU ar, ld64 ignores what it writes instead of
-      # erroring, and the build looks fine until something links. One
-      # line, naming the one that could not be found.
-      missing = ", ".join(sorted(n for n, path in archiver.items() if not path))
-      print(f"buildutil: osxcross profile has no {missing} for the arm64 "
-            "target -- dependency builds will archive with this container's "
-            "own ar, and ld64 does not read those",
-            file=sys.stderr, flush=True)
+    conf, env = _osxcross_profile_entries()
+    lines += conf
+    buildenv += env
 
   if settings.get("os") == "Emscripten":
     conf = _emscripten_conf()
@@ -1104,6 +1112,37 @@ def _drop_unusable_cache(build_dir: Path, toolchain: Path,
   return False
 
 
+def _osxcross_configure_args() -> list[str]:
+  """The -D flags the project's own cmake invocation needs on the
+  osxcross lane: the Darwin binutils, the linker that synthesises what
+  ld64 does not, and the rpath policy that keeps a signature valid."""
+  if not _osxcross_live():
+    return []
+  args = []
+  # CMake defaults CMAKE_AR to the host GNU ar, whose System-V archives
+  # ld64 rejects. install_name_tool it searches for only once a language
+  # is enabled after Platform/Darwin -- which is what a module's .mm
+  # does -- and then hard errors, guessing a prefix from the compiler
+  # name that the oa64-clang wrappers do not carry. Name all three.
+  for variable, tool in (("AR", "ar"), ("RANLIB", "ranlib"),
+                         ("INSTALL_NAME_TOOL", "install_name_tool")):
+    found = _osxcross_tool(tool)
+    if found:
+      args.append(f"-DCMAKE_{variable}={found}")
+  # SDL's Cocoa objects reference clang's arm64 objc_msgSend selector stubs
+  # (_objc_msgSend$sel); osxcross's cctools ld64 doesn't synthesize them, LLD's
+  # Mach-O linker does. Point every link at ld64.lld.
+  args += [f"-DCMAKE_{flavour}_LINKER_FLAGS=-fuse-ld=lld"
+           for flavour in ("EXE", "SHARED", "MODULE")]
+  # ld64 ad-hoc signs every arm64 Mach-O, and cmake's install rewrites
+  # the copy's RPATH with install_name_tool -- changing bytes the
+  # CodeDirectory covers, with no codesign on Linux to recompute them.
+  # Linking with the INSTALL rpath leaves the install nothing to edit;
+  # the build-tree rpath it costs runs nothing on this machine anyway.
+  args.append("-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON")
+  return args
+
+
 def _cmake_configure(build_dir: Path, build_type: str, *,
                      tests: bool, bench: bool,
                      coverage: bool = False, gc_sections: bool = False) -> None:
@@ -1131,26 +1170,7 @@ def _cmake_configure(build_dir: Path, build_type: str, *,
      "-DCMAKE_POLICY_DEFAULT_CMP0141=NEW",
      "-DCMAKE_CROSSCOMPILING_EMULATOR=wine"]
     if _wine_msvc_live() else [])
-  if _osxcross_live():                            # CMake defaults CMAKE_AR to
-    ar = _osxcross_tool("ar")                     # the host GNU ar, whose System-V
-    ranlib = _osxcross_tool("ranlib")             # archives ld64 rejects -- point it
-    if ar:                                        # at the osxcross Darwin cctools ar
-      wine_cross.append(f"-DCMAKE_AR={ar}")
-    if ranlib:
-      wine_cross.append(f"-DCMAKE_RANLIB={ranlib}")
-    # SDL's Cocoa objects reference clang's arm64 objc_msgSend selector stubs
-    # (_objc_msgSend$sel); osxcross's cctools ld64 doesn't synthesize them, LLD's
-    # Mach-O linker does. Point every link at ld64.lld.
-    for flavour in ("EXE", "SHARED", "MODULE"):
-      wine_cross.append(f"-DCMAKE_{flavour}_LINKER_FLAGS=-fuse-ld=lld")
-    # CMakeFindBinUtils looks for install_name_tool only once a language is
-    # enabled AFTER Platform/Darwin.cmake has been read -- which is exactly
-    # what enabling OBJCXX for a module's .mm does -- and then hard errors
-    # unless it finds one, searching only for the prefix it guesses from
-    # the compiler name. Name it outright.
-    install_name_tool = _osxcross_tool("install_name_tool")
-    if install_name_tool:
-      wine_cross.append(f"-DCMAKE_INSTALL_NAME_TOOL={install_name_tool}")
+  wine_cross += _osxcross_configure_args()
   # the firmware-artifact stage: a dir of prebuilt .bin images
   # lets a cross build skip watcom entirely
   prebuilt_firmware = os.environ.get("BUILDUTIL_PREBUILT_FIRMWARE")
