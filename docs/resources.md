@@ -201,7 +201,10 @@ used to be silently additive, and the binary carried both names until
 someone wiped the build tree. Every data directory the hook emits into is
 swept when the hook ends — what this run wrote stays, the rest goes, and
 a directory the sweep empties goes with it. `data_dir(..., keep=True)`
-opts a tree out. Nothing outside a data directory is ever swept: a
+opts a tree out. A hook that finds its output already up to date and
+skips the write must still `declare(path)` it, or the sweep reads the
+untouched file as a leftover and removes it. Nothing outside a data
+directory is ever swept: a
 generated header is reached by name, not by glob.
 
 A declared tool is reachable from the hook. A `Require(<pkg> VERSION "…"

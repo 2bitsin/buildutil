@@ -86,7 +86,11 @@ def _fail() -> None:
 #             normal run reports its own cost -- errors at 1600, and leaves a
 #             cold instrumented rebuild room to finish.
 #   analyze   the -O2 clang-tidy pass over the whole tree
-_VERB_BUDGETS = {"bench": 1800.0, "coverage": 2400.0, "analyze": 900.0}
+#   publish   builds every configuration from source, packages and runs the
+#             package test; a from-source oxbox publish in a fresh
+#             container passed 180s and was torn down
+_VERB_BUDGETS = {"bench": 1800.0, "coverage": 2400.0, "analyze": 900.0,
+                 "publish": 1800.0}
 
 
 def watchdog_budget_for(subcommand: str | None, requested: float, *,

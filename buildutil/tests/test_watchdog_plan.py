@@ -16,12 +16,13 @@ def test_interactive_uses_the_per_verb_budget():
   assert _plan("bench") == 1800.0                 # bench's long override
   assert _plan("coverage") == 2400.0              # gcov build + corpus + guests
   assert _plan("analyze") == 900.0                # the -O2 tidy pass
+  assert _plan("publish") == 1800.0               # every configuration from source
 
 
 # The reason the long verbs have budgets at all: so no caller has to reach
 # for --no-watchdog, which removes the alarm rather than moving it.
 def test_every_long_verb_still_arms_something():
-  for verb in ("bench", "coverage", "analyze"):
+  for verb in ("bench", "coverage", "analyze", "publish"):
     assert _plan(verb) is not None
 
 
