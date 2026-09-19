@@ -1,7 +1,9 @@
-# Everything underscore-prefixed is derived, local working state —
-# _build/, _install/, _conanhome/, _pyvenv/, _bdudata/ (the buildutil
-# convention; `buildutil clean --nuke` wipes exactly this set).
-_*
+# Underscore-prefixed entries at the root are derived, local working
+# state: _build/, _install/, _conanhome/, _pyvenv/, _bdudata/ (the
+# buildutil convention; `buildutil clean --nuke` wipes exactly this set).
+# Deeper down, _name.hpp is a private header and is tracked.
+/_*
+/test_package/_*
 
 # conan writes these; buildutil drives cmake directly, and the package
 # test builds under test_package/ with conan's own cmake_layout

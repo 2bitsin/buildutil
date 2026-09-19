@@ -76,7 +76,7 @@ def test_conanfile_is_valid_python(fresh):
 def test_gitignore_covers_derived_state(fresh):
   initcmd.main(["--name", "demo"])
   lines = (fresh / ".gitignore").read_text().splitlines()
-  assert "_*" in lines
+  assert "/_*" in lines and "/test_package/_*" in lines
   assert "CMakeUserPresets.json" in lines
 
 
@@ -236,17 +236,15 @@ def test_the_scaffolded_gitignore_hides_the_env(fresh):
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-def test_an_underscored_private_header_is_invisible_to_git(fresh):
-  """The documented collision, proved with git itself: the build
-  system reads a leading underscore as "not exported" and the
-  scaffolded .gitignore reads it as "derived, local working state", so
-  a header marked private by one convention is never committed by the
-  other. Until a marker exists that does not spend the underscore, the
-  docs have to say so."""
+def test_a_private_header_is_tracked_and_the_root_derived_state_is_not(fresh):
   initcmd.main(["--name", "demo"])
   subprocess.run(["git", "init", "-q"], cwd=fresh, check=True)
   header = fresh / "sources" / "demo" / "hello" / "_detail.hpp"
   header.write_text("#pragma once\n")
-  ignored = subprocess.run(["git", "check-ignore", "-q", str(header)],
-                           cwd=fresh)
-  assert ignored.returncode == 0
+  c_source = header.with_name("_impl.c")
+  c_source.write_text("")
+  (fresh / "_build").mkdir()
+  ignored = lambda p: subprocess.run(["git", "check-ignore", "-q", str(p)],
+                                     cwd=fresh).returncode == 0
+  assert not ignored(header) and not ignored(c_source)
+  assert ignored(fresh / "_build")

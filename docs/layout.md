@@ -221,18 +221,14 @@ underscore on the file or on any directory component keeps a header
 private, as do `*.test/`, `*.bench/`, `*.install/`, `*.embed/` and
 dot-directories.
 
-Mind the collision before reaching for the underscore: in a project
-scaffolded by `buildutil init` — every project — the first rule of
-`.gitignore` is `_*`, the derived-state convention above, so a header
-named `_detail.hpp` compiles, tests green and is **never committed**.
-`_posix.hpp` and `_win32.hpp` were written, built on four
-configurations and were invisible in `git status`. Punching a hole in
-the ignore file leaves two rules fighting over one character forever,
-so the working spelling for a private header today is an ordinary name
-that no re-export block names — `native-file.posix.hpp` — which keeps
-it out of the API but not out of the installed package. A marker that
-says "real source, not exported" without spending the underscore is an
-open question, not a feature. Kind tags are deliberately **not** stripped here, unlike
+The underscore is the one private marker; there is no `*.private/`
+directory and no `.private.hpp` suffix. The scaffolded `.gitignore`
+anchors its derived-state rule to the repo root (`/_*`, and
+`/test_package/_*` for the package test), so `_detail.hpp` inside a
+module is tracked like any other source. A project scaffolded before
+0.86.1 carries an unanchored `_*` and must anchor it, or its private
+headers are never committed.
+Kind tags are deliberately **not** stripped here, unlike
 the binary mirror, because the in-tree spelling resolves through
 `sources/` with literal directory names.
 
