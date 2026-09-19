@@ -126,6 +126,48 @@ hashes, so the installed binary would be one the Mac refuses to launch.
 It is a build-only lane — no emulator exists to run Mach-O binaries on
 Linux — so the build-tree rpath that costs is worth nothing here.
 
+## The lane images
+
+The two cross lanes need a container, and the recipe for each is in this
+repository — `images/osxcross/Dockerfile` and
+`images/msvc-wine/Dockerfile`. Both start from `ubuntu:24.04` and build
+what they need from upstream sources; neither inherits an image from
+another project, because a lane whose toolchain, standard library and
+parser are facts about somebody else's container is a lane nobody can
+reproduce or fix.
+
+```console
+docker build -t buildutil/msvc-wine:latest images/msvc-wine
+docker build -t buildutil/osxcross:latest images/osxcross
+```
+
+The wine-msvc image installs wine, then lets
+[msvc-wine](https://github.com/mstorsjo/msvc-wine) download the genuine
+MSVC toolchain from Microsoft and write the unix wrappers — `cl`, `link`,
+`lib`, and the `msvcenv.sh` beside them that the wrappers and the lane
+probe both read. `_CL_=/Z7` is baked in.
+
+The osxcross image builds
+[osxcross](https://github.com/tpoechtrager/osxcross) — the clang wrappers
+and the cctools — and has exactly one input that cannot be downloaded:
+the macOS SDK. Apple's licence does not allow redistributing it and
+`osxcross/tools/gen_sdk_package.sh` runs on a Mac, so the tarball goes in
+`images/osxcross/tarballs/` (gitignored) and the recipe copies it in.
+
+Both images carry a **clang**, and not for compiling: the reflect
+extension parses headers with libclang, the pip wheel ships that library
+with none of clang's builtin headers, and a lane image without a clang
+therefore cannot run the extension at all — no include path the driver
+could pass makes up for a missing `stddef.h`. That was diagnosed as a
+driver shortfall twice before it was recognised as an image that did not
+carry its own toolchain.
+
+Running one by hand: mount the project, keep `HOME`, `CONAN_HOME` and
+`BUILDUTIL_VENV_DIR` inside the mount, and drop the entrypoint. The wine
+lane additionally wants a persistent `wineserver` started before any
+build (`wineserver -p; wine wineboot`), since one started per command
+dies mid-build.
+
 ## Windows, native
 
 `cl` is found through `$VCVARS_PATH` or a short list of standard
