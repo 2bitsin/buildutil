@@ -27,10 +27,11 @@ discovery that broke, is a failure rather than a silent zero. Positional
 targets become ctest **labels**, not names — `buildutil test widget` runs
 everything the module `widget` owns — while `--filter`/`-f` is a regex
 over test *names*. `--timeout` is ctest's per-test wall clock and
-defaults to 60 seconds, `--parallel` opts into parallel execution (serial
-is the default) with `--jobs`, `--quiet` drops `--output-on-failure`, and
-`--no-build` runs what is already there, refusing when there is no test
-tree to run. `--no-native` runs only the python suites and `--no-pytest`
+defaults to 60 seconds, bounding every entry that declares none of its own
+(an entry with a declared bound keeps it), `--parallel` opts into parallel
+execution (serial is the default) with `--jobs`, `--quiet` drops
+`--output-on-failure`, and `--no-build` runs what is already there,
+refusing when there is no test tree to run. `--no-native` runs only the python suites and `--no-pytest`
 only the native ones.
 
 `-O`/`--test-option` passes an option through to pytest: `name` becomes
@@ -97,6 +98,25 @@ runs nothing. The third path is buildutil's own: `tools/*/pytest.ini`
 suites are run directly, skipping any directory `[test] python` already
 covers, and pytest's "no tests collected" exit is treated as success
 there.
+
+A `--timeout` sized for one gtest case is the wrong bound for an entry
+holding twenty pytest cases, so a suite may carry its own wall clock:
+
+```toml
+[test]
+python = ["tools", "examples/scooby"]
+
+[test.timeout]
+"examples/scooby" = 240
+```
+
+which becomes the `TIMEOUT` property of that entry. ctest honours a test's
+own property over its `--timeout`, so `buildutil test --timeout 60` bounds
+every entry that declares nothing — the C++ cases, one per entry — and
+leaves the declared suites at theirs. A key that names no declared suite
+is refused at the command the project ran, by name; a module's own suite
+(found by presence, declaring nothing) has nowhere to carry a bound and is
+bounded by `--timeout`.
 
 Each suite is **one** ctest entry, not one per case: discovering cases
 would mean running pytest at configure time, and a configure step that

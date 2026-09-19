@@ -57,10 +57,11 @@ def test(
   ),
   timeout: float = typer.Option(
     60.0, "--timeout",
-    help="Per-test timeout (seconds). A test exceeding this is killed and "
-       "reported as a failure rather than hanging the whole run. "
-       "Tune up if a test is genuinely slow; default catches "
-       "deadlocks early.",
+    help="Per-test timeout (seconds) for every entry that declares none of "
+       "its own. A test exceeding it is killed and reported as a failure "
+       "rather than hanging the whole run; a python suite that needs "
+       "longer declares it in buildutil.toml's [test.timeout] and keeps "
+       "that.",
   ),
   parallel: bool = typer.Option(
     False, "--parallel",

@@ -215,6 +215,7 @@ def _load_project() -> dict:
     "modules_no_arc": [],        # [modules.<name>] objc_arc = false
     "modules_frameworks": {},    # [modules.<name>] frameworks = [...]
     "test_python_suites": [],    # [test] python: non-module suite dirs
+    "test_python_timeouts": {},  # [test.timeout]: suite -> its own seconds
     "bench_suite": "",
     "run_default": "",
     "run_default_os": {},
@@ -271,7 +272,10 @@ def _load_project() -> dict:
   cfg["modules_platforms"] = _module_platforms(raw)
   cfg["modules_no_arc"] = _modules_without_arc(raw)
   cfg["modules_frameworks"] = _module_frameworks(raw)
-  cfg["test_python_suites"] = _python_suites(raw)
+  test = _test_table(raw)
+  cfg["test_python_suites"] = _python_suites(test)
+  cfg["test_python_timeouts"] = _python_suite_timeouts(
+    test, cfg["test_python_suites"])
   cfg["bench_suite"] = str(raw.get("bench", {}).get("suite", ""))
   run = raw.get("run", {})
   cfg["run_default"] = str(run.get("default", ""))
@@ -533,11 +537,11 @@ def _modules_without_arc(raw: dict) -> list[str]:
   return out
 
 
-_TEST_KEYS = {"python"}
+_TEST_KEYS = {"python", "timeout"}
 
 
-def _python_suites(raw: dict) -> list[str]:
-  """[test] python: suite directories that are not modules."""
+def _test_table(raw: dict) -> dict:
+  """[test], validated once for everything read out of it."""
   test = raw.get("test", {})
   if not isinstance(test, dict):
     sys.exit("buildutil.toml: [test] must be a table")
@@ -545,12 +549,46 @@ def _python_suites(raw: dict) -> list[str]:
   if unknown:
     sys.exit(f"buildutil.toml: [test] has unknown key(s) "
              f"{', '.join(unknown)} (known: {', '.join(sorted(_TEST_KEYS))})")
+  return test
+
+
+def _python_suites(test: dict) -> list[str]:
+  """[test] python: suite directories that are not modules."""
   suites = [str(one) for one in test.get("python", [])]
   for suite in suites:
     if suite.startswith("/") or ".." in Path(suite).parts:
       sys.exit(f"buildutil.toml: [test] python entry {suite!r} must be a "
                "directory inside the repo, relative to its root")
   return suites
+
+
+def _python_suite_timeouts(test: dict,
+                           suites: list[str]) -> dict[str, int | float]:
+  """[test.timeout]: a declared suite's own wall clock in seconds, which
+  becomes that ctest entry's TIMEOUT property.
+
+  A python suite is ONE entry however many cases it holds, so `--timeout`,
+  sized for a gtest case, bounds a whole suite -- and how long a suite
+  legitimately takes is a project fact, committed, not a flag someone
+  must remember."""
+  table = test.get("timeout", {})
+  if not isinstance(table, dict):
+    sys.exit('buildutil.toml: [test.timeout] must be a table mapping a '
+             '[test] python suite to seconds ("examples/scooby" = 240)')
+  out = {}
+  for suite, seconds in table.items():
+    if suite not in suites:
+      sys.exit(f"buildutil.toml: [test.timeout] names {suite!r}, which is not "
+               "a suite declared in [test] python (declared: "
+               f"{', '.join(suites) or 'nothing'})")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+      sys.exit(f"buildutil.toml: [test.timeout] {suite!r} must be a number of "
+               f"seconds, not {seconds!r}")
+    if seconds <= 0:
+      sys.exit(f"buildutil.toml: [test.timeout] {suite!r} is {seconds}; a "
+               "suite's own wall clock must be more than zero seconds")
+    out[suite] = seconds
+  return out
 
 
 def _identifier(text: str) -> str:

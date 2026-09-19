@@ -4,6 +4,8 @@ A module's suite is declared by presence (`*.test.py` inside it). A
 top-level `tools/` has no CMakeLists to be found through, so before this
 the only way to register it was to call two private `_buildutil_*`
 functions from the project's root CMakeLists, which is what this ends.
+Its `[test.timeout]` half is the bound such a suite carries, one entry
+holding however many cases.
 """
 import json
 import os
@@ -26,6 +28,8 @@ e2e = pytest.mark.skipif(
 
 PROBE = ("import json, buildutil.config as c;"
          "print(json.dumps(c.PROJECT['test_python_suites']))")
+BOUNDS_PROBE = ("import json, buildutil.config as c;"
+                "print(json.dumps(c.PROJECT['test_python_timeouts']))")
 
 ROOT_CMAKE = """\
 cmake_minimum_required(VERSION 3.25)
@@ -42,17 +46,26 @@ def test_the_suite_ran_in_its_own_directory():
   assert Path.cwd().name == "tools"
 """
 
+SLOW_SUITE = """\
+import time
 
-def _config(tmp_path, toml):
+
+def test_the_case_takes_longer_than_a_gtest_case():
+  time.sleep(2)
+"""
+
+
+def _config(tmp_path, toml, probe=PROBE):
   (tmp_path / "buildutil.toml").write_text(toml)
   env = {**os.environ, "PYTHONPATH": PKG_PARENT}
   env.pop("BUILDUTIL_ROOT", None)
-  return subprocess.run([sys.executable, "-c", PROBE], cwd=tmp_path, env=env,
+  return subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, env=env,
                         capture_output=True, text=True)
 
 
-def _project(tmp_path, suite=SUITE):
-  deposit.ensure(tmp_path, {**CFG, "test_python_suites": ["tools"]})
+def _project(tmp_path, suite=SUITE, timeouts=None):
+  deposit.ensure(tmp_path, {**CFG, "test_python_suites": ["tools"],
+                            "test_python_timeouts": timeouts or {}})
   (tmp_path / "CMakeLists.txt").write_text(ROOT_CMAKE)
   tools = tmp_path / "tools"
   tools.mkdir()
@@ -102,7 +115,7 @@ def test_a_path_out_of_the_repo_is_refused(tmp_path):
 def test_the_declaration_renders_as_one_call(tmp_path):
   deposit.ensure(tmp_path, {**CFG, "test_python_suites": ["tools", "qa/py"]})
   rendered = (tmp_path / "_bdudata" / "cmake" / "buildutil.cmake").read_text()
-  assert '_buildutil_python_suites("tools;qa/py")' in rendered
+  assert '_buildutil_python_suites("tools;qa/py" "")' in rendered
   assert "@PYTHON_SUITES@" not in rendered
 
 
@@ -170,3 +183,91 @@ def test_the_buildutil_spelling_collects_too(tmp_path):
     capture_output=True, text=True, env={**os.environ, "BUILDUTIL": "1"})
   assert run.returncode == 0, run.stdout + run.stderr
   assert "1 passed" in run.stdout, run.stdout
+
+
+def test_a_declared_bound_is_read_by_suite(tmp_path):
+  got = _config(tmp_path, '[test]\npython = ["tools", "examples/scooby"]\n'
+                          '[test.timeout]\n"examples/scooby" = 240\n',
+                probe=BOUNDS_PROBE)
+  assert got.returncode == 0, got.stderr
+  assert json.loads(got.stdout) == {"examples/scooby": 240}
+
+
+def test_no_declared_bound_is_an_empty_table(tmp_path):
+  got = _config(tmp_path, '[test]\npython = ["tools"]\n', probe=BOUNDS_PROBE)
+  assert got.returncode == 0, got.stderr
+  assert json.loads(got.stdout) == {}
+
+
+def test_a_bound_for_an_undeclared_suite_is_refused_by_name(tmp_path):
+  got = _config(tmp_path, '[test]\npython = ["tools"]\n'
+                          '[test.timeout]\n"examples/scooby" = 240\n')
+  assert got.returncode != 0
+  assert "examples/scooby" in got.stderr
+  assert "[test] python" in got.stderr
+
+
+def test_a_bound_that_is_not_a_count_of_seconds_is_refused(tmp_path):
+  for bad in ('"soon"', "true", "0", "-5"):
+    got = _config(tmp_path, '[test]\npython = ["tools"]\n'
+                            f'[test.timeout]\ntools = {bad}\n')
+    assert got.returncode != 0, bad
+    assert "[test.timeout]" in got.stderr, bad
+
+
+def test_the_bound_rides_the_registration_call(tmp_path):
+  deposit.ensure(tmp_path, {**CFG, "test_python_suites": ["tools", "qa/py"],
+                            "test_python_timeouts": {"qa/py": 240}})
+  rendered = (tmp_path / "_bdudata" / "cmake" / "buildutil.cmake").read_text()
+  assert '_buildutil_python_suites("tools;qa/py" "qa/py=240")' in rendered
+
+
+def _entry_properties(build, name):
+  shown = subprocess.run(
+    ["ctest", "--test-dir", str(build), "--show-only=json-v1"],
+    capture_output=True, text=True)
+  assert shown.returncode == 0, shown.stdout + shown.stderr
+  entries = json.loads(shown.stdout)["tests"]
+  entry = next(one for one in entries if one["name"] == name)
+  return {one["name"]: one["value"] for one in entry.get("properties", [])}
+
+
+@e2e
+def test_a_declared_bound_is_the_entrys_ctest_timeout(tmp_path):
+  """A suite is ONE entry however many cases it holds, so --timeout, which
+  is right for a gtest case, is wrong for it by construction."""
+  root = _project(tmp_path, timeouts={"tools": 240})
+  build = tmp_path / "b"
+  assert _configure(root, build).returncode == 0
+  assert _entry_properties(build, "tools-pytest")["TIMEOUT"] == 240
+
+
+@e2e
+def test_a_suite_with_no_bound_leaves_the_timeout_to_the_driver(tmp_path):
+  root = _project(tmp_path)
+  build = tmp_path / "b"
+  assert _configure(root, build).returncode == 0
+  assert "TIMEOUT" not in _entry_properties(build, "tools-pytest")
+
+
+@e2e
+def test_a_declared_bound_outranks_the_drivers_timeout(tmp_path):
+  """What the driver's `--timeout` being a floor rests on: ctest honours a
+  test's own TIMEOUT over the one on its command line. The same suite with
+  no bound is what the flag then kills."""
+  root = _project(tmp_path, suite=SLOW_SUITE, timeouts={"tools": 60})
+  env = {**os.environ, "BUILDUTIL": "1"}
+  bound = tmp_path / "bound"
+  assert _configure(root, bound).returncode == 0
+  ran = subprocess.run(
+    ["ctest", "--test-dir", str(bound), "-R", "tools-pytest", "--timeout", "1"],
+    capture_output=True, text=True, env=env)
+  assert ran.returncode == 0, ran.stdout + ran.stderr
+  bare = tmp_path / "bare"
+  deposit.ensure(root, {**CFG, "test_python_suites": ["tools"]})
+  assert _configure(root, bare).returncode == 0
+  killed = subprocess.run(
+    ["ctest", "--test-dir", str(bare), "-R", "tools-pytest", "--timeout", "1"],
+    capture_output=True, text=True, env=env)
+  assert killed.returncode != 0
+  assert "Timeout" in killed.stdout, killed.stdout

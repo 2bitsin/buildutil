@@ -142,11 +142,16 @@ def _project_options(cfg: dict) -> str:
 
 
 def _python_suites(cfg: dict) -> str:
-  """buildutil.toml's [test] python as the cmake call that registers it."""
+  """buildutil.toml's [test] python as the cmake call that registers it,
+  carrying [test.timeout] as `<suite>=<seconds>` pairs."""
   suites = cfg.get("test_python_suites") or []
   if not suites:
     return ""
-  return '_buildutil_python_suites("{dirs}")'.format(dirs=";".join(suites))
+  timeouts = cfg.get("test_python_timeouts") or {}
+  return '_buildutil_python_suites("{dirs}" "{timeouts}")'.format(
+    dirs=";".join(suites),
+    timeouts=";".join(f"{suite}={seconds}"
+                      for suite, seconds in timeouts.items()))
 
 
 def _macos_bundle(cfg: dict) -> str:

@@ -6,9 +6,9 @@ project-specific lives in one file at the repo root, and the repo root
 key is required — an empty file marks the root and takes every default.
 Validation is strict and names itself at the command the project ran,
 not three layers down: unknown keys are refused for `[runtime]`,
-`[bundle.macos]`, `[bundle.macos.helpers]`, `[modules.<name>]`, `[test]`
-and `[resources]`, and a platform tag that is not in the vocabulary is a
-refusal too.
+`[bundle.macos]`, `[bundle.macos.helpers]`, `[modules.<name>]`, `[test]`,
+`[test.timeout]` and `[resources]`, and a platform tag that is not in the
+vocabulary is a refusal too.
 
 ## `[project]`
 
@@ -88,6 +88,7 @@ conf = ["tools.build:jobs=25"]
 | key | default | what it changes |
 |---|---|---|
 | `[test] python` | `[]` | directories that are **not** modules and hold a pytest suite; each gets a `<dir>-pytest` ctest entry. Repo-relative, no `..`, and a directory with no test file in it fails the configure |
+| `[test.timeout]` | `{}` | one entry per declared suite, `"<suite>" = <seconds>`, the wall clock that suite's ctest entry gets. A key that is not in `[test] python` is refused by name, and so is a value that is not a positive number |
 | `[bench] suite` | `""` | a python bench suite run as `python -m <suite>`; unset, `buildutil bench` runs the `*-benches` executables instead |
 | `[coverage] bridge_dirs` | `[]` | build directories of python bridges; the first one that exists is exported to pytest as `<module_define_prefix>_BRIDGE_DIR` |
 | `[coverage] exclude` | `[]` | extra `gcovr --exclude` regexes, for vendored code |

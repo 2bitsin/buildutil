@@ -1906,16 +1906,37 @@ function(_buildutil_register_python_suite target directory)
     ENVIRONMENT_MODIFICATION "${_env}")
 endfunction()
 
+# The value `key` carries in a list of `key=value` pairs, empty when it
+# carries none. A string compare, not a regex: a key here is a path, and a
+# path holds regex metacharacters.
+function(_buildutil_pair_value out pairs key)
+  set(${out} "" PARENT_SCOPE)
+  foreach(_pair IN LISTS pairs)
+    string(FIND "${_pair}" "=" _at)
+    string(SUBSTRING "${_pair}" 0 ${_at} _name)
+    if(_name STREQUAL key)
+      math(EXPR _from "${_at} + 1")
+      string(SUBSTRING "${_pair}" ${_from} -1 _value)
+      set(${out} "${_value}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+endfunction()
+
 # [test] python: a directory that is not a module, as one ctest entry.
 # pytest is handed the DIRECTORY, so its own patterns apply, plus *.test.py.
 # A declared directory holding none of them fails the configure.
-function(_buildutil_python_suites)
+#
+# `timeouts` is [test.timeout] as `<suite>=<seconds>` pairs, set as the
+# entry's TIMEOUT property -- which ctest honours over its own --timeout,
+# so a suite that declares nothing stays bounded by the driver's flag.
+function(_buildutil_python_suites suites timeouts)
   if(NOT BUILD_TESTING)
     return()
   endif()
   _buildutil_pytest_patterns(_patterns)
   _buildutil_pytest_file_option(_files_option)
-  foreach(_suite IN LISTS ARGN)
+  foreach(_suite IN LISTS suites)
     set(_suite_dir "${CMAKE_SOURCE_DIR}/${_suite}")
     if(NOT IS_DIRECTORY "${_suite_dir}")
       message(FATAL_ERROR
@@ -1936,6 +1957,11 @@ function(_buildutil_python_suites)
     string(REPLACE "/" "-" _suite_target "${_suite}")
     _buildutil_register_python_suite(${_suite_target} "${_suite_dir}"
       "${_suite_dir}" ${_files_option})
+    _buildutil_pair_value(_seconds "${timeouts}" "${_suite}")
+    if(_seconds)
+      set_tests_properties(${_suite_target}-pytest PROPERTIES
+                           TIMEOUT "${_seconds}")
+    endif()
   endforeach()
 endfunction()
 
