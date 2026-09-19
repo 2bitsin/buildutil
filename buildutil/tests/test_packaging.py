@@ -178,6 +178,13 @@ def test_the_refusal_survives_a_bare_recipe_without_settings(tmp_path):
 
 # --------------------------------------------- the version model --
 
+@pytest.fixture(autouse=True)
+def _no_ambient_remote(monkeypatch):
+  for name in ("CONAN_REMOTE_URL", "CONAN_REMOTE_NAME", "CI_ARTIFACTORY_HREF",
+               "CI_ARTIFACTORY_NAME"):
+    monkeypatch.delenv(name, raising=False)
+
+
 def _fake_project(monkeypatch, **cfg):
   from buildutil import config
   base = {"package_kind": "", "package_name": "", "name": "proj"}
@@ -762,3 +769,10 @@ def test_a_linkable_package_still_componentises_its_libraries(tmp_path):
                "external": []}])
   assert info.components["genesis"].libs == ["genesis"]
   assert info.components["snes"].libs == []
+
+
+def test_a_missing_conan_binary_is_no_answer(monkeypatch):
+  monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
+  def absent(*args, **kwargs):
+    raise FileNotFoundError(2, "No such file or directory", "conan")
+  assert packaging.remote_builds("1.2.3", run=absent) is None

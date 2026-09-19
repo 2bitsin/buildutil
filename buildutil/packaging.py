@@ -107,8 +107,11 @@ def remote_builds(base: str, run=subprocess.run) -> list[int] | None:
   name, url, _, _ = bootstrap.conan_remote_env()
   if not url:
     return None
-  proc = run(["conan", "list", f"{package_name()}/*", "-r", name,
-              "--format=json"], capture_output=True, text=True)
+  try:
+    proc = run(["conan", "list", f"{package_name()}/*", "-r", name,
+                "--format=json"], capture_output=True, text=True)
+  except OSError:
+    return None
   if proc.returncode != 0:
     return None
   try:
