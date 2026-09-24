@@ -9,10 +9,11 @@ script or `python -m buildutil`.
 """
 import atexit
 import os
+import sys
 
 
 def _lift_watchdog_flags(argv: list[str]) -> tuple[list[str], list[str]]:
-  """The watchdog switches (--no-watchdog, --watchdog-budget N /
+  """The watchdog switches (--i-am-willingly-circumventing-build-and-test-time-safeguards, --watchdog-budget N /
   --watchdog-budget=N) are legal ANYWHERE on the line — every subcommand
   accepts them. typer only parses globals before the subcommand, so pull
   them out and hand back (switches, everything else) for reassembly.
@@ -27,6 +28,11 @@ def _lift_watchdog_flags(argv: list[str]) -> tuple[list[str], list[str]]:
       rest.extend(argv[i:])
       break
     if arg == "--no-watchdog":
+      sys.stderr.write("buildutil: --no-watchdog is gone. The watchdog is the "
+                       "measurement; a run it fails is a defect to fix. If you "
+                       "must, say it: --i-am-willingly-circumventing-build-and-test-time-safeguards\n")
+      sys.exit(2)
+    if arg == "--i-am-willingly-circumventing-build-and-test-time-safeguards":
       flags.append(arg)
     elif arg == "--watchdog-budget" and i + 1 < len(argv):
       flags.extend(argv[i:i + 2])

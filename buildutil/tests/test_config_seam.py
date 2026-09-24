@@ -15,6 +15,8 @@ PKG_PARENT = str(Path(__file__).resolve().parents[2])
 PROBE = (
   "import json, buildutil.config as c;"
   "print(json.dumps({'root': str(c.REPO_ROOT), 'have': c.HAVE_PROJECT,"
+  " 'discovery_timeout': c.PROJECT['test_discovery_timeout'],"
+  " 'exclude_labels': c.PROJECT['test_exclude_labels'],"
   " 'name': c.PROJECT_NAME, 'cmake': c.CMAKE_PREFIX,"
   " 'mod': c.MODULE_DEFINE_PREFIX, 'deps': c.VENV_DEPS,"
   " 'bridges': c.PROJECT['coverage_bridge_dirs'], 'bench': c.PROJECT['bench_suite'], 'copts': c.PROJECT['conan_options_os'], 'cconf': c.PROJECT['conan_conf'], 'covx': c.PROJECT['coverage_exclude'], 'export': c.PROJECT['export_module_headers'], 'dormant': c.PROJECT['modules_dormant'], 'rns': c.PROJECT['reflect_namespace'], 'rann': c.PROJECT['reflect_annotation'], 'rmac': c.PROJECT['reflect_macros']}))"
@@ -44,6 +46,7 @@ def test_root_is_nearest_ancestor_with_toml(tmp_path):
 def test_no_toml_means_no_project(tmp_path):
   got = _probe(tmp_path)
   assert not got["have"]
+  assert got["discovery_timeout"] == 30
   # and the defaults hold: generic prefixes, driver-only deps
   assert got["name"] == "project"
   assert got["cmake"] == "BUILDUTIL" and got["mod"] == "MOD"
@@ -149,3 +152,75 @@ def test_the_scan_key_that_only_served_them_is_refused_too(tmp_path):
   with pytest.raises(subprocess.CalledProcessError) as refused:
     _probe(tmp_path)
   assert "scan" in refused.value.stderr
+
+
+@pytest.mark.parametrize("toml, expected", [
+  ("", 30), ("[test]\n", 30), ("[test]\ndiscovery_timeout = 73\n", 73),
+])
+def test_discovery_timeout(tmp_path, toml, expected):
+  (tmp_path / "buildutil.toml").write_text(toml)
+  assert _probe(tmp_path)["discovery_timeout"] == expected
+
+
+@pytest.mark.parametrize("value, message", [
+  ("0", "more than zero seconds"), ("-1", "more than zero seconds"),
+  ("1.5", "integer number of seconds"), ("30.0", "integer number of seconds"),
+  ('"30"', "integer number of seconds"), ("true", "integer number of seconds"),
+  ("false", "integer number of seconds"), ("[]", "integer number of seconds"),
+  ("{}", "integer number of seconds"),
+])
+def test_invalid_discovery_timeout(tmp_path, value, message):
+  (tmp_path / "buildutil.toml").write_text(
+    f"[test]\ndiscovery_timeout = {value}\n")
+  with pytest.raises(subprocess.CalledProcessError) as refused:
+    _probe(tmp_path)
+  assert "buildutil.toml: [test] discovery_timeout" in refused.value.stderr
+  assert message in refused.value.stderr
+
+
+@pytest.mark.parametrize("toml, expected", [
+  ("", []), ("[test]\n", []),
+  ('[test]\nexclude_labels = []\n', []),
+  ('[test]\nexclude_labels = ["measurement", "slow.case"]\n',
+   ["measurement", "slow.case"]),
+])
+def test_exclude_labels(tmp_path, toml, expected):
+  (tmp_path / "buildutil.toml").write_text(toml)
+  assert _probe(tmp_path)["exclude_labels"] == expected
+
+
+@pytest.mark.parametrize("value", ['"measurement"', "true", "1", "{}", '[1]'])
+def test_invalid_exclude_labels(tmp_path, value):
+  (tmp_path / "buildutil.toml").write_text(
+    f"[test]\nexclude_labels = {value}\n")
+  with pytest.raises(subprocess.CalledProcessError) as refused:
+    _probe(tmp_path)
+  assert "[test] exclude_labels must be a list of strings" in refused.value.stderr
+
+
+def test_optimize_accepts_derived_module_names(tmp_path, monkeypatch):
+  from buildutil import config
+  module = tmp_path / "sources" / "render" / "scene.lib"
+  module.mkdir(parents=True)
+  (module / "CMakeLists.txt").write_text("Init_submodule()\n")
+  (tmp_path / "buildutil.toml").write_text(
+    '[optimize]\nalways = ["render-scene"]\n')
+  monkeypatch.setattr(config, "REPO_ROOT", tmp_path)
+  monkeypatch.setattr(config, "HAVE_PROJECT", True)
+  assert config._load_project()["optimize_always"] == ["render-scene"]
+
+
+@pytest.mark.parametrize("table, message", [
+  ('[optimize]\nalways = ["missing-scene"]', "missing-scene"),
+  ('[optimize]\nalways = "scene"', "list of module names"),
+  ('[optimize]\nalways = [1]', "list of module names"),
+  ('optimize = []', "must be a table"),
+  ('[optimize]\nalway = []', "alway"),
+])
+def test_optimize_rejects_invalid_entries(tmp_path, monkeypatch, table, message):
+  from buildutil import config
+  (tmp_path / "buildutil.toml").write_text(table)
+  monkeypatch.setattr(config, "REPO_ROOT", tmp_path)
+  monkeypatch.setattr(config, "HAVE_PROJECT", True)
+  with pytest.raises(SystemExit, match=message):
+    config._load_project()

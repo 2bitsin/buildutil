@@ -234,10 +234,8 @@ def test_one_place_force_includes_the_header(tmp_path):
   emitting them is how they would come to disagree."""
   machinery = (deposit.ensure(tmp_path, CFG)
                / "buildutil.cmake").read_text()
-  assert machinery.count("add_compile_options(\n"
-                         "    \"$<$<AND:${preprocessed}") == 1
-  assert machinery.count(':-include>"') == 1
-  assert machinery.count(':/FI>"') == 1
+  assert machinery.count(':SHELL:-include ') == 1
+  assert machinery.count(':SHELL:/FI ') == 1
 
 
 # ------------------------------------------------------------ the editor --

@@ -141,21 +141,23 @@ else()
 endif()
 
 function(Require NAME)
-  cmake_parse_arguments(REQ "TEST;BENCH;TOOL;SYSTEM;PUBLIC" "VERSION;CONAN" "COMPONENTS;PLATFORM;OPTIONS" ${ARGN})
+  cmake_parse_arguments(REQ "TEST;BENCH;TOOL;SYSTEM;PUBLIC;FORCE" "VERSION;CONAN" "COMPONENTS;PLATFORM;OPTIONS" ${ARGN})
+  _buildutil_refuse_misplaced_require(${NAME})
   # PUBLIC says this dep is part of the module's own API -- its headers
   # appear in headers this project EXPORTS, so a consumer of
   # the published package needs them on its include path too. Acted on
   # only by the conanfile reading this same call (transitive_headers on
   # the requires); here it is validated. Meaningless off the runtime
-  # graph: a SYSTEM dep conan never propagates, and TEST/BENCH/TOOL deps
-  # never reach a consumer at all (format_json.hpp includes
-  # <nlohmann/json.hpp>, every consumer failed to compile).
-  if(REQ_PUBLIC AND (REQ_SYSTEM OR REQ_TEST OR REQ_BENCH OR REQ_TOOL))
+  # graph: TEST/BENCH/TOOL deps never reach a consumer at all
+  # (format_json.hpp includes <nlohmann/json.hpp>, every consumer failed
+  # to compile).
+  if(REQ_PUBLIC AND (REQ_TEST OR REQ_BENCH OR REQ_TOOL))
     message(FATAL_ERROR
-      "Require(${NAME}): PUBLIC only makes sense on a plain runtime "
-      "dependency — SYSTEM/TEST/BENCH/TOOL deps never propagate to a "
+      "Require(${NAME}): PUBLIC only makes sense on a runtime "
+      "dependency — TEST/BENCH/TOOL deps never propagate to a "
       "package consumer, so PUBLIC there would silently do nothing.")
   endif()
+  _buildutil_refuse_lone_force(${NAME} "${REQ_FORCE}" "${REQ_SYSTEM}")
   # OPTIONS are conan package options (key=value), acted on ONLY by the
   # conanfile reading this same call — here they are validated and
   # otherwise ignored. Both refusals are loud on purpose: a typo'd
@@ -235,25 +237,17 @@ function(Require NAME)
       return()
     endif()
   endif()
+  _buildutil_claim_require_name(${NAME})
   # TEST/BENCH deps only exist when the matching CMake option is on,
   # so the rest of the build doesn't pay for the find_package call
   # (or expose the headers) when no test/bench target will use them.
-  if(REQ_TEST AND NOT BUILD_TESTING)
+  # a .test module serves the benches too, so TEST deps exist in either lane
+  if(REQ_TEST AND NOT BUILD_TESTING AND NOT BUILD_BENCHMARKING)
     return()
   endif()
   if(REQ_BENCH AND NOT BUILD_BENCHMARKING)
     return()
   endif()
-  # SYSTEM says the HOST provides this one: find_package still runs, and
-  # the conanfile (which reads these same calls) leaves it out of the
-  # graph entirely. Without it, dropping a CONAN name to use the host's
-  # copy made conan ask for a recipe that does not exist and fail the
-  # install -- so projects fell back to a bare find_package in a group
-  # root, which works only because the conanfile's regex cannot see it.
-  # A dependency surviving on a parser's blind spot is not a dependency
-  # anyone can reason about. Nothing to do here: the keyword's whole
-  # effect is on the conan side, and find_package below runs as usual.
-  #
   # TOOL deps are build-time executables (the conanfile rides them in as
   # tool_requires, landing their bindir on CMAKE_PROGRAM_PATH) -- nothing
   # to find_package; consumers find_program them at the point of use.
@@ -271,24 +265,140 @@ function(Require NAME)
   # the package and nobody else has verified anything. Range operators
   # are stripped: find_package takes a plain number (soft lower bound);
   # the range form is only meaningful for conan.
-  set(_ver "")
   if(REQ_SYSTEM)
     string(REGEX REPLACE "^[><=~^]+" "" _ver "${REQ_VERSION}")
-  endif()
-  # an imported target belongs to the directory that found it, and the
-  # rpath pass below runs in ROOT scope, where it would not exist
-  if(REQ_SYSTEM)
-    set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
-  endif()
-  get_property(_req_imported DIRECTORY PROPERTY IMPORTED_TARGETS)
-  if(_req_names)
-    find_package(${NAME} ${_ver} REQUIRED COMPONENTS ${_req_names})
+    _buildutil_find_host_package(${NAME} "${_ver}" "${_req_names}")
+  elseif(_req_names)
+    find_package(${NAME} REQUIRED COMPONENTS ${_req_names})
   else()
-    find_package(${NAME} ${_ver} REQUIRED)
+    find_package(${NAME} REQUIRED)
   endif()
-  if(REQ_SYSTEM)
-    _buildutil_record_host_imports("${_req_imported}")
+endfunction()
+
+function(_buildutil_refuse_misplaced_require name)
+  if(NOT CMAKE_CURRENT_SOURCE_DIR STREQUAL "${CMAKE_SOURCE_DIR}/sources")
+    message(FATAL_ERROR
+      "Require(${name}) in ${CMAKE_CURRENT_LIST_FILE}: Require belongs in "
+      "sources/CMakeLists.txt, the only file conanfile.py reads; anywhere "
+      "else it never reaches the conan graph. Move it there.")
   endif()
+endfunction()
+
+function(_buildutil_refuse_lone_force name force system)
+  if(force AND NOT system)
+    message(FATAL_ERROR
+      "Require(${name}): FORCE without SYSTEM — FORCE takes the host's "
+      "package over the conan pins it replaces, and only a SYSTEM dep is "
+      "the host's.")
+  endif()
+endfunction()
+
+function(_buildutil_claim_require_name name)
+  get_property(seen GLOBAL PROPERTY _buildutil_required_names)
+  if(name IN_LIST seen)
+    message(FATAL_ERROR
+      "Require(${name}) is declared twice for this platform; the conanfile "
+      "would read two requirements of one package. Keep one.")
+  endif()
+  set_property(GLOBAL APPEND PROPERTY _buildutil_required_names "${name}")
+endfunction()
+
+# The conanfile forces a <conan>/system@host wrapper over every conan pin
+# of a SYSTEM dep; this find reaches the host's own config or Find module.
+# CMAKE_PREFIX_PATH, CMAKE_MODULE_PATH, CMAKE_LIBRARY_PATH,
+# CMAKE_INCLUDE_PATH and CMAKE_PROGRAM_PATH lose conan's generators folder
+# and cache, and a <NAME>_DIR cached there is forgotten. Afterwards every
+# target the find imported is refused if its imported location is inside
+# the conan cache; the find's result variables are not checked.
+function(_buildutil_find_host_package _bhp_name _bhp_version _bhp_components)
+  # an imported target belongs to the directory that found it, and the
+  # rpath pass runs in ROOT scope, where it would not exist
+  set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ON)
+  _buildutil_conan_dirs(_bhp_conan_dirs)
+  foreach(_bhp_variable IN ITEMS CMAKE_PREFIX_PATH CMAKE_MODULE_PATH
+          CMAKE_LIBRARY_PATH CMAKE_INCLUDE_PATH CMAKE_PROGRAM_PATH)
+    _buildutil_without_dirs(${_bhp_variable} "${_bhp_conan_dirs}")
+  endforeach()
+  _buildutil_forget_conan_dir(${_bhp_name} "${_bhp_conan_dirs}")
+  get_property(_bhp_before DIRECTORY PROPERTY IMPORTED_TARGETS)
+  if(_bhp_components)
+    find_package(${_bhp_name} ${_bhp_version} REQUIRED
+                 COMPONENTS ${_bhp_components})
+  else()
+    find_package(${_bhp_name} ${_bhp_version} REQUIRED)
+  endif()
+  _buildutil_refuse_cache_imports(${_bhp_name} "${_bhp_before}")
+  _buildutil_record_host_imports("${_bhp_before}")
+endfunction()
+
+# conan's generators folder (the toolchain's own) and its package cache
+function(_buildutil_conan_dirs out)
+  set(dirs "")
+  if(CMAKE_TOOLCHAIN_FILE)
+    get_filename_component(generators "${CMAKE_TOOLCHAIN_FILE}" DIRECTORY)
+    file(REAL_PATH "${generators}" generators)
+    list(APPEND dirs "${generators}")
+  endif()
+  if(DEFINED ENV{CONAN_HOME})
+    file(REAL_PATH "$ENV{CONAN_HOME}" home)
+    list(APPEND dirs "${home}")
+  endif()
+  set(${out} "${dirs}" PARENT_SCOPE)
+endfunction()
+
+function(_buildutil_under_dirs path dirs out)
+  set(${out} FALSE PARENT_SCOPE)
+  if(NOT path)
+    return()
+  endif()
+  file(REAL_PATH "${path}" real)
+  foreach(dir IN LISTS dirs)
+    cmake_path(IS_PREFIX dir "${real}" NORMALIZE under)
+    if(under)
+      set(${out} TRUE PARENT_SCOPE)
+    endif()
+  endforeach()
+endfunction()
+
+function(_buildutil_without_dirs variable dirs)
+  set(kept "")
+  foreach(entry IN LISTS ${variable})
+    _buildutil_under_dirs("${entry}" "${dirs}" under)
+    if(NOT under)
+      list(APPEND kept "${entry}")
+    endif()
+  endforeach()
+  set(${variable} "${kept}" PARENT_SCOPE)
+endfunction()
+
+# a dependant's find_dependency caches <NAME>_DIR at the wrapper's config
+function(_buildutil_forget_conan_dir name dirs)
+  _buildutil_under_dirs("${${name}_DIR}" "${dirs}" under)
+  if(under)
+    unset(${name}_DIR CACHE)
+  endif()
+endfunction()
+
+function(_buildutil_refuse_cache_imports name before)
+  if(NOT DEFINED ENV{CONAN_HOME})
+    return()
+  endif()
+  file(REAL_PATH "$ENV{CONAN_HOME}/p" cache)
+  get_property(after DIRECTORY PROPERTY IMPORTED_TARGETS)
+  foreach(imported IN LISTS after)
+    if(imported IN_LIST before)
+      continue()
+    endif()
+    _buildutil_imported_directory(${imported} directory)
+    _buildutil_under_dirs("${directory}" "${cache}" under)
+    if(under)
+      message(FATAL_ERROR
+        "Require(${name} ... SYSTEM) imported ${imported} from ${directory}, "
+        "inside the conan cache: conan's copy of ${name} is in the graph "
+        "beside the host's. Run the build through buildutil so the host "
+        "wrapper replaces it.")
+    endif()
+  endforeach()
 endfunction()
 
 function(_buildutil_record_host_imports before)
@@ -509,6 +619,8 @@ endfunction()
 #   sources/wd.obj/      an object-only module -- every object reaches
 #                        whoever links it, nothing dropped
 #   sources/dip.so/      a shared library    (.dll / .dylib synonyms)
+#   sources/rig.test/    a test-lane module -- built with the suites,
+#                        linked only from TEST/BENCH groups, never shipped
 #
 # The tag is NEVER part of a name. sources/wd.exe/ is the module `wd` and
 # ships a binary called `wd` -- otherwise Linux would install `wd.exe`.
@@ -519,7 +631,7 @@ endfunction()
 # decides the real suffix. A tag that meant "Windows only" would collide
 # with the platform axis (host.win32/) and a listing would stop being
 # unambiguous about which of the two it was doing.
-set(_buildutil_kind_tags "obj;lib;a;exe;so;dll;dylib")
+set(_buildutil_kind_tags "@KIND_TAGS@")
 
 # A module directory may ALSO carry a platform tag, the same one its
 # sources carry: sources/helper.macos/ is the module `helper`, and it
@@ -665,6 +777,70 @@ function(_buildutil_loader_relative out hop)
   endif()
 endfunction()
 
+# A module that dlopens a sibling finds it the way a linked sibling is
+# found: loader-relative at the install mirror, and at the sibling's own
+# directory in the build tree. glibc searches the caller's DT_RUNPATH.
+# Whatever runs the loader builds the loaded module first.
+function(_buildutil_apply_runtime_loads)
+  get_property(loaders GLOBAL PROPERTY _buildutil_runtime_loaders)
+  list(REMOVE_DUPLICATES loaders)
+  foreach(loader IN LISTS loaders)
+    get_property(loaded GLOBAL PROPERTY _buildutil_loads_${loader})
+    list(REMOVE_DUPLICATES loaded)
+    get_target_property(loader_type ${loader} TYPE)
+    if(NOT loader_type MATCHES "^(SHARED_LIBRARY|EXECUTABLE)$")
+      message(FATAL_ERROR
+        "${loader}: Link_dependencies(RUNTIME) on a module that builds as "
+        "${loader_type}. The rpath that finds the loaded module belongs to "
+        "the binary calling dlopen: an application, or a shared library "
+        "(a main.<so|dll|dylib>.cpp or a .so tag).")
+    endif()
+    foreach(dep IN LISTS loaded)
+      _buildutil_apply_runtime_load(${loader} ${dep})
+    endforeach()
+  endforeach()
+endfunction()
+
+function(_buildutil_apply_runtime_load loader dep)
+  if(NOT TARGET ${dep})
+    message(FATAL_ERROR
+      "${loader}: Link_dependencies(RUNTIME) names ${dep}, which has no "
+      "target in this build: the loader would find nothing to load.")
+  endif()
+  get_target_property(dep_type ${dep} TYPE)
+  if(NOT dep_type STREQUAL "SHARED_LIBRARY")
+    message(FATAL_ERROR
+      "${loader}: Link_dependencies(RUNTIME) names ${dep}, which builds "
+      "as ${dep_type}. Only a shared library can be loaded at run time.")
+  endif()
+  if(WIN32)
+    message(WARNING
+      "${loader}: Link_dependencies(RUNTIME ${dep}): Windows has no rpath; "
+      "the DLL is found only when it sits beside the loading executable.")
+  endif()
+  get_target_property(loader_src ${loader} SOURCE_DIR)
+  get_target_property(dep_src ${dep} SOURCE_DIR)
+  _buildutil_mirror_parent_of("${loader_src}" loader_mirror)
+  _buildutil_mirror_parent_of("${dep_src}" dep_mirror)
+  file(RELATIVE_PATH hop "/buildutil-prefix/${loader_mirror}"
+                         "/buildutil-prefix/${dep_mirror}")
+  _buildutil_loader_relative(hop_rpath "${hop}")
+  set_property(TARGET ${loader} APPEND PROPERTY INSTALL_RPATH "${hop_rpath}")
+  get_target_property(loader_type ${loader} TYPE)
+  if(loader_type STREQUAL "SHARED_LIBRARY")
+    set_property(TARGET ${loader} APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:${dep}>")
+  endif()
+  foreach(runner IN ITEMS "${loader}" "${loader}-tests" "${loader}-benches")
+    if(TARGET ${runner})
+      get_target_property(runner_type ${runner} TYPE)
+      if(runner_type STREQUAL "EXECUTABLE")
+        add_dependencies(${runner} ${dep})
+        set_property(TARGET ${runner} APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:${dep}>")
+      endif()
+    endif()
+  endforeach()
+endfunction()
+
 # What an INSTALLED binary must find: its shared siblings at the install
 # mirror, loader-relative, and the host libraries a SYSTEM Require found
 # -- never a conan library, whose cache path here would let an
@@ -673,6 +849,8 @@ endfunction()
 # properties (deferred args expand in the deferred scope — locals are
 # gone).
 function(_buildutil_apply_install_rpaths)
+  _buildutil_apply_runtime_loads()
+  _buildutil_list_export_objects()
   get_property(apps GLOBAL PROPERTY _buildutil_apps)
   get_property(host_imports GLOBAL PROPERTY _buildutil_host_imports)
   foreach(app IN LISTS apps)
@@ -716,6 +894,17 @@ function(_buildutil_apply_install_rpaths)
   endforeach()
 endfunction()
 
+function(_buildutil_clean_path_parts dir out_list)
+  file(RELATIVE_PATH relative "${CMAKE_SOURCE_DIR}/sources" "${dir}")
+  string(REPLACE "/" ";" parts "${relative}")
+  set(clean "")
+  foreach(part IN LISTS parts)
+    _buildutil_kind_of("${part}" part_name _ignored_kind)
+    list(APPEND clean "${part_name}")
+  endforeach()
+  set(${out_list} "${clean}" PARENT_SCOPE)
+endfunction()
+
 # The module name for ANY directory: its path under sources/, kind tags
 # stripped, joined with '-'. Two places need this -- the library pre-pass
 # walks the tree before modules configure, and each module asks about
@@ -724,14 +913,8 @@ endfunction()
 # itself `wd`, so the library fell back to the bare name and collided
 # with its own executable. One function, both callers.
 function(_buildutil_name_for_dir dir out)
-  file(RELATIVE_PATH relative "${CMAKE_SOURCE_DIR}/sources" "${dir}")
-  string(REPLACE "/" ";" parts "${relative}")
-  set(clean "")
-  foreach(part IN LISTS parts)
-    _buildutil_kind_of("${part}" part_name _ignored_kind)
-    list(APPEND clean "${part_name}")
-  endforeach()
-  string(REPLACE ";" "-" name "${clean}")
+  _buildutil_clean_path_parts("${dir}" clean)
+  list(JOIN clean "-" name)
   set(${out} "${name}" PARENT_SCOPE)
 endfunction()
 
@@ -915,6 +1098,12 @@ function(_buildutil_register_libraries root)
       continue()
     endif()
     _buildutil_dir_platform_live("${sub}" _live)
+    if(NOT _live AND EXISTS "${entry}/CMakeLists.txt")
+      _buildutil_name_for_dir("${entry}" name)
+      _buildutil_kind_of("${entry}" _rl_name _rl_kind)
+      set_property(GLOBAL PROPERTY _buildutil_module_elsewhere_${name} TRUE)
+      set_property(GLOBAL PROPERTY _buildutil_module_elsewhere_${_rl_name} TRUE)
+    endif()
     if(NOT _live)
       continue()
     endif()
@@ -928,6 +1117,9 @@ function(_buildutil_register_libraries root)
       _buildutil_kind_of("${entry}" _rl_name _rl_kind)
       if(entry_points OR _rl_kind STREQUAL "exe")
         set_property(GLOBAL PROPERTY _buildutil_lib_${name} "${name}-lib")
+      endif()
+      if(_rl_kind STREQUAL "test")
+        set_property(GLOBAL PROPERTY _buildutil_test_module_${name} TRUE)
       endif()
       # LEAF ALIASES. A module under a group carries the path-joined target
       # name (sources/oxbox/utilities -> oxbox-utilities), but a dependency
@@ -948,9 +1140,21 @@ function(_buildutil_register_libraries root)
         endif()
       endif()
     else()
+      _buildutil_refuse_test_group("${entry}")
       _buildutil_register_libraries("${entry}")
     endif()
   endforeach()
+endfunction()
+
+# `.test` names a module; a group carrying it would also read as test sources.
+function(_buildutil_refuse_test_group dir)
+  _buildutil_kind_of("${dir}" _tg_name _tg_kind)
+  if(_tg_kind STREQUAL "test")
+    message(FATAL_ERROR
+      "${dir} is tagged .test but holds no CMakeLists.txt, so it is a group, "
+      "and .test names a module. Give it a CMakeLists.txt calling "
+      "Init_submodule() to make it a test-lane module, or drop the tag.")
+  endif()
 endfunction()
 
 # The MODULE a dependency name refers to, or empty for a non-module
@@ -1198,6 +1402,7 @@ endfunction()
 function(_buildutil_split_source_list files out_sources out_tests out_benches)
   _buildutil_platform_suffixes(live_suffixes)
   _buildutil_target_system(target_system)
+  _buildutil_kind_of("${CMAKE_CURRENT_SOURCE_DIR}" _sl_name _sl_kind)
   set(sources "")
   set(tests "")
   set(benches "")
@@ -1208,6 +1413,10 @@ function(_buildutil_split_source_list files out_sources out_tests out_benches)
     # the project as a test, and with the platform tags below it would
     # drop them from the build outright.
     set(rel "${f}")
+    # a .test module's own directory names its kind, not its sources' lane
+    if(_sl_kind STREQUAL "test")
+      string(REPLACE "${CMAKE_CURRENT_SOURCE_DIR}/" "" rel "${rel}")
+    endif()
     string(REPLACE "${CMAKE_BINARY_DIR}/" "" rel "${rel}")
     string(REPLACE "${CMAKE_SOURCE_DIR}/" "" rel "${rel}")
     # A module's *.install/ trees are DATA that ship beside the binaries,
@@ -1624,6 +1833,8 @@ function(_buildutil_add_test_target target)
   set(test_target ${target}-tests)
   _buildutil_library_of("${target}" lib)
   add_executable(${test_target} ${_tests})
+  _buildutil_apply_optimization(${test_target})
+  _buildutil_track_suite(${test_target})
   get_target_property(module_type ${lib} TYPE)
   if(module_type STREQUAL "MODULE_LIBRARY")
     # standalone: nothing is linked, so there are no usage requirements to
@@ -1632,7 +1843,7 @@ function(_buildutil_add_test_target target)
     # not next to the headers it tests; see Init_submodule)
     target_include_directories(${test_target} PRIVATE
       "${CMAKE_SOURCE_DIR}/sources" "${CMAKE_CURRENT_SOURCE_DIR}")
-    _buildutil_apply_cxx_standard(${test_target} PRIVATE)
+    _buildutil_apply_compile_flags(${test_target} PRIVATE)
     target_link_libraries(${test_target} PRIVATE GTest::gtest_main)
   else()
     target_link_libraries(${test_target} PRIVATE ${lib} GTest::gtest_main)
@@ -1720,6 +1931,8 @@ function(_buildutil_add_test_target target)
   # directory, which is the contract above.
   _buildutil_ensure_ctest_guard()
   gtest_discover_tests(${test_target}
+    DISCOVERY_MODE PRE_TEST
+    DISCOVERY_TIMEOUT @DISCOVERY_TIMEOUT@
     TEST_LIST ${test_target}_discovered
     PROPERTIES
       LABELS ${target}
@@ -1800,15 +2013,8 @@ function(_buildutil_add_python_test_target target)
   if(NOT BUILD_TESTING)
     return()
   endif()
-  file(GLOB_RECURSE _loose CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.test.py")
+  _buildutil_python_suite_files(py_tests "${CMAKE_CURRENT_SOURCE_DIR}")
   _buildutil_python_suite_dirs(_dirs "${CMAKE_CURRENT_SOURCE_DIR}")
-  set(py_tests "")
-  foreach(_file IN LISTS _loose)
-    if(NOT _file MATCHES "/[^/]*\\.test/")   # already in a suite directory
-      list(APPEND py_tests "${_file}")
-    endif()
-  endforeach()
   list(APPEND py_tests ${_dirs})
   if(NOT py_tests)
     return()
@@ -1835,6 +2041,19 @@ function(_buildutil_pytest_file_option out)
   _buildutil_pytest_patterns(_patterns)
   string(JOIN " " _joined ${_patterns})
   set(${out} -o "python_files=${_joined}" PARENT_SCOPE)
+endfunction()
+
+# A module's loose `*.test.py` files, outside its `*.test/` suites.
+function(_buildutil_python_suite_files out root)
+  file(GLOB_RECURSE _found CONFIGURE_DEPENDS "${root}/*.test.py")
+  set(_files "")
+  foreach(_file IN LISTS _found)
+    file(RELATIVE_PATH _rel "${root}" "${_file}")
+    if(NOT _rel MATCHES "(^|/)[^/]*\\.test/")
+      list(APPEND _files "${_file}")
+    endif()
+  endforeach()
+  set(${out} "${_files}" PARENT_SCOPE)
 endfunction()
 
 # The `*.test/` directories under `root` that hold a python suite. A
@@ -1957,6 +2176,8 @@ function(_buildutil_python_suites suites timeouts)
     string(REPLACE "/" "-" _suite_target "${_suite}")
     _buildutil_register_python_suite(${_suite_target} "${_suite_dir}"
       "${_suite_dir}" ${_files_option})
+    set_tests_properties(${_suite_target}-pytest PROPERTIES
+      ENVIRONMENT "BUILDUTIL_BUILD_DIR=${CMAKE_BINARY_DIR};BUILDUTIL_PROFILE=${BUILDUTIL_PROFILE}")
     _buildutil_pair_value(_seconds "${timeouts}" "${_suite}")
     if(_seconds)
       set_tests_properties(${_suite_target}-pytest PROPERTIES
@@ -1981,13 +2202,15 @@ function(_buildutil_add_bench_target target)
   set(bench_target ${target}-benches)
   _buildutil_library_of("${target}" lib)
   add_executable(${bench_target} ${_benches})
+  _buildutil_apply_optimization(${bench_target})
+  _buildutil_track_suite(${bench_target})
   get_target_property(module_type ${lib} TYPE)
   if(module_type STREQUAL "MODULE_LIBRARY")
     # standalone, same as the test target above: no link, so no inherited
     # roots -- restate them, the module's own dir included
     target_include_directories(${bench_target} PRIVATE
       "${CMAKE_SOURCE_DIR}/sources" "${CMAKE_CURRENT_SOURCE_DIR}")
-    _buildutil_apply_cxx_standard(${bench_target} PRIVATE)
+    _buildutil_apply_compile_flags(${bench_target} PRIVATE)
     target_link_libraries(${bench_target} PRIVATE benchmark::benchmark_main)
   else()
     target_link_libraries(${bench_target}
@@ -2002,12 +2225,8 @@ function(_buildutil_add_bench_target target)
           COMPONENT benches EXCLUDE_FROM_ALL)
 endfunction()
 
-# Compile flags for our own targets:
-#  * /std:c++latest (MSVC) — conan's settings.yml caps msvc at
-#    cppstd=23 (so the profile sets /std:c++23), but we want our code
-#    in MSVC's preview-C++26 mode. It goes on AFTER CMake's own /std
-#    flag and "last /std wins" promotes us. (gcc/clang compile at
-#    whatever the conan profile picked: cppstd=26 -> -std=c++2c.)
+# Compile flags for our own targets (the standard is
+# _buildutil_set_cxx_standard's, below):
 #  * /bigobj (MSVC) — the generated dual-mode mnemonic tests exceed
 #    MSVC's COFF per-object section cap (fatal error C1128); /bigobj
 #    lifts that limit and is side-effect-free on smaller objects.
@@ -2060,6 +2279,168 @@ function(_buildutil_module_frameworks module names)
   set_property(GLOBAL PROPERTY _buildutil_frameworks_${module} "${names}")
 endfunction()
 
+# The soname: soversion(number, version=) from the module's configure.py,
+# else the package major, on every platform; cmake lays out the files.
+function(_buildutil_apply_soversion target)
+  _buildutil_module_name(_so_module)
+  get_property(_so_number GLOBAL PROPERTY _buildutil_module_soversion_${_so_module})
+  get_property(_so_version GLOBAL PROPERTY _buildutil_module_version_${_so_module})
+  if("${_so_number}" STREQUAL "")
+    get_property(_so_number GLOBAL PROPERTY _buildutil_package_major)
+  endif()
+  set_target_properties(${target} PROPERTIES SOVERSION "${_so_number}")
+  if(NOT "${_so_version}" STREQUAL "")
+    set_target_properties(${target} PROPERTIES VERSION "${_so_version}")
+  endif()
+endfunction()
+
+# What only a shared library module may carry: a soname from its hook.
+function(_buildutil_refuse_unshared_soversion target kind)
+  get_property(declared GLOBAL PROPERTY _buildutil_module_soversion_${target} SET)
+  if(declared AND NOT kind STREQUAL "so")
+    message(FATAL_ERROR
+      "${CMAKE_CURRENT_SOURCE_DIR}/configure.py declares soversion(), but "
+      "${target} does not build as a shared library: a soname belongs to a "
+      "module with a main.<so|dll|dylib>.cpp or a .so tag.")
+  endif()
+endfunction()
+
+# exports.map, the linker version script of a shared module, by presence:
+# beside main.<so|dll|dylib>.cpp or at the module root, or declared by the
+# module's hook in a generated root; one of them, on a shared module only.
+function(_buildutil_find_version_script target kind shared_entry out)
+  set(checked_in "")
+  set(beside "${CMAKE_CURRENT_SOURCE_DIR}")
+  foreach(entry IN LISTS shared_entry)
+    get_filename_component(entry_dir "${entry}" DIRECTORY)
+    list(APPEND beside "${entry_dir}")
+  endforeach()
+  list(REMOVE_DUPLICATES beside)
+  foreach(dir IN LISTS beside)
+    file(GLOB hit CONFIGURE_DEPENDS "${dir}/exports.map")
+    list(APPEND checked_in ${hit})
+  endforeach()
+  _buildutil_declared_version_scripts(${target} generated)
+  set(all ${checked_in} ${generated})
+  if(all AND NOT kind STREQUAL "so")
+    list(JOIN all "\n  " pretty)
+    message(FATAL_ERROR
+      "${CMAKE_CURRENT_SOURCE_DIR} is not a shared library module, yet "
+      "holds a linker version script:\n  ${pretty}\nexports.map belongs "
+      "to a module with a main.<so|dll|dylib>.cpp or a .so tag.")
+  endif()
+  list(LENGTH all count)
+  if(count GREATER 1)
+    list(JOIN all "\n  " pretty)
+    message(FATAL_ERROR
+      "${CMAKE_CURRENT_SOURCE_DIR} has more than one exports.map, checked "
+      "in or declared by its configure.py:\n  ${pretty}\nA shared library "
+      "links with one version script.")
+  endif()
+  set(${out} "${all}" PARENT_SCOPE)
+endfunction()
+
+function(_buildutil_declared_version_scripts target out)
+  get_property(declared GLOBAL PROPERTY _buildutil_module_declared_${target})
+  _buildutil_generated_roots("${target}" roots)
+  set(found "")
+  foreach(root IN LISTS roots)
+    if(EXISTS "${root}/exports.map")
+      file(REAL_PATH "${root}/exports.map" wanted)
+      foreach(path IN LISTS declared)
+        file(REAL_PATH "${path}" real)
+        if(real STREQUAL wanted)
+          list(APPEND found "${path}")
+        endif()
+      endforeach()
+    endif()
+  endforeach()
+  set(${out} "${found}" PARENT_SCOPE)
+endfunction()
+
+# ELF: the objects' _Public_ marks become the version script before the
+# link, a checked-in or declared exports.map instead when there is one,
+# and the archives stay out of the dynamic table.
+function(_buildutil_apply_exports lib target script)
+  if(NOT _buildutil_elf)
+    if(script)
+      message(WARNING
+        "${script}: a linker version script is applied on ELF targets only; "
+        "${lib} links for ${CMAKE_SYSTEM_NAME} without it and exports what "
+        "its symbol visibility says.")
+    endif()
+    return()
+  endif()
+  set(dir "${CMAKE_BINARY_DIR}/generated/_buildutil/exports/${target}")
+  get_target_property(node ${lib} OUTPUT_NAME)
+  string(TOUPPER "${node}" node)
+  string(REGEX REPLACE "[^0-9A-Z]" "_" node "${node}")
+  get_property(major GLOBAL PROPERTY _buildutil_package_major)
+  _buildutil_require_export_scan(python)
+  if(NOT EXISTS "${dir}/linker.rsp")
+    file(WRITE "${dir}/linker.rsp" "")
+  endif()
+  # clang spells LINKER: as -Xlinker, and its driver expands the @file that
+  # follows, so an empty file takes the next argument: -Wl, reaches ld whole.
+  target_link_options(${lib} PRIVATE "LINKER:--exclude-libs,ALL" "-Wl,@${dir}/linker.rsp")
+  if(script)
+    set_property(TARGET ${lib} APPEND PROPERTY LINK_DEPENDS "${script}")
+  endif()
+  add_custom_command(TARGET ${lib} PRE_LINK
+    COMMAND ${python} -m buildutil.exports link
+            --objects "${dir}/objects.txt" --major "${major}" --node "${node}"
+            --map "${script}" --map-out "${dir}/exports.map"
+            --rsp "${dir}/linker.rsp" --record "${dir}/marks.json"
+    VERBATIM)
+  add_custom_command(TARGET ${lib} POST_BUILD
+    COMMAND ${python} -m buildutil.exports verify
+            --library "$<TARGET_FILE:${lib}>" --record "${dir}/marks.json"
+    VERBATIM)
+  set_property(GLOBAL APPEND PROPERTY _buildutil_export_scans "${lib}")
+  set_property(TARGET ${lib} PROPERTY _buildutil_export_objects "${dir}/objects.txt")
+endfunction()
+
+# The scan runs at every ELF shared module's link, so a cmake that cannot
+# import it fails here rather than at the first link.
+function(_buildutil_require_export_scan out)
+  _buildutil_python_command(python)
+  get_property(probed GLOBAL PROPERTY _buildutil_export_scan_probed)
+  if(NOT probed)
+    execute_process(COMMAND ${python} -c "import buildutil.exports"
+                    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+                    RESULT_VARIABLE missing OUTPUT_QUIET ERROR_VARIABLE reason)
+    if(missing)
+      message(FATAL_ERROR
+        "buildutil: this cmake cannot run buildutil.exports, which every shared "
+        "module links through on ELF. Configure with -DBUILDUTIL_PYSUPPORT="
+        "<site-packages>/buildutil/pysupport (the driver passes it).\n${reason}")
+    endif()
+    set_property(GLOBAL PROPERTY _buildutil_export_scan_probed TRUE)
+  endif()
+  set(${out} "${python}" PARENT_SCOPE)
+endfunction()
+
+# What the scan reads: the library's own objects and those of the object
+# libraries it links directly, which the link takes whole; an archive's
+# marks stay hidden by --exclude-libs,ALL, so no archive is read.
+function(_buildutil_list_export_objects)
+  get_property(libs GLOBAL PROPERTY _buildutil_export_scans)
+  foreach(lib IN LISTS libs)
+    set(objects "$<TARGET_OBJECTS:${lib}>")
+    get_target_property(links ${lib} LINK_LIBRARIES)
+    foreach(dep IN LISTS links)
+      if(TARGET ${dep})
+        get_target_property(type ${dep} TYPE)
+        if(type STREQUAL "OBJECT_LIBRARY")
+          list(APPEND objects "$<TARGET_OBJECTS:${dep}>")
+        endif()
+      endif()
+    endforeach()
+    get_target_property(listing ${lib} _buildutil_export_objects)
+    file(GENERATE OUTPUT "${listing}" CONTENT "$<JOIN:${objects},\n>\n")
+  endforeach()
+endfunction()
+
 function(_buildutil_apply_objc_options target visibility)
   if(NOT APPLE)
     return()
@@ -2098,16 +2479,64 @@ set(_buildutil_cxx_langs "$<COMPILE_LANGUAGE:CXX,OBJCXX>")
 set(_buildutil_hidden_default "$<AND:$<NOT:$<CXX_COMPILER_ID:MSVC>>,\
 $<NOT:$<BOOL:$<TARGET_PROPERTY:_buildutil_publish_symbols>>>>")
 
-function(_buildutil_apply_cxx_standard target visibility)
+if(APPLE OR WIN32 OR EMSCRIPTEN)
+  set(_buildutil_elf FALSE)
+else()
+  set(_buildutil_elf TRUE)
+endif()
+
+# The export scan reads machine code, which an LTO object carries only when
+# fat; without -flto the flag changes nothing (gcc output byte-identical).
+set(_buildutil_fat_lto "$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<OR:$<CXX_COMPILER_ID:GNU>,\
+$<AND:$<CXX_COMPILER_ID:Clang>,$<VERSION_GREATER_EQUAL:$<CXX_COMPILER_VERSION>,17>>>>")
+
+set(_buildutil_optimize_always @OPTIMIZE_ALWAYS@)
+if(MSVC AND _buildutil_optimize_always)
+  # /RTC1 is incompatible with /O2; move the shared flag to a target condition
+  # so unlisted targets keep their runtime checks.
+  foreach(lang C CXX OBJC OBJCXX)
+    if(CMAKE_${lang}_FLAGS_DEBUG MATCHES "(^| )/RTC1( |$)")
+      string(REGEX REPLACE "(^| )/RTC1( |$)" " "
+        CMAKE_${lang}_FLAGS_DEBUG "${CMAKE_${lang}_FLAGS_DEBUG}")
+      add_compile_options(
+        "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:${lang}>,$<NOT:$<BOOL:$<TARGET_PROPERTY:_buildutil_optimized>>>>:/RTC1>")
+    endif()
+  endforeach()
+endif()
+
+function(_buildutil_apply_optimization target)
+  _buildutil_module_name(module)
+  if(NOT module IN_LIST _buildutil_optimize_always)
+    return()
+  endif()
+  set_property(TARGET ${target} PROPERTY _buildutil_optimized TRUE)
+  if(MSVC)
+    set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_CHECKS "")
+    target_compile_options(${target} PRIVATE "$<$<CONFIG:Debug>:/O2>")
+  else()
+    target_compile_options(${target} PRIVATE
+      "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:C,GNU,Clang,AppleClang>>:-O2>"
+      "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>>:-O2>"
+      "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:OBJC,Clang,AppleClang>>:-O2>"
+      "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANG_AND_ID:OBJCXX,Clang,AppleClang>>:-O2>")
+  endif()
+endfunction()
+
+function(_buildutil_apply_compile_flags target visibility)
+  _buildutil_apply_optimization(${target})
   set(cxx "${_buildutil_cxx_langs}")
   set(hides "${_buildutil_hidden_default}")
   target_compile_options(${target} ${visibility}
-    $<$<CXX_COMPILER_ID:MSVC>:/std:c++latest;/bigobj;/constexpr:steps100000000;/utf-8>
+    $<$<CXX_COMPILER_ID:MSVC>:/bigobj;/constexpr:steps100000000;/utf-8>
     "$<$<AND:${cxx},$<CXX_COMPILER_ID:Clang,AppleClang>>:-fconstexpr-steps=100000000>"
     "$<$<AND:${cxx},$<CXX_COMPILER_ID:GNU>>:-fconstexpr-ops-limit=100000000>"
+    "$<$<AND:${cxx},$<CXX_COMPILER_ID:GNU>>:-Werror=narrowing>"
     $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fdollars-in-identifiers>
     "$<${hides}:-fvisibility=hidden>"
     "$<$<AND:${cxx},${hides}>:-fvisibility-inlines-hidden>")
+  if(_buildutil_elf)
+    target_compile_options(${target} ${visibility} "$<${_buildutil_fat_lto}:-ffat-lto-objects>")
+  endif()
   _buildutil_apply_objc_options(${target} ${visibility})
   # `./buildutil --max-errors N` / `--fail-fast` (== N 1), via -D@CMAKE_OPTION_PREFIX@_MAX_ERRORS:
   # stop each compile after N errors for a tight fix-rebuild loop. 0 / undefined = off.
@@ -2118,6 +2547,139 @@ function(_buildutil_apply_cxx_standard target visibility)
       $<$<CXX_COMPILER_ID:Clang,AppleClang>:-ferror-limit=${@CMAKE_OPTION_PREFIX@_MAX_ERRORS}>)
   endif()
 endfunction()
+
+# The C++ standard of a module's own targets: Init_submodule(STANDARD n),
+# else [project] cxx_standard, else the lane's. Dependencies keep the
+# profile's compiler.cppstd; nothing here touches conan's settings.
+set(_buildutil_cxx_standards "@CXX_STANDARDS@")
+string(REPLACE ";" ", " _buildutil_cxx_accepted "${_buildutil_cxx_standards}")
+set(_buildutil_project_cxx_standard "@CXX_STANDARD@")
+# cl alone, the same test as $<CXX_COMPILER_ID:MSVC>: clang-cl has a C++26
+# flag in cmake and no conan cap to lift.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  set(_buildutil_cl TRUE)
+else()
+  set(_buildutil_cl FALSE)
+endif()
+
+# The highest standard this lane's compiler takes; cl's 26 is /std:c++latest past conan's cap of 23.
+function(_buildutil_cxx_standard_ceiling out)
+  set(ceiling "")
+  foreach(standard IN LISTS _buildutil_cxx_standards)
+    if("cxx_std_${standard}" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
+      set(ceiling ${standard})
+    endif()
+  endforeach()
+  if(_buildutil_cl AND ceiling EQUAL 23)
+    set(ceiling 26)
+  endif()
+  set(${out} "${ceiling}" PARENT_SCOPE)
+endfunction()
+
+function(_buildutil_check_module_standard module standard missing)
+  if("STANDARD" IN_LIST missing)
+    message(FATAL_ERROR "module '${module}': Init_submodule(STANDARD) needs a "
+      "value (accepted: ${_buildutil_cxx_accepted})")
+  endif()
+  if(NOT standard STREQUAL "" AND NOT standard IN_LIST _buildutil_cxx_standards)
+    message(FATAL_ERROR "module '${module}': Init_submodule(STANDARD ${standard}) "
+      "is not a standard buildutil builds (accepted: ${_buildutil_cxx_accepted})")
+  endif()
+endfunction()
+
+# `source` is the declaration the standard came from, as the error shows it.
+function(_buildutil_refuse_above_ceiling standard source)
+  _buildutil_cxx_standard_ceiling(ceiling)
+  if(ceiling STREQUAL "")
+    set(ceiling "none of ${_buildutil_cxx_accepted}")
+  elseif(standard GREATER ceiling)
+    set(ceiling "C++${ceiling}")
+  else()
+    return()
+  endif()
+  message(FATAL_ERROR
+    "${source} asks for C++${standard}, but this lane's compiler "
+    "(${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}) tops out at "
+    "${ceiling}. Lower the standard or build on a newer compiler; "
+    "buildutil never downgrades it.")
+endfunction()
+
+# The project-wide standard and its source: [project] cxx_standard, else the lane's; empty where neither names one.
+function(_buildutil_project_standard out_standard out_source)
+  if(NOT _buildutil_project_cxx_standard STREQUAL "")
+    set(standard "${_buildutil_project_cxx_standard}")
+    set(source "[project] cxx_standard = ${standard}")
+  elseif(_buildutil_cl)
+    set(standard 26)
+    set(source "the MSVC lane's /std:c++latest")
+  else()
+    set(standard "${CMAKE_CXX_STANDARD}")
+    set(source "the lane's compiler.cppstd=${standard}")
+  endif()
+  set(${out_standard} "${standard}" PARENT_SCOPE)
+  set(${out_source} "${source}" PARENT_SCOPE)
+endfunction()
+
+# MIGRATION SHIM, one release only (#175, removed in 0.97.0): a directory's own CMAKE_CXX_STANDARD, checked and warned once.
+function(_buildutil_directory_standard_shim standard)
+  if(standard STREQUAL BUILDUTIL_CXX_STANDARD)
+    return()
+  endif()
+  file(RELATIVE_PATH dir "${CMAKE_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
+  set(source "set(CMAKE_CXX_STANDARD ${standard}) in ${dir} (use [project] cxx_standard)")
+  _buildutil_refuse_above_ceiling("${standard}" "${source}")
+  get_property(warned GLOBAL PROPERTY _buildutil_directory_standard_warned)
+  if(NOT warned)
+    set_property(GLOBAL PROPERTY _buildutil_directory_standard_warned TRUE)
+    message(DEPRECATION "${source}: a directory's own C++ standard is read for "
+      "one more release; declare it in buildutil.toml instead.")
+  endif()
+endfunction()
+
+# A module's standard: its own STANDARD, checked here, else the project's, checked once at include.
+function(_buildutil_module_standard module standard missing out)
+  _buildutil_check_module_standard("${module}" "${standard}" "${missing}")
+  if(standard STREQUAL "")
+    _buildutil_project_standard(project_standard ignored_source)
+    _buildutil_directory_standard_shim("${project_standard}")
+    set(${out} "${project_standard}" PARENT_SCOPE)
+    return()
+  endif()
+  _buildutil_refuse_above_ceiling("${standard}"
+    "module '${module}': Init_submodule(STANDARD ${standard})")
+  set(${out} "${standard}" PARENT_SCOPE)
+endfunction()
+
+# cl: cmake maps 23 to /std:c++latest; the explicit flag keeps 26 should that mapping change.
+function(_buildutil_set_cxx_standard standard)
+  if(standard STREQUAL "")
+    return()
+  endif()
+  set(cmake_standard ${standard})
+  if(_buildutil_cl AND standard EQUAL 26)
+    set(cmake_standard 23)
+  endif()
+  set(targets ${ARGN})
+  list(REMOVE_DUPLICATES targets)
+  foreach(target IN LISTS targets)
+    if(NOT TARGET ${target})
+      continue()
+    endif()
+    set_target_properties(${target} PROPERTIES CXX_STANDARD ${cmake_standard}
+      CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    if(_buildutil_cl AND standard EQUAL 26)
+      target_compile_options(${target} PRIVATE /std:c++latest)
+    endif()
+  endforeach()
+endfunction()
+
+# Checked once, here; cached for `buildutil vscode` and the reflect generator.
+_buildutil_project_standard(_buildutil_standard _buildutil_standard_source)
+if(NOT _buildutil_standard STREQUAL "")
+  _buildutil_refuse_above_ceiling("${_buildutil_standard}" "${_buildutil_standard_source}")
+endif()
+set(BUILDUTIL_CXX_STANDARD "${_buildutil_standard}" CACHE INTERNAL
+    "the resolved C++ standard of the project's own targets")
 
 # Every module is a library first and foremost; the rest is
 # presence-driven. A main.cpp is the one TU kept out of the library --
@@ -2147,7 +2709,7 @@ endfunction()
 #     /<name> and shared _build/generated/<name>), swept by clean;
 #   * editing configure.py or any declared input re-runs codegen, since
 #     they join CMAKE_CONFIGURE_DEPENDS.
-function(_buildutil_exec_configure dir name out_incdirs out_sources)
+function(_buildutil_exec_configure scope dir name out_incdirs out_sources)
   set(${out_incdirs} "" PARENT_SCOPE)
   set(${out_sources} "" PARENT_SCOPE)
   set(script "${dir}/configure.py")
@@ -2204,23 +2766,137 @@ function(_buildutil_exec_configure dir name out_incdirs out_sources)
   endif()
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${script}")
   set(gen_sources "")
+  set(declared "")
+  set(flagged "")
   if(EXISTS "${manifest}")
     file(STRINGS "${manifest}" lines)
     foreach(line IN LISTS lines)
       string(SUBSTRING "${line}" 0 1 tag)
       string(SUBSTRING "${line}" 2 -1 path)
       if(tag STREQUAL "G")
+        list(APPEND declared "${path}")
+        _buildutil_checked_in("${path}" "${dir}" checked_in)
+        if(checked_in)
+          continue()
+        endif()
         set_source_files_properties("${path}" PROPERTIES GENERATED TRUE)
         if(path MATCHES "\\.(c|cc|cpp|cxx)$")
           list(APPEND gen_sources "${path}")
         endif()
       elseif(tag STREQUAL "D")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${path}")
+      elseif(tag STREQUAL "O" OR tag STREQUAL "M")
+        string(FIND "${path}" "\t" tab)
+        string(SUBSTRING "${path}" 0 ${tab} file)
+        math(EXPR after "${tab} + 1")
+        string(SUBSTRING "${path}" ${after} -1 flag)
+        file(REAL_PATH "${file}" real)
+        list(APPEND flagged "${real}")
+        list(APPEND flags_${tag}_${real} "${flag}")
+      elseif(tag STREQUAL "S")
+        set_property(GLOBAL PROPERTY _buildutil_${scope}_soversion_${name} "${path}")
+      elseif(tag STREQUAL "V")
+        set_property(GLOBAL PROPERTY _buildutil_${scope}_version_${name} "${path}")
       endif()
     endforeach()
   endif()
+  list(REMOVE_DUPLICATES flagged)
+  foreach(real IN LISTS flagged)
+    _buildutil_record_source_flags(${scope} "${dir}" "${name}" "${real}"
+                                   "${flags_O_${real}}" "${flags_M_${real}}")
+  endforeach()
+  set_property(GLOBAL PROPERTY _buildutil_${scope}_declared_${name} "${declared}")
   set(${out_incdirs} "${per_profile}" "${shared}" PARENT_SCOPE)
   set(${out_sources} "${gen_sources}" PARENT_SCOPE)
+endfunction()
+
+# Where `path` sits inside `dir`'s own module, '' when outside it or in a
+# nested module (a subdirectory with its own CMakeLists.txt).
+function(_buildutil_inside_module path dir out)
+  file(REAL_PATH "${dir}" real_dir)
+  file(REAL_PATH "${path}" real_path)
+  file(RELATIVE_PATH rel "${real_dir}" "${real_path}")
+  set(${out} "" PARENT_SCOPE)
+  if(rel MATCHES "^\\.\\./" OR IS_ABSOLUTE "${rel}")
+    return()
+  endif()
+  cmake_path(GET real_path PARENT_PATH parent)
+  while(NOT parent STREQUAL real_dir)
+    if(EXISTS "${parent}/CMakeLists.txt")
+      return()
+    endif()
+    cmake_path(GET parent PARENT_PATH parent)
+  endwhile()
+  set(${out} "${rel}" PARENT_SCOPE)
+endfunction()
+
+# A declared file of the hook's own module, outside its *.test/ subtrees,
+# is checked in: the glob compiles it already, and only its flags are news.
+function(_buildutil_checked_in path dir out)
+  _buildutil_inside_module("${path}" "${dir}" rel)
+  if(rel STREQUAL "" OR rel MATCHES "(^|/)[^/]*\\.test/")
+    set(${out} FALSE PARENT_SCOPE)
+  else()
+    set(${out} TRUE PARENT_SCOPE)
+  endif()
+endfunction()
+
+function(_buildutil_under_any path roots out)
+  set(${out} FALSE PARENT_SCOPE)
+  foreach(root IN LISTS roots)
+    if(NOT EXISTS "${root}")
+      continue()
+    endif()
+    file(REAL_PATH "${root}" real_root)
+    file(RELATIVE_PATH rel "${real_root}" "${path}")
+    if(NOT rel MATCHES "^\\.\\./" AND NOT IS_ABSOLUTE "${rel}")
+      set(${out} TRUE PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+endfunction()
+
+# A hook's declare(path, options=, defines=), recorded by real path so the
+# module that compiles the file finds it whichever spelling reached it. A
+# group hook flags its own generated files, a module hook its module's
+# sources and the generated files of its own and its groups' hooks; the
+# last declare() of one hook replaces, and a second hook is refused.
+function(_buildutil_record_source_flags scope dir name real options defines)
+  _buildutil_generated_roots("${name}" roots)
+  if(scope STREQUAL "module")
+    _buildutil_ancestor_group_incdirs(group_roots)
+    list(APPEND roots ${group_roots})
+    _buildutil_inside_module("${real}" "${dir}" own)
+  endif()
+  _buildutil_under_any("${real}" "${roots}" generated)
+  if(NOT generated AND "${own}" STREQUAL "")
+    message(FATAL_ERROR
+      "${dir}/configure.py declares compile flags for ${real}, which is "
+      "neither a source of its own ${scope} nor a file its hooks generate.")
+  endif()
+  get_property(owner GLOBAL PROPERTY _buildutil_source_owner_${real})
+  if(owner AND NOT owner STREQUAL "${dir}/configure.py")
+    message(FATAL_ERROR
+      "${real} has compile flags declared by two hooks:\n  ${owner}\n  "
+      "${dir}/configure.py\nOne hook owns a file's flags.")
+  endif()
+  set_property(GLOBAL PROPERTY _buildutil_source_owner_${real} "${dir}/configure.py")
+  set_property(GLOBAL PROPERTY _buildutil_source_O_${real} "${options}")
+  set_property(GLOBAL PROPERTY _buildutil_source_M_${real} "${defines}")
+endfunction()
+
+# COMPILE_OPTIONS and COMPILE_DEFINITIONS on the files a module compiles,
+# in the module's own directory scope, where its targets are.
+function(_buildutil_apply_source_flags)
+  foreach(file IN LISTS ARGN)
+    file(REAL_PATH "${file}" real)
+    get_property(options GLOBAL PROPERTY _buildutil_source_O_${real})
+    get_property(defines GLOBAL PROPERTY _buildutil_source_M_${real})
+    if(options OR defines)
+      set_source_files_properties("${file}" PROPERTIES
+        COMPILE_OPTIONS "${options}" COMPILE_DEFINITIONS "${defines}")
+    endif()
+  endforeach()
 endfunction()
 
 # A group-level configure.py: shared codegen for the whole subtree. Its
@@ -2232,7 +2908,13 @@ endfunction()
 function(_buildutil_run_group_configure dir)
   file(RELATIVE_PATH relative "${CMAKE_SOURCE_DIR}/sources" "${dir}")
   string(REPLACE "/" "_" name "${relative}")
-  _buildutil_exec_configure("${dir}" "${name}" incdirs sources)
+  _buildutil_exec_configure(group "${dir}" "${name}" incdirs sources)
+  get_property(soversion GLOBAL PROPERTY _buildutil_group_soversion_${name} SET)
+  if(soversion)
+    message(FATAL_ERROR
+      "${dir}/configure.py declares soversion(), but ${dir} is a group: "
+      "only a shared library module has a soname.")
+  endif()
   set_property(GLOBAL APPEND PROPERTY @CMAKE_OPTION_PREFIX@_GROUP_CONFIGURES "${dir}")
   set_property(GLOBAL PROPERTY @CMAKE_OPTION_PREFIX@_GROUP_INCDIRS_${name} "${incdirs}")
   set_property(GLOBAL PROPERTY @CMAKE_OPTION_PREFIX@_GROUP_SOURCES_${name} "${sources}")
@@ -2409,8 +3091,8 @@ function(_buildutil_emit_runtime_data names files)
   endforeach()
 endfunction()
 
-# Every object of every .obj module an executable depends on, however far
-# away, put on that executable's link line.
+# Every object of every OBJECT library an executable or a suite depends on,
+# however far away, put on its link line.
 #
 # cmake propagates an OBJECT library's objects to DIRECT consumers only.
 # Measured: exe -> static lib -> obj library loses them, because they are
@@ -2422,7 +3104,7 @@ endfunction()
 # Deferred to the end of the WHOLE tree, not this directory: a module may
 # depend on one the scan has not reached yet, and at that point the
 # target does not exist to be walked.
-# Runs ONCE, over every executable, at the end of the whole tree.
+# Runs ONCE, over every executable and suite, at the end of the whole tree.
 #
 # The app names travel in a global property rather than as deferred-call
 # arguments: cmake expands those in the DEFERRED scope, where a function
@@ -2433,12 +3115,13 @@ function(_buildutil_attach_all_object_deps)
   foreach(app IN LISTS apps)
     _buildutil_attach_object_deps("${app}")
   endforeach()
+  get_property(suites GLOBAL PROPERTY _buildutil_suites)
+  foreach(suite IN LISTS suites)
+    _buildutil_attach_object_deps("${suite}")
+  endforeach()
 endfunction()
 
-# Every cmake target reachable from `seed` through link edges -- the
-# declared dependence closure. Two consumers: the object sweep collects
-# OBJECT libraries from it, the test-tool sweep collects apps.
-
+# Every cmake target reachable from `seed` through link edges.
 function(_buildutil_link_closure seed out)
   set(queue "${seed}")
   set(seen "")
@@ -2488,9 +3171,42 @@ function(_buildutil_attach_object_deps app)
   endif()
 endfunction()
 
+function(_buildutil_schedule_object_sweep)
+  get_property(scheduled GLOBAL PROPERTY _buildutil_obj_sweep_scheduled)
+  if(NOT scheduled)
+    set_property(GLOBAL PROPERTY _buildutil_obj_sweep_scheduled TRUE)
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+      CALL _buildutil_attach_all_object_deps)
+  endif()
+endfunction()
+
+function(_buildutil_track_suite suite)
+  set_property(GLOBAL APPEND PROPERTY _buildutil_suites "${suite}")
+  _buildutil_schedule_object_sweep()
+endfunction()
+
+# A module's non-module links as two JSON lists: the host targets a SYSTEM
+# find imported, which package_info() maps onto their wrappers, and the rest.
+function(_buildutil_manifest_externals module external_out host_out)
+  get_property(externals GLOBAL PROPERTY _buildutil_cmp_external_${module})
+  get_property(host_imports GLOBAL PROPERTY _buildutil_host_imports)
+  set(external "")
+  set(host "")
+  foreach(item IN LISTS externals)
+    if(item IN_LIST host_imports)
+      list(APPEND host "\"${item}\"")
+    else()
+      list(APPEND external "\"${item}\"")
+    endif()
+  endforeach()
+  list(JOIN external ", " external)
+  list(JOIN host ", " host)
+  set(${external_out} "${external}" PARENT_SCOPE)
+  set(${host_out} "${host}" PARENT_SCOPE)
+endfunction()
+
 # Writes the component manifest the conan recipe reads. Deferred to the
 # end of the tree so every module and every Link_dependencies edge exists.
-# JSON by hand: cmake has no writer, and the shape is three flat fields.
 function(_buildutil_write_component_manifest)
   get_property(_wc_mods GLOBAL PROPERTY _buildutil_components)
   if(NOT _wc_mods)
@@ -2502,7 +3218,6 @@ function(_buildutil_write_component_manifest)
     get_property(_wc_path GLOBAL PROPERTY _buildutil_cmp_path_${_wc_m})
     get_property(_wc_lib GLOBAL PROPERTY _buildutil_cmp_lib_${_wc_m})
     get_property(_wc_needs GLOBAL PROPERTY _buildutil_cmp_needs_${_wc_m})
-    get_property(_wc_ext GLOBAL PROPERTY _buildutil_cmp_external_${_wc_m})
     set(_wc_need_json "")
     foreach(_wc_n IN LISTS _wc_needs)
       get_property(_wc_np GLOBAL PROPERTY _buildutil_cmp_path_${_wc_n})
@@ -2510,12 +3225,8 @@ function(_buildutil_write_component_manifest)
         list(APPEND _wc_need_json "\"${_wc_np}\"")
       endif()
     endforeach()
-    set(_wc_ext_json "")
-    foreach(_wc_e IN LISTS _wc_ext)
-      list(APPEND _wc_ext_json "\"${_wc_e}\"")
-    endforeach()
+    _buildutil_manifest_externals(${_wc_m} _wc_ext_json _wc_host_json)
     list(JOIN _wc_need_json ", " _wc_need_json)
-    list(JOIN _wc_ext_json ", " _wc_ext_json)
     if(NOT _wc_first)
       string(APPEND _wc_json ",")
     endif()
@@ -2523,7 +3234,8 @@ function(_buildutil_write_component_manifest)
     string(APPEND _wc_json
       "\n    {\"path\": \"${_wc_path}\", \"lib\": \"${_wc_lib}\""
       ", \"needs\": [${_wc_need_json}]"
-      ", \"external\": [${_wc_ext_json}]}")
+      ", \"external\": [${_wc_ext_json}]"
+      ", \"host\": [${_wc_host_json}]}")
   endforeach()
   string(APPEND _wc_json "\n  ]\n}\n")
   set(_wc_out "${CMAKE_BINARY_DIR}/buildutil-components.json")
@@ -2531,16 +3243,163 @@ function(_buildutil_write_component_manifest)
   install(FILES "${_wc_out}" DESTINATION "share/buildutil")
 endfunction()
 
+# Include roots, compile flags and extension hook of a module library.
+function(_buildutil_configure_module_library lib target gen_incdirs)
+  set_target_properties(${lib} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(${lib} PUBLIC "${CMAKE_SOURCE_DIR}/sources")
+  # The PARENT generated root is universal, exactly as sources/ is: a
+  # qualified #include "<module>/foo.gh" then resolves from anywhere
+  # with nothing declared. That covers the readers who CANNOT link the
+  # producer -- a tool consuming a sibling's generated tables, where
+  # linking would be a dependency cycle -- which previously needed a
+  # project-local override to reach at all.
+  _buildutil_add_generated_roots(${lib} PUBLIC
+    "${CMAKE_BINARY_DIR}/generated" "${CMAKE_SOURCE_DIR}/_build/generated"
+    ${gen_incdirs})
+  target_include_directories(${lib}
+    ${_buildutil_own_dir_scope} "${CMAKE_CURRENT_SOURCE_DIR}")
+  _buildutil_add_link_pools(${lib} ${_buildutil_own_dir_scope})
+  _buildutil_apply_compile_flags(${lib} PUBLIC)
+  # Extension hook: once per module, AFTER its include roots and flags are
+  # set, so an extension adds to a module that is otherwise finished.
+  if(COMMAND _buildutil_ext_module)
+    _buildutil_ext_module("${lib}" "${target}")
+  endif()
+endfunction()
+
+# A .test module: an OBJECT library where suites build, never shipped.
+function(_buildutil_init_test_module target lib gen_incdirs suites publish)
+  _buildutil_refuse_test_module_suites("${suites}" ${publish})
+  if(NOT BUILD_TESTING AND NOT BUILD_BENCHMARKING)
+    return()
+  endif()
+  add_library(${lib} OBJECT ${ARGN})
+  target_link_libraries(${lib} PUBLIC GTest::gtest)
+  _buildutil_configure_module_library(${lib} ${target} "${gen_incdirs}")
+  _buildutil_module_alias(alias)
+  if(alias)
+    add_library(${alias} ALIAS ${lib})
+  endif()
+  _buildutil_add_resources(${target})
+  _buildutil_add_embedded_resources(${target})
+endfunction()
+
+# A .test module has no suite of its own and ships nothing.
+function(_buildutil_refuse_test_module_suites files publish)
+  if(publish)
+    message(FATAL_ERROR
+      "${CMAKE_CURRENT_SOURCE_DIR} is a .test module and calls "
+      "Init_submodule(PUBLISH_SYMBOLS): it is linked into suites, never "
+      "loaded, so there is nothing to publish. Drop PUBLISH_SYMBOLS.")
+  endif()
+  _buildutil_python_suite_files(_ts_python "${CMAKE_CURRENT_SOURCE_DIR}")
+  _buildutil_python_suite_dirs(_ts_suites "${CMAKE_CURRENT_SOURCE_DIR}")
+  _buildutil_platform_data_dirs("${CMAKE_CURRENT_SOURCE_DIR}" "install"
+                                _ts_data _ts_levels)
+  set(_ts_found ${files} ${_ts_python} ${_ts_suites} ${_ts_data})
+  if(_ts_found)
+    string(REPLACE ";" "\n  " _ts_pretty "${_ts_found}")
+    message(FATAL_ERROR
+      "${CMAKE_CURRENT_SOURCE_DIR} is a .test module, which has no suite "
+      "and ships nothing, but holds:\n  ${_ts_pretty}\nMove test cases "
+      "into a suite that links it under TEST (or BENCH), and runtime data "
+      "and python bridges into the module that ships them.")
+  endif()
+endfunction()
+
+# A `*.test/` holding a CMakeLists.txt in a module: test sources or a module?
+function(_buildutil_refuse_inner_test_modules)
+  file(GLOB_RECURSE _it_lists "${CMAKE_CURRENT_SOURCE_DIR}/*/CMakeLists.txt")
+  foreach(_it_list IN LISTS _it_lists)
+    file(RELATIVE_PATH _it_rel "${CMAKE_CURRENT_SOURCE_DIR}" "${_it_list}")
+    get_filename_component(_it_dir "${_it_rel}" DIRECTORY)
+    string(REPLACE "/" ";" _it_parts "${_it_dir}")
+    foreach(_it_part IN LISTS _it_parts)
+      _buildutil_kind_of("${_it_part}" _it_name _it_kind)
+      if(_it_kind STREQUAL "test")
+        message(FATAL_ERROR
+          "${CMAKE_CURRENT_SOURCE_DIR}/${_it_dir} holds a CMakeLists.txt "
+          "inside the module ${CMAKE_CURRENT_SOURCE_DIR}, so it reads both "
+          "as that module's test sources and as a test-lane module. Move it "
+          "out of the module to make it a module, or delete its "
+          "CMakeLists.txt to keep it as test sources.")
+      endif()
+    endforeach()
+  endforeach()
+endfunction()
+
+# One conan component per module, for the recipe that cannot see the graph.
+function(_buildutil_register_component target)
+  _buildutil_clean_path_parts("${CMAKE_CURRENT_SOURCE_DIR}" _cmp_clean)
+  list(JOIN _cmp_clean "/" _cmp_rel)
+  _buildutil_module_app_name(_cmp_leaf)
+  set_property(GLOBAL APPEND PROPERTY _buildutil_components "${target}")
+  set_property(GLOBAL PROPERTY _buildutil_cmp_path_${target} "${_cmp_rel}")
+  set_property(GLOBAL PROPERTY _buildutil_cmp_lib_${target} "${_cmp_leaf}")
+  get_property(_cmp_scheduled GLOBAL PROPERTY _buildutil_cmp_scheduled)
+  if(NOT _cmp_scheduled)
+    set_property(GLOBAL PROPERTY _buildutil_cmp_scheduled TRUE)
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+      CALL _buildutil_write_component_manifest)
+  endif()
+endfunction()
+
+# Headers ship at their sources/-relative spelling; `_` keeps one private.
+function(_buildutil_install_module_headers)
+  file(GLOB_RECURSE _hdr_any CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.h" "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.hxx" "${CMAKE_CURRENT_SOURCE_DIR}/*.hh"
+    "${CMAKE_CURRENT_SOURCE_DIR}/*.inl" "${CMAKE_CURRENT_SOURCE_DIR}/*.ipp")
+  if(_hdr_any)
+    file(RELATIVE_PATH _hdr_rel
+      "${CMAKE_SOURCE_DIR}/sources" "${CMAKE_CURRENT_SOURCE_DIR}")
+    # A nested module installs its own headers under its OWN destination.
+    # Without this its subtree would also ship from here, putting the same
+    # file at two paths.
+    set(_hdr_excl "")
+    file(GLOB_RECURSE _hdr_nested CONFIGURE_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/*/CMakeLists.txt")
+    foreach(_hdr_n IN LISTS _hdr_nested)
+      get_filename_component(_hdr_n "${_hdr_n}" DIRECTORY)
+      file(RELATIVE_PATH _hdr_n "${CMAKE_CURRENT_SOURCE_DIR}" "${_hdr_n}")
+      list(APPEND _hdr_excl REGEX "(^|/)${_hdr_n}(/|$)" EXCLUDE)
+    endforeach()
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/"
+      DESTINATION "include/${_hdr_rel}"
+      FILES_MATCHING
+        PATTERN "*.h" PATTERN "*.hpp" PATTERN "*.hxx"
+        PATTERN "*.hh" PATTERN "*.inl" PATTERN "*.ipp"
+        PATTERN "_*" EXCLUDE
+        PATTERN "*.test" EXCLUDE
+        PATTERN "*.bench" EXCLUDE
+        PATTERN "*.install" EXCLUDE
+        PATTERN "*.embed" EXCLUDE
+        REGEX "(^|/)[^/]*\\.(install|embed)\\.(@PLATFORM_TAGS@)(/|$)" EXCLUDE
+        PATTERN ".*" EXCLUDE
+        ${_hdr_excl})
+  endif()
+endfunction()
+
 function(Init_submodule)
-  cmake_parse_arguments(MOD "PUBLISH_SYMBOLS" "" "" ${ARGN})
+  cmake_parse_arguments(MOD "PUBLISH_SYMBOLS" "STANDARD" "" ${ARGN})
   _buildutil_module_name(target)
+  _buildutil_module_standard("${target}" "${MOD_STANDARD}"
+    "${MOD_KEYWORDS_MISSING_VALUES}" cxx_standard)
+  _buildutil_refuse_inner_test_modules()
   _buildutil_split_sources(sources tests benches)
-  _buildutil_exec_configure("${CMAKE_CURRENT_SOURCE_DIR}" "${target}" gen_incdirs gen_sources)
+  _buildutil_exec_configure(module "${CMAKE_CURRENT_SOURCE_DIR}" "${target}" gen_incdirs gen_sources)
   _buildutil_ancestor_group_incdirs(group_incdirs)
   _buildutil_ancestor_group_sources(group_sources)
   list(APPEND gen_incdirs ${group_incdirs})
   list(APPEND gen_sources ${group_sources})
   _buildutil_split_source_list("${gen_sources}" gen_srcs gen_tests gen_benches)
+  foreach(globbed IN ITEMS sources tests benches)
+    if(${globbed})
+      list(REMOVE_ITEM gen_srcs ${${globbed}})
+      list(REMOVE_ITEM gen_tests ${${globbed}})
+      list(REMOVE_ITEM gen_benches ${${globbed}})
+    endif()
+  endforeach()
   set(entry ${sources})
   list(FILTER entry   INCLUDE REGEX "/main\\.cpp$")
   list(FILTER sources EXCLUDE REGEX "/main\\.cpp$")
@@ -2598,10 +3457,8 @@ function(Init_submodule)
   # configure error naming both, never a silent precedence -- the whole
   # value of reading the tree with `ls` is that the listing cannot lie.
   _buildutil_kind_of("${CMAKE_CURRENT_SOURCE_DIR}" _ignored_name kind)
-  file(GLOB_RECURSE shared_entry CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/main.so.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/main.dll.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/main.dylib.cpp")
+  set(shared_entry ${sources})
+  list(FILTER shared_entry INCLUDE REGEX "/main\\.(so|dll|dylib)\\.cpp$")
   if(entry AND shared_entry)
     message(FATAL_ERROR
       "${CMAKE_CURRENT_SOURCE_DIR} holds both main.cpp and a "
@@ -2673,10 +3530,22 @@ function(Init_submodule)
     endif()
     list(APPEND sources "${empty_tu}")
   endif()
+  _buildutil_apply_source_flags(${sources} ${entry} ${pybind_entry} ${tests}
+                                ${benches} ${gen_tests} ${gen_benches})
+  _buildutil_find_version_script(${target} "${kind}" "${shared_entry}"
+                                 version_script)
+  _buildutil_refuse_unshared_soversion(${target} "${kind}")
   # OBJECT: every object reaches whoever links this module, including the
   # ones nothing references -- for code that is resolved against at
   # runtime rather than at link time. SHARED: the module IS the loadable
   # artifact. STATIC otherwise, which is the default nothing has to say.
+  if(kind STREQUAL "test")
+    _buildutil_init_test_module(${target} ${lib} "${gen_incdirs}"
+      "${tests};${benches};${gen_tests};${gen_benches};${pybind_entry}"
+      ${MOD_PUBLISH_SYMBOLS} ${sources})
+    _buildutil_set_cxx_standard("${cxx_standard}" ${lib})
+    return()
+  endif()
   if(kind STREQUAL "obj")
     add_library(${lib} OBJECT ${sources})
   elseif(kind STREQUAL "so")
@@ -2686,8 +3555,10 @@ function(Init_submodule)
     # the filename would repeat the path the directory already states
     _buildutil_module_app_name(_so_name)
     set_target_properties(${lib} PROPERTIES OUTPUT_NAME "${_so_name}")
+    _buildutil_apply_soversion(${lib})
     _buildutil_mirror_parent(_mirror)
     install(TARGETS ${lib} LIBRARY DESTINATION "${_mirror}" RUNTIME DESTINATION "${_mirror}")
+    _buildutil_apply_exports(${lib} ${target} "${version_script}")
   elseif(BUILDUTIL_MODULE_LINKAGE STREQUAL "shared" AND kind STREQUAL "")
     # the module_linkage CONFIG option (buildutil config): UNTAGGED
     # modules — the ones that did not declare a kind — build shared.
@@ -2732,92 +3603,9 @@ function(Init_submodule)
     set_target_properties(${lib} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON
                           _buildutil_publish_symbols ON)
   endif()
-  set_target_properties(${lib} PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  target_include_directories(${lib} PUBLIC "${CMAKE_SOURCE_DIR}/sources")
-  # The PARENT generated root is universal, exactly as sources/ is: a
-  # qualified #include "<module>/foo.gh" then resolves from anywhere
-  # with nothing declared. That covers the readers who CANNOT link the
-  # producer -- a tool consuming a sibling's generated tables, where
-  # linking would be a dependency cycle -- which previously needed a
-  # project-local override to reach at all.
-  _buildutil_add_generated_roots(${lib} PUBLIC
-    "${CMAKE_BINARY_DIR}/generated" "${CMAKE_SOURCE_DIR}/_build/generated"
-    ${gen_incdirs})
-  target_include_directories(${lib}
-    ${_buildutil_own_dir_scope} "${CMAKE_CURRENT_SOURCE_DIR}")
-  _buildutil_add_link_pools(${lib} ${_buildutil_own_dir_scope})
-  _buildutil_apply_cxx_standard(${lib} PUBLIC)
-  # Extension hook: once per module, AFTER its include roots and standard are
-  # set, so an extension adds to a module that is otherwise finished.
-  if(COMMAND _buildutil_ext_module)
-    _buildutil_ext_module("${lib}" "${target}")
-  endif()
-  # Exported headers by layout: every header under a module ships, at the
-  # module's sources/-relative path -- sources/oxbox/serialization/x.hpp
-  # installs as include/oxbox/serialization/x.hpp. That destination IS
-  # the in-tree spelling: sources/ is already a universal include root
-  # (just above), so <oxbox/serialization/x.hpp> is the same string here
-  # and in a consumer of the installed package. A public header including
-  # a sibling therefore cannot compile in this project and break on
-  # install -- the failure the old *.public/ tag directory allowed, and
-  # which nesting the module name inside it only papered over.
-  #
-  # Private headers opt OUT with a leading underscore, on the file or on
-  # any directory component. Kind tags are deliberately NOT stripped
-  # here, unlike the binary mirror: the in-tree spelling resolves through
-  # sources/ using literal directory names, so stripping would reintroduce
-  # the very asymmetry this rule exists to remove.
-  # COMPONENT MANIFEST. A multi-module library package exposes one conan
-  # component per module, so a consumer links oxbox::utilities rather than
-  # dragging the whole package in through oxbox::oxbox (which conan keeps
-  # as the aggregate). The recipe cannot see this graph -- Link_dependencies
-  # is cmake -- so the build writes it down and package_info reads it.
-  # Paths stay sources/-relative and RAW; naming policy (dropping a leading
-  # component equal to the package name) is the recipe's, in one place.
-  file(RELATIVE_PATH _cmp_rel
-    "${CMAKE_SOURCE_DIR}/sources" "${CMAKE_CURRENT_SOURCE_DIR}")
-  _buildutil_module_app_name(_cmp_leaf)
-  set_property(GLOBAL APPEND PROPERTY _buildutil_components "${target}")
-  set_property(GLOBAL PROPERTY _buildutil_cmp_path_${target} "${_cmp_rel}")
-  set_property(GLOBAL PROPERTY _buildutil_cmp_lib_${target} "${_cmp_leaf}")
-  get_property(_cmp_scheduled GLOBAL PROPERTY _buildutil_cmp_scheduled)
-  if(NOT _cmp_scheduled)
-    set_property(GLOBAL PROPERTY _buildutil_cmp_scheduled TRUE)
-    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
-      CALL _buildutil_write_component_manifest)
-  endif()
-  file(GLOB_RECURSE _hdr_any CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.h" "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.hxx" "${CMAKE_CURRENT_SOURCE_DIR}/*.hh"
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.inl" "${CMAKE_CURRENT_SOURCE_DIR}/*.ipp")
-  if(_hdr_any)
-    file(RELATIVE_PATH _hdr_rel
-      "${CMAKE_SOURCE_DIR}/sources" "${CMAKE_CURRENT_SOURCE_DIR}")
-    # A nested module installs its own headers under its OWN destination.
-    # Without this its subtree would also ship from here, putting the same
-    # file at two paths.
-    set(_hdr_excl "")
-    file(GLOB_RECURSE _hdr_nested CONFIGURE_DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/*/CMakeLists.txt")
-    foreach(_hdr_n IN LISTS _hdr_nested)
-      get_filename_component(_hdr_n "${_hdr_n}" DIRECTORY)
-      file(RELATIVE_PATH _hdr_n "${CMAKE_CURRENT_SOURCE_DIR}" "${_hdr_n}")
-      list(APPEND _hdr_excl REGEX "(^|/)${_hdr_n}(/|$)" EXCLUDE)
-    endforeach()
-    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/"
-      DESTINATION "include/${_hdr_rel}"
-      FILES_MATCHING
-        PATTERN "*.h" PATTERN "*.hpp" PATTERN "*.hxx"
-        PATTERN "*.hh" PATTERN "*.inl" PATTERN "*.ipp"
-        PATTERN "_*" EXCLUDE
-        PATTERN "*.test" EXCLUDE
-        PATTERN "*.bench" EXCLUDE
-        PATTERN "*.install" EXCLUDE
-        PATTERN "*.embed" EXCLUDE
-        REGEX "(^|/)[^/]*\\.(install|embed)\\.(@PLATFORM_TAGS@)(/|$)" EXCLUDE
-        PATTERN ".*" EXCLUDE
-        ${_hdr_excl})
-  endif()
+  _buildutil_configure_module_library(${lib} ${target} "${gen_incdirs}")
+  _buildutil_register_component(${target})
+  _buildutil_install_module_headers()
   _buildutil_module_alias(alias)
   if(alias)
     add_library(${alias} ALIAS ${lib})
@@ -2878,12 +3666,7 @@ function(Init_submodule)
     if(entry_from_closure)
       set_property(GLOBAL APPEND PROPERTY _buildutil_closure_entry_apps "${target}")
     endif()
-    get_property(scheduled GLOBAL PROPERTY _buildutil_obj_sweep_scheduled)
-    if(NOT scheduled)
-      set_property(GLOBAL PROPERTY _buildutil_obj_sweep_scheduled TRUE)
-      cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
-        CALL _buildutil_attach_all_object_deps)
-    endif()
+    _buildutil_schedule_object_sweep()
     if(MOD_PUBLISH_SYMBOLS)
       set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON
                             _buildutil_publish_symbols ON)
@@ -2900,6 +3683,7 @@ function(Init_submodule)
     # same restatement the -tests / -benches targets make. The glob is
     # recursive, so main.cpp need not sit at the module root either.
     target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    _buildutil_apply_optimization(${target})
     _buildutil_add_link_pools(${target} PRIVATE)
     # the mirrored spot: sources/a/b/c ships <prefix>/a/b/c -- the leaf
     # is the FILE, its parent path the directories
@@ -2937,6 +3721,8 @@ function(Init_submodule)
   if(TARGET ${target}-resources-embed AND TARGET ${target}-benches)
     add_dependencies(${target}-benches ${target}-resources-embed)
   endif()
+  _buildutil_set_cxx_standard("${cxx_standard}" ${lib} ${target}
+    ${target}-tests ${target}-benches ${target}-pybind)
   # A test executable that starts the thing under test needs the same
   # payload beside it -- and it does not live in <build>/bin, so the app's
   # copy is no help. Build tree only: nothing here ships.
@@ -3119,15 +3905,143 @@ function(_buildutil_project_options project declarations)
   if(failed)
     message(FATAL_ERROR "buildutil: could not render ${header}\n${reason}")
   endif()
-  # The preprocessed languages only: a resource script and an unpreprocessed
-  # .s have no use for the header and no flag spelling for it.
+  set_property(GLOBAL PROPERTY _buildutil_options_header "${header}")
+  _buildutil_force_include_flags("${header}" flags)
+  add_compile_options(${flags})
+endfunction()
+
+# The flag that force-includes one header, as one SHELL: group so cmake's
+# option de-duplication cannot drop the second of two `-include`s. The
+# preprocessed languages only: a resource script and an unpreprocessed .s
+# have no use for the header and no flag spelling for it.
+function(_buildutil_force_include_flags header out)
   set(preprocessed "$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>")
   set(cl "$<CXX_COMPILER_ID:MSVC>")
-  add_compile_options(
-    "$<$<AND:${preprocessed},$<NOT:${cl}>>:-include>"
-    "$<$<AND:${preprocessed},$<NOT:${cl}>>:${header}>"
-    "$<$<AND:${preprocessed},${cl}>:/FI>"
-    "$<$<AND:${preprocessed},${cl}>:${header}>")
+  set(${out}
+    "$<$<AND:${preprocessed},$<NOT:${cl}>>:SHELL:-include \"${header}\">"
+    "$<$<AND:${preprocessed},${cl}>:SHELL:/FI \"${header}\">" PARENT_SCOPE)
+endfunction()
+
+# _Public_(n) on a function definition exports it at ABI version n, at the
+# package's semver major when n is empty; the section it names carries n
+# to the export scan. Force-included into every C and C++ unit.
+function(_buildutil_public_macro)
+  cmake_path(GET _buildutil_cmake_dir PARENT_PATH bdudata)
+  set(package "")
+  if(EXISTS "${bdudata}/buildinfo.json")
+    file(READ "${bdudata}/buildinfo.json" stamped)
+    _buildutil_json_field("${stamped}" package "" package)
+  endif()
+  set(major 0)
+  if(package MATCHES "^([0-9]+)\\.[0-9]+\\.[0-9]+")
+    set(major "${CMAKE_MATCH_1}")
+  elseif(package STREQUAL "")
+    message(STATUS "no semver tag reachable: the package is 0.0.0 and _Public_() exports at major 0")
+  else()
+    message(STATUS "version '${package}' is not semver, major 0")
+  endif()
+  set_property(GLOBAL PROPERTY _buildutil_package_major "${major}")
+  set(header "${CMAKE_BINARY_DIR}/generated/_buildutil/public.h")
+  file(CONFIGURE OUTPUT "${header}" CONTENT [=[
+/* Generated by buildutil: _Public_(n) exports a function at ABI version n, empty n the package major. */
+#ifndef BUILDUTIL_PUBLIC_H
+#define BUILDUTIL_PUBLIC_H
+#if defined(__GNUC__)
+#pragma GCC system_header
+#endif
+#define BUILDUTIL_STR_(n) #n
+#define BUILDUTIL_STR(n) BUILDUTIL_STR_(n)
+#if defined(_MSC_VER)
+#define _Public_(n) __declspec(dllexport) __declspec(code_seg(".text$_Public_." BUILDUTIL_STR(n)))
+#elif defined(_WIN32) || defined(__CYGWIN__)
+#define _Public_(n) __declspec(dllexport) __attribute__((section(".text$_Public_." BUILDUTIL_STR(n))))
+#elif defined(__ELF__)
+#define _Public_(n) __attribute__((visibility("default"), section(".text._Public_." BUILDUTIL_STR(n))))
+#else
+#define _Public_(n) __attribute__((visibility("default")))
+#endif
+#endif
+]=] @ONLY)
+  _buildutil_force_include_flags("${header}" flags)
+  add_compile_options(${flags})
+endfunction()
+
+# ===========================================================================
+# BUILD IDENTITY -- what the build IS, where the options above are what it
+# was asked for. The driver stamps _bdudata/buildinfo.json before every
+# configure; this reads the six values into cmake variables a project's own
+# cmake can use (a configure_file of a web page, an installer, an about
+# box) and renders the same six as macros into a header.
+#
+# The header is NOT force-included and never joins a compile line: the time
+# moves on every build and a force include would rebuild every translation
+# unit with it. A project that wants the macros writes
+# `#include "<project>/buildinfo.hpp"` -- the generated root is already on
+# every module's include path, exactly as `<project>/options.hpp` would be.
+#
+# Called from ROOT scope, so PARENT_SCOPE here is the scope every module
+# added afterwards inherits.
+# ===========================================================================
+function(_buildutil_json_field text field fallback out)
+  string(JSON value ERROR_VARIABLE unreadable GET "${text}" "${field}")
+  if(unreadable)
+    set(value "${fallback}")
+  endif()
+  set(${out} "${value}" PARENT_SCOPE)
+endfunction()
+
+function(_buildutil_build_identity project)
+  cmake_path(GET _buildutil_cmake_dir PARENT_PATH bdudata)
+  set(stamp "${bdudata}/buildinfo.json")
+  set(version "unknown")
+  set(commit "unknown")
+  set(tag "")
+  set(time "")
+  set(dirty OFF)
+  set(number 0)
+  if(EXISTS "${stamp}")
+    # the stamp moves every build, so cmake re-runs and the header follows
+    set_property(DIRECTORY "${CMAKE_SOURCE_DIR}" APPEND
+                 PROPERTY CMAKE_CONFIGURE_DEPENDS "${stamp}")
+    file(READ "${stamp}" stamped)
+    _buildutil_json_field("${stamped}" version "${version}" version)
+    _buildutil_json_field("${stamped}" commit  "${commit}"  commit)
+    _buildutil_json_field("${stamped}" tag     "${tag}"     tag)
+    _buildutil_json_field("${stamped}" time    "${time}"    time)
+    _buildutil_json_field("${stamped}" dirty   "${dirty}"   dirty)
+    _buildutil_json_field("${stamped}" number  "${number}"  number)
+  else()
+    message(STATUS "buildutil: no ${stamp} -- build identity is unknown")
+  endif()
+  set(@CMAKE_OPTION_PREFIX@_BUILD_VERSION "${version}" PARENT_SCOPE)
+  set(@CMAKE_OPTION_PREFIX@_BUILD_COMMIT  "${commit}"  PARENT_SCOPE)
+  set(@CMAKE_OPTION_PREFIX@_BUILD_TAG     "${tag}"     PARENT_SCOPE)
+  set(@CMAKE_OPTION_PREFIX@_BUILD_TIME    "${time}"    PARENT_SCOPE)
+  set(@CMAKE_OPTION_PREFIX@_BUILD_DIRTY   "${dirty}"   PARENT_SCOPE)
+  set(@CMAKE_OPTION_PREFIX@_BUILD_NUMBER  "${number}"  PARENT_SCOPE)
+  set(header "${CMAKE_BINARY_DIR}/generated/${project}/buildinfo.hpp")
+  _buildutil_python_command(_bu_buildinfo_py)
+  # Every project pays this call, [options] or none, so a cmake that
+  # cannot reach the package at all (the deposit configured by hand, a
+  # lane image carrying only cmake and a toolchain) says so and carries
+  # on with the variables -- where a BAD VALUE, which only the generator
+  # can see, is still a refusal.
+  execute_process(COMMAND ${_bu_buildinfo_py} -c "import buildutil.buildinfo"
+                  RESULT_VARIABLE no_generator OUTPUT_QUIET ERROR_QUIET)
+  if(no_generator)
+    message(WARNING "buildutil: ${header} not rendered -- this cmake cannot "
+                    "run buildutil.buildinfo. The build identity is in the "
+                    "cmake variables either way.")
+    return()
+  endif()
+  execute_process(
+    COMMAND ${_bu_buildinfo_py} -m buildutil.buildinfo
+            --prefix "@CMAKE_OPTION_PREFIX@" --package-prefix "@MODULE_DEFINE_PREFIX@"
+            --input "${stamp}" --output "${header}"
+    RESULT_VARIABLE failed ERROR_VARIABLE reason)
+  if(failed)
+    message(FATAL_ERROR "buildutil: could not render ${header}\n${reason}")
+  endif()
 endfunction()
 
 # One [resources] declaration, rendered from buildutil.toml. GLOBS and
@@ -3813,7 +4727,7 @@ function(_buildutil_add_python_bridge target entry)
   # a *.pybind.cpp is a module TU kept out of the library too -- restate the
   # module's PRIVATE own-dir root, as -app and -tests do
   target_include_directories(${target}-pybind PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-  _buildutil_apply_cxx_standard(${target}-pybind PRIVATE)
+  _buildutil_apply_compile_flags(${target}-pybind PRIVATE)
   install(TARGETS ${target}-pybind LIBRARY DESTINATION lib/python)
 endfunction()
 
@@ -3825,17 +4739,89 @@ function(Init_python_module)
   # so a nested TU is not next to the module's headers either
   target_include_directories(${target} PRIVATE
     "${CMAKE_SOURCE_DIR}/sources" "${CMAKE_CURRENT_SOURCE_DIR}")
-  _buildutil_apply_cxx_standard(${target} PRIVATE)
+  _buildutil_apply_compile_flags(${target} PRIVATE)
   install(TARGETS ${target} LIBRARY DESTINATION lib/python)
   _buildutil_add_test_target(${target})
   _buildutil_add_python_test_target(${target})
   _buildutil_add_bench_target(${target})
+  _buildutil_project_standard(cxx_standard ignored_source)
+  _buildutil_directory_standard_shim("${cxx_standard}")
+  _buildutil_set_cxx_standard("${cxx_standard}" ${target}
+    ${target}-tests ${target}-benches)
 endfunction()
 
 function(Init_script)
   _buildutil_module_name(target)
   _buildutil_mirror_parent(_mirror)
   install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/${target}" DESTINATION "${_mirror}")
+endfunction()
+
+# A .test module is linked from TEST/BENCH groups; its own links are positional.
+function(_buildutil_check_test_lane_links target positional grouped)
+  get_property(_tl_self GLOBAL PROPERTY _buildutil_test_module_${target})
+  if(_tl_self)
+    if(grouped)
+      message(FATAL_ERROR
+        "${target} is a .test module and has no suite, so its "
+        "Link_dependencies TEST/BENCH groups link nothing. Name them "
+        "positionally: a .test module is test lane already.")
+    endif()
+    return()
+  endif()
+  foreach(_tl_dep IN LISTS positional)
+    _buildutil_module_of_spelling("${_tl_dep}" _tl_module)
+    if(NOT _tl_module)
+      continue()
+    endif()
+    get_property(_tl_test GLOBAL PROPERTY _buildutil_test_module_${_tl_module})
+    if(_tl_test)
+      message(FATAL_ERROR
+        "${target} links the .test module ${_tl_module} as a runtime "
+        "dependency. A test-lane module is built only with the suites and "
+        "never ships, so only a suite may link it: "
+        "Link_dependencies(TEST ${_tl_dep}) in ${target}.")
+    endif()
+  endforeach()
+endfunction()
+
+# The module a leaf, full name or `::` alias names; empty for anything else.
+function(_buildutil_module_of_spelling spelling out)
+  string(REPLACE "::" ";" _ms_parts "${spelling}")
+  set(_ms_clean "")
+  foreach(_ms_part IN LISTS _ms_parts)
+    _buildutil_kind_of("${_ms_part}" _ms_name _ms_kind)
+    list(APPEND _ms_clean "${_ms_name}")
+  endforeach()
+  list(JOIN _ms_clean "-" _ms_joined)
+  _buildutil_module_of("${_ms_joined}" _ms_module)
+  set(${out} "${_ms_module}" PARENT_SCOPE)
+endfunction()
+
+# RUNTIME: modules this one loads at run time (dlopen) instead of linking.
+# Resolved at the end of the tree, when every sibling target exists.
+function(_buildutil_record_runtime_loads target dormant)
+  foreach(dep IN LISTS ARGN)
+    _buildutil_module_of_spelling("${dep}" dep_module)
+    get_property(elsewhere GLOBAL PROPERTY _buildutil_module_elsewhere_${dep})
+    if(NOT dep_module AND elsewhere)
+      message(FATAL_ERROR
+        "${target}: Link_dependencies(RUNTIME) names ${dep}, which does not "
+        "build for ${CMAKE_SYSTEM_NAME}: the loader would start and find "
+        "nothing to load.")
+    endif()
+    if(NOT dep_module)
+      message(FATAL_ERROR
+        "${target}: Link_dependencies(RUNTIME ${dep}) names no module of "
+        "this project. RUNTIME is for a sibling module loaded at run time; "
+        "a package is linked positionally.")
+    endif()
+    if(dep_module IN_LIST dormant)
+      continue()
+    endif()
+    _buildutil_library_of("${dep_module}" dep_lib)
+    set_property(GLOBAL APPEND PROPERTY _buildutil_runtime_loaders "${target}")
+    set_property(GLOBAL APPEND PROPERTY _buildutil_loads_${target} "${dep_lib}")
+  endforeach()
 endfunction()
 
 # Positional args link into the module library itself (PUBLIC for a
@@ -3845,9 +4831,19 @@ endfunction()
 # -benches executables, for deps those exercise (e.g. an integration test that
 # runs a sibling module) but that the library must not pull in.
 function(Link_dependencies)
-  cmake_parse_arguments(LINK "" "" "TEST;BENCH" ${ARGN})
+  cmake_parse_arguments(LINK "" "" "TEST;BENCH;RUNTIME" ${ARGN})
   _buildutil_module_name(target)
   _buildutil_library_of("${target}" lib)
+  set(_ld_grouped FALSE)
+  if(LINK_TEST OR LINK_BENCH)
+    set(_ld_grouped TRUE)
+  endif()
+  _buildutil_check_test_lane_links("${target}" "${LINK_UNPARSED_ARGUMENTS}"
+                                   ${_ld_grouped})
+  get_property(_ld_test_lane GLOBAL PROPERTY _buildutil_test_module_${target})
+  if(_ld_test_lane AND NOT BUILD_TESTING AND NOT BUILD_BENCHMARKING)
+    return()
+  endif()
   # a dormant module leaves no target, so drop it from any dependant's link
   # list -- the dependant guards its use behind @MODULE_DEFINE_PREFIX@_<NAME>_ENABLED
   _buildutil_dormant_modules(dormant)
@@ -3909,6 +4905,7 @@ function(Link_dependencies)
   if(LINK_BENCH AND TARGET ${target}-benches)
     target_link_libraries(${target}-benches PRIVATE ${LINK_BENCH})
   endif()
+  _buildutil_record_runtime_loads(${target} "${dormant}" ${LINK_RUNTIME})
 endfunction()
 
 # Patch-overlay: a source file under sources/ may carry a corrected copy generated at build
@@ -4338,6 +5335,13 @@ cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
 # a project without options pays nothing.
 # ---------------------------------------------------------------------------
 @PROJECT_OPTIONS@
+# ---------------------------------------------------------------------------
+# The build's identity (_bdudata/buildinfo.json), as cmake variables here and
+# as macros in a header no compile line carries. Nothing is declared for it:
+# every project gets it.
+# ---------------------------------------------------------------------------
+@BUILD_IDENTITY@
+_buildutil_public_macro()
 # ---------------------------------------------------------------------------
 # Declared runtime payload ([runtime]), macOS bundle ([bundle.macos]) and
 # python suites ([test] python), rendered from buildutil.toml. Each is empty

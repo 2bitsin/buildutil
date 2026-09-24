@@ -45,7 +45,7 @@ works. A value the declaration cannot accept exits 2.
 The profile line is where a build says what it was asked for:
 
 ```
-profile: x86_64-linux-gcc-release options: contracts=off
+profile: x86_64-linux-gcc-release (default) options: contracts=off
 ```
 
 listing only what differs from its default, and nothing when everything
@@ -95,6 +95,52 @@ template argument, a constant expression, as above — is better still:
 there a name nothing declared is a compile error, where under `#if` it
 would quietly be `0`. Nothing includes the header and no project's
 CMakeLists mentions any of this.
+
+## Build identity
+
+An option is what the build was *asked for*. The **identity** is what the
+build is, and no project declares it: every configure stamps
+`_bdudata/buildinfo.json` and the machinery reads it back.
+
+| value | where it comes from |
+|---|---|
+| `version` | `git describe --tags --always --dirty` — `v1.2.3` on a tagged commit, `v1.2.3-5-gabc1234` after it, the short hash where no tag is reachable, `-dirty` appended when tracked files are modified |
+| `commit` | `git rev-parse --short HEAD` |
+| `tag` | `git describe --tags --exact-match` — empty unless the tag sits on HEAD |
+| `time` | the moment of the stamp, UTC, to the minute: `2026-09-20T12:34Z` |
+| `dirty` | `git status --porcelain -uno` said something |
+| `number` | `_bdudata/buildnum`, counted up on every build and local to the checkout |
+
+Where git cannot answer — an unpacked source tarball, a conan cache
+build — the values stand in as `unknown`, `unknown`, empty, empty, off
+and `0`. Nothing fails and nothing is guessed.
+
+In cmake they are ordinary variables in the root scope, named
+`<cmake_option_prefix>_BUILD_<VALUE>`: `BOSSDEUX_BUILD_VERSION`,
+`_BUILD_COMMIT`, `_BUILD_TAG`, `_BUILD_TIME`, `_BUILD_DIRTY` (`ON`/`OFF`)
+and `_BUILD_NUMBER`. A project's own `cmake/` can `configure_file` an
+about page, a plist or an installer script from them.
+
+In C++ they are macros of the *same* names, written to
+`<build>/generated/<project>/buildinfo.hpp` — version, commit, tag and
+time as string literals, `dirty` as `0` or `1`, the number as an
+integer. The same header carries the package version the export mark
+reads ([layout.md](layout.md#exporting-symbols)):
+`<module_define_prefix>_PACKAGE_VERSION` and its `_MAJOR`, `_MINOR` and
+`_PATCH`:
+
+```cpp
+#include "demo/buildinfo.hpp"
+
+std::print("demo {} built {}\n", DEMO_BUILD_VERSION, DEMO_BUILD_TIME);
+```
+
+**That include is written by hand**, and this is the one generated header
+buildutil does not force-include. The time and the number move on every
+build, so a force include would recompile every translation unit of the
+project every time; instead the one file that prints a version includes
+it, and only that file rebuilds. Nothing is on the compile line for it,
+so a misspelled macro is a compile error rather than a quiet `0`.
 
 ## buildutil's own options
 

@@ -58,7 +58,8 @@ exactly that into the local `_install/` so the local mirror stays
 complete. A module with no sources of its own gets a real library target
 from a generated empty translation unit, but the archive built from it
 holds no object and is not installed: nothing can link it, and shipping
-it makes the recipe advertise a library that is not one.
+it makes the recipe advertise a library that is not one. A `.test` module
+never ships at all: no archive, no headers, no component.
 
 ## The version never lives in the package source
 
@@ -88,13 +89,19 @@ version and one build number, uploaded together. A package that exists
 Release-only cannot be resolved by a consumer whose profile is Debug —
 conan computes a different `package_id`, finds no binary and lands in
 the recipe's source-build refusal — so covering both is the default and
-publish time is roughly double a single-configuration build. `--release`
-or `--debug` narrows the run to that one configuration, and says at the
+publish time is roughly double a single-configuration build. An explicit
+[profile flag](commands.md#building) narrows the run to that configuration,
+including RelWithDebInfo, and says at the
 end which consumers it left without a binary. `--no-upload` stops after
 the package test as a local dry run. An unconfigured remote is a hard
 error for `publish`, unlike the dependency upload after an ordinary
 build, which is merely skipped with a note when there is nowhere to send
 it.
+
+Dependency uploads include only binaries built or found in the cache in
+this invocation's resolved Conan graphs. The project's own package name
+is excluded at every version and user/channel; unrelated cached packages
+are never uploaded. Publish combines the graphs of all built configurations.
 
 The dependency upload after a build happens by default, because the
 remote is the fleet's binary cache and a pipeline that quietly rebuilds
@@ -113,7 +120,93 @@ anything starting `>`, `<`, `~` or `^` — is refused with exit 2 unless
 `--allow-version-ranges`. A published binary is reproducible only if the
 graph it was built against is pinned; `SYSTEM`, `TOOL`, `TEST` and
 `BENCH` dependencies are exempt, since none of them ends up inside the
-package.
+package: a `SYSTEM` one is whatever the consumer's host has, checked
+against the floor on the consumer's machine.
+
+## Host packages in a published package
+
+A runtime `Require(NAME VERSION "<floor>" SYSTEM)` puts
+`<conan>/system@host` in the graph: a wrapper recipe buildutil renders
+from the NAME alone into `_bdudata/host/<conan>/`, so its text is the
+same for every project. The driver exports it at a conan install when
+the cache lacks that `<ref>#<rrev>` (`conan list`), and the project's
+recipe forces the wrapper pinned to that revision, computed from the
+rendered text the way conan hashes an export. A recipe in the cache has
+no rendering and requires the wrapper unpinned; its consumer's pin, or
+conan's latest revision, resolves it. The line's `COMPONENTS` and the
+project's other `SYSTEM` lines reach the wrapper as the `components`
+and `packages` options. Two recipes in one graph asking one wrapper for
+different `components`, or for different `packages` entries of the
+packages it finds, are refused, naming both recipes, both values and
+the Require line to widen: conan keeps one value per option and would
+drop the other silently.
+
+At a conan install the wrapper runs `find_package(NAME)` in a scratch
+cmake project outside any toolchain and describes each library target
+the package's own config imported (interface targets included) as a
+conan component: the library file by its full name at the host's
+absolute directory, the include directories, the defines and the link
+items. It publishes the map from each target to the component that
+declares it as the `buildutil_host_targets` property, which the
+project's recipe and other wrappers read. A target a nested
+`find_dependency` imported belongs to that package: the wrapper requires
+the dependency's own wrapper and points the component there, and without
+a `SYSTEM` line for the dependency it refuses and names the line to add.
+The C runtime's own libraries are no package: `Threads::Threads`,
+`-pthread`, `dl` (`CMAKE_DL_LIBS`), `m` and `rt` become system libs. A
+link item it cannot describe (a generator expression other than
+`$<LINK_ONLY:...>`, or a namespaced target the find did not import) is
+refused by name. A package whose find sets no `<NAME>_VERSION` is a
+probe failure.
+
+The probe is cached in `CONAN_HOME/buildutil-host/`, keyed on the
+wrapper's recipe text, the NAME, the components, the `os`, `arch` and
+`build_type` settings, and the environment variables `CMAKE_PREFIX_PATH`,
+`<NAME>_ROOT`, `<NAME upper>_ROOT`, `PATH` and `PKG_CONFIG_PATH`. A
+cached probe is redone when a file the find read (config and version
+files, a Find module's version header, each `.pc` file the find asked
+pkg-config for, the libraries) changed, or when the set of
+`<prefix>/{lib,lib64,lib/*,share}/cmake/<NAME>*` directories under the
+search prefixes (`<NAME>_ROOT`, `CMAKE_PREFIX_PATH`, the prefixes of
+`PATH`, `/usr/local`, `/usr`, `/`) changed.
+
+The wrapper's `package_type` is `unknown`, so conan never puts the
+host's library directories on `LD_LIBRARY_PATH` ahead of a package's own
+`RUNPATH`. The requirement is `force=True`, so it replaces every pin of
+that package in the package's subtree, and every dependant of it (oxbox
+pinning openssl, say) builds from source once per host version and
+profile; a dependant that is not baked is refused with the usual
+message. The wrapper's package id modes are `full_package_mode`: a
+dependant's package id carries the wrapper's package id (the host
+version and the components) and never its recipe revision, so an edit
+to the wrapper template, or a revision someone else published, re-ids
+nothing. The exported `sources/CMakeLists.txt` carries the line, so the
+published recipe re-derives the force and the refusals in every
+consumer's graph: a consumer builds and links the host's library without
+a `SYSTEM` line of its own, and a consumer whose own requirement pins
+the package, or that has a sibling pinning it, gets conan's version
+conflict, naming both; such a consumer adds its own `SYSTEM` line.
+Publish uploads the recipes of the runtime `SYSTEM` wrappers beside the
+package (recipe only: the binary is the consumer's own probe).
+
+A module of a multi-module package links a dependency by the cmake
+target name its config declares (`OpenSSL::SSL`, `Fake::A`), and
+`package_info()` turns each into the conan component that declares it:
+one map over every direct dependency, built from conan's
+`cmake_target_name` of the package and of each component (with the
+default `<conan>::<component>` spelling kept) and from a host wrapper's
+`buildutil_host_targets`. A namespaced link no direct dependency declares
+is refused by name; a plain name is a system library.
+
+The component manifest records the targets a `SYSTEM` find imported
+under `host`, and `package_info()` points each at the wrapper component
+that declares it, so a static component tells its consumer to link the
+host's library; a host target no wrapper declares is refused by name. A
+cross build forces no wrapper, so its components declare no host target:
+the target's package is the consumer's own `SYSTEM` line on that
+platform. A runtime `SYSTEM` wrapper no component links through
+`Link_dependencies` is unused, and conan refuses the package; link it
+through `Link_dependencies`, never by hand.
 
 ## The package test
 
@@ -123,7 +216,9 @@ smoke executable against `find_package(<name> REQUIRED CONFIG)` and runs
 it; an application's test walks the package folder for something
 executable and fails when there is nothing. An unqualified `buildutil
 test` runs it too, so the packaging path is exercised without anyone
-remembering to.
+remembering to. This smoke exports under `@buildutil/smoke` and removes
+that reference in a `finally` block, including when the package test fails.
+Publish exports the plain reference.
 
 ## `--bake-buildutil` and building in the cache
 

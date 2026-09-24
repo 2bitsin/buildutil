@@ -967,6 +967,55 @@ def _scheme(name):
   return SimpleNamespace(name=name)
 
 
+@pytest.mark.parametrize("required,major,library", [
+  (20, 18, "/wheel/clang/native/libclang.so"),
+  (21, 20, "/usr/lib/llvm-20/lib/libclang.so"),
+])
+def test_stl_version_rejection_stops_before_collecting_types(
+    monkeypatch, tmp_path, capsys, required, major, library):
+  version = lambda: f"clang version {major}.1.1"
+  ci = SimpleNamespace(
+    conf=SimpleNamespace(lib=SimpleNamespace(
+      clang_getClangVersion=version, _name=library)),
+    _CXString=SimpleNamespace(from_result=lambda value: value))
+  diagnostic = SimpleNamespace(spelling=(
+    "static assertion failed: error STL1000: Unexpected compiler version, "
+    f"expected Clang {required} or newer."),
+    location=SimpleNamespace(file=SimpleNamespace(name="/msvc/yvals_core.h")))
+  cascade = SimpleNamespace(spelling="'_Ty' does not refer to a value")
+  tu = SimpleNamespace(diagnostics=[cascade] * 30 + [diagnostic] * 2)
+  monkeypatch.setattr(reflect, "load_clang", lambda: (ci, "/resource"))
+  monkeypatch.setattr(reflect, "parse", lambda *args: tu)
+  monkeypatch.setattr(reflect, "sdk_path", lambda: None)
+  monkeypatch.setattr(reflect, "msvc_args", lambda: [])
+  monkeypatch.setattr(reflect, "collect", lambda *args: pytest.fail("collected"))
+  output = tmp_path / "thing.reflect.hpp"
+  result = reflect.main(["generate", "--header", str(_promised(tmp_path)),
+                         "--output", str(output)])
+  assert result == 1
+  assert capsys.readouterr().err == (
+    "buildutil reflect: the MSVC STL in /msvc/yvals_core.h requires Clang "
+    f"{required} or newer; the scan parses with libclang {major} from "
+    f"{library} (system libclang first, then the bundled wheel). "
+    f"Install clang-{required} or newer or point BUILDUTIL_LIBCLANG at one.\n")
+  assert not output.exists()
+
+
+@pytest.mark.parametrize("spelling", [
+  "'vendor/marker.hpp' file not found",
+  "error STL1000: unrelated rejection",
+  "expected Clang 20 or newer",
+  "too many errors emitted, stopping now",
+])
+def test_other_diagnostics_keep_the_existing_reporting(spelling):
+  diagnostic = SimpleNamespace(
+    spelling=spelling, severity=4,
+    location=SimpleNamespace(file=None, line=0, column=0))
+  tu = SimpleNamespace(diagnostics=[diagnostic])
+  assert reflect.stl_version_failure(None, tu) is None
+  assert reflect.diagnostics(tu) == [f"<none>:0:0: fatal error: {spelling}"]
+
+
 def test_a_tagged_type_with_no_scheme_is_a_shortfall(tmp_path):
   short = reflect.shortfall(_promised(tmp_path), [_scheme("A")], [])
   assert short is not None, "the silent drop is back"
@@ -1676,6 +1725,19 @@ def test_parse_args_carries_the_sysroot_only_when_there_is_one():
   assert "-isysroot" not in without
   # the default keeps every existing caller honest
   assert reflect.parse_args("c++20", ["/inc"], None) == without
+
+
+def test_parse_args_force_includes_follow_macros_in_order():
+  args = reflect.parse_args("c++23", ["/inc"], None,
+                            defines=["FEATURE=1"], undefines=["OFF"],
+                            force_includes=["/first header.hpp", "/second.hpp"])
+  assert args[args.index("-DFEATURE=1"):] == [
+    "-DFEATURE=1", "-UOFF", "-include", "/first header.hpp",
+    "-include", "/second.hpp", "-I/inc"]
+  without = reflect.parse_args("c++23", ["/inc"], None)
+  assert "-include" not in without
+  assert without == reflect.parse_args("c++23", ["/inc"], None,
+                                       force_includes=[])
 
 
 def test_parse_args_carries_the_modules_macro_state():

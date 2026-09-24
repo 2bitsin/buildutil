@@ -14,7 +14,7 @@ TOOLCHAIN_TEXT = "# conan toolchain\n"
 @pytest.fixture
 def configure(monkeypatch, tmp_path):
   """Run _cmake_configure in a tmp project and hand back cmake's argv."""
-  monkeypatch.setattr(engine, "_stamp_build_info", lambda: None)
+  monkeypatch.setattr(engine, "_stamp_build_info", lambda package="": None)
   monkeypatch.setattr(engine, "_regen_clangd", lambda build_dir: None)
   monkeypatch.setattr(engine, "_wine_msvc_live", lambda: False)
   monkeypatch.setattr(engine, "_osxcross_live", lambda: False)
@@ -98,3 +98,7 @@ def test_a_changed_toolchain_still_drops_the_cache(configure, tmp_path):
   (build_dir / ".buildutil-toolchain.stamp").write_text("# something else\n")
   assert _toolchain_arg(configure()) is not None
   assert not (build_dir / "CMakeCache.txt").exists()
+
+
+def test_the_profile_is_passed_to_cmake(configure):
+  assert f"-DBUILDUTIL_PROFILE={PROFILE}" in configure()

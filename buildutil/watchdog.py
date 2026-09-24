@@ -3,7 +3,7 @@ command is timed. Past 1min it warns, past 2min it errors, and at 3min
 it FAILS -- the whole child tree is torn down and the command exits
 nonzero. A slow command is a build-system bug to fix, not time to wait.
 
-Escape hatch (NOT the default): `--no-watchdog` disables the budget for
+Escape hatch (NOT the default): `--i-am-willingly-circumventing-build-and-test-time-safeguards` disables the budget for
 one invocation, `--watchdog-budget N` moves the fail line. Both are legal
 ANYWHERE on the command line (ruling 2026-08-02): __main__ lifts them in
 front of the subcommand for typer, and arms the same rules itself for the
@@ -74,7 +74,7 @@ def _fail() -> None:
 # TRIPS THE WARNING -- that is the reading, not a nuisance.
 #
 # Which is why a verb gets a budget rather than a caller reaching for
-# --no-watchdog: disabling it does not move the alarm, it removes the
+# --i-am-willingly-circumventing-build-and-test-time-safeguards: disabling it does not move the alarm, it removes the
 # instrument. But a budget an honest run FAILS is just as bad, because the
 # next thing anyone does is reach for the switch. Both numbers below are
 # measured, with headroom for a cold build:
@@ -96,7 +96,7 @@ _VERB_BUDGETS = {"bench": 1800.0, "coverage": 2400.0, "analyze": 900.0,
 def watchdog_budget_for(subcommand: str | None, requested: float, *,
                         explicit: bool, no_watchdog: bool, in_ci: bool) -> float | None:
   """The wall budget to arm the watchdog with, or None to leave it off. An
-  explicit --watchdog-budget always wins; --no-watchdog turns it off; in CI it
+  explicit --watchdog-budget always wins; --i-am-willingly-circumventing-build-and-test-time-safeguards turns it off; in CI it
   is off by default (the GitLab job timeout is the bound); otherwise the
   per-verb budget, else the generic default."""
   if no_watchdog:
@@ -113,7 +113,7 @@ def parse_switches(flags: list[str]) -> tuple[bool, float, bool]:
   the pre-project verbs' equivalent of the root callback's typer options."""
   no_watchdog, budget, explicit = False, 180.0, False
   for i, flag in enumerate(flags):
-    if flag == "--no-watchdog":
+    if flag == "--i-am-willingly-circumventing-build-and-test-time-safeguards":
       no_watchdog = True
     elif flag == "--watchdog-budget" and i + 1 < len(flags):
       budget, explicit = float(flags[i + 1]), True

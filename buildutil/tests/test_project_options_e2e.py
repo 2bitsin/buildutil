@@ -89,11 +89,12 @@ def test_the_msvc_lane_gets_the_spelling_cl_understands(tmp_path):
   """/FI is the same block's other arm; a Linux box cannot run it, so
   the rendered machinery is what says so."""
   machinery = (deposit.ensure(tmp_path, CFG) / "buildutil.cmake").read_text()
-  assert '"$<$<AND:${preprocessed},${cl}>:/FI>"' in machinery
+  assert '"$<$<AND:${preprocessed},${cl}>:SHELL:/FI \\"${header}\\">"' in machinery
 
 
 def _plain(root: Path) -> Path:
-  """The same tree with nothing declared: no header, no force include."""
+  """The same tree with nothing declared: no options.hpp, and the one
+  force include is the export mark's header every project has."""
   tree = _tree(root)
   deposit.ensure(tree, {**CFG, "options": {}})
   module = tree / "sources" / "hello"
@@ -104,9 +105,11 @@ def _plain(root: Path) -> Path:
 
 def test_a_project_without_options_is_handed_nothing(tmp_path):
   build_dir = _configure(_plain(tmp_path))
+  public = build_dir / "generated" / "_buildutil" / "public.h"
   for command in _compile_lines(build_dir).values():
-    assert "-include" not in command, command
-  assert not (build_dir / "generated" / "demo").exists()
+    assert command.count("-include") == 1, command
+    assert f"-include {public}" in command, command
+  assert not (build_dir / "generated" / "demo" / "options.hpp").exists()
 
 
 # ----------------------------------------------- the scaffolded project --
@@ -179,3 +182,32 @@ def test_the_other_value_reconfigures_the_same_build_tree(tmp_path,
   assert "#define DEMO_CONTRACTS 1" in header.read_text()
   assert _run(root, "-DDEMO_OPTION_CONTRACTS=OFF") == "contracts 0 check 0"
   assert "#define DEMO_CONTRACTS 0" in header.read_text()
+
+
+@pytest.mark.parametrize("msvc", [False, True])
+def test_optimized_module_keeps_symbols_without_affecting_neighbors(
+    tmp_path, monkeypatch, msvc):
+  from buildutil import config
+  root = _tree(tmp_path)
+  other = root / "sources" / "other"
+  other.mkdir()
+  (other / "CMakeLists.txt").write_text("Init_submodule()\n")
+  (other / "other.cpp").write_text("int other() { return 0; }\n")
+  (root / "buildutil.toml").write_text('[optimize]\nalways = ["hello"]\n')
+  monkeypatch.setattr(config, "REPO_ROOT", root)
+  monkeypatch.setattr(config, "HAVE_PROJECT", True)
+  deposit.ensure(root, {**CFG, "optimize_always":
+                        config._load_project()["optimize_always"]})
+  if msvc:
+    # Exercise MSVC flag routing with the host compiler; configure never compiles
+    # these targets, so no Windows toolchain is needed to inspect the result.
+    (root / "CMakeLists.txt").write_text(ROOT.replace(
+      "include(buildutil)", 'set(MSVC TRUE)\n'
+      'set(CMAKE_CXX_FLAGS_DEBUG "-g /RTC1")\ninclude(buildutil)'))
+  lines = _compile_lines(_configure(root, "-DCMAKE_BUILD_TYPE=Debug"))
+  optimized = "/O2" if msvc else "-O2"
+  for name, command in lines.items():
+    assert "-g" in command.split(), command
+    assert (optimized in command.split()) == (name != "other.cpp"), command
+    if msvc:
+      assert ("/RTC1" in command.split()) == (name == "other.cpp"), command

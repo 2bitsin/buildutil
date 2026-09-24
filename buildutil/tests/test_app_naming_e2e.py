@@ -18,11 +18,14 @@ Skipped where there is no cmake or no C++ compiler, like the rest of the
 e2e tests.
 """
 import shutil
+from pathlib import Path
 import subprocess
 
 import pytest
 
 from buildutil import deposit
+
+PYSUPPORT = Path(deposit.__file__).resolve().parent / "pysupport"
 
 CFG = {"cmake_option_prefix": "ACME", "module_define_prefix": "ACM"}
 
@@ -68,7 +71,8 @@ def _configure(root) -> subprocess.CompletedProcess:
   duplicate output path silently, so a test left on the default would
   pass just as happily against the broken machinery."""
   return subprocess.run(
-    ["cmake", "-S", str(root), "-B", str(root / "b"), "-G", "Ninja"],
+    ["cmake", "-S", str(root), "-B", str(root / "b"), "-G", "Ninja",
+     f"-DBUILDUTIL_PYSUPPORT={PYSUPPORT}"],
     capture_output=True, text=True)
 
 

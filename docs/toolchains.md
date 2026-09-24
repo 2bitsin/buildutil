@@ -41,12 +41,49 @@ Packaging pairs profiles the same way the build did, by construction.
 
 A newer compiler builds correctly; buildutil simply does not advertise a
 version conan would reject, so the version in a profile is capped at gcc
-15, clang 20, apple-clang 16 and msvc 196. The standard follows from the
-lane: MSVC gets 23, because conan caps it there; gcc and clang below
-major 14 get 23 and everything else gets 26. On MSVC the machinery
-additionally applies `/std:c++latest`, `/bigobj`, a raised constexpr
-budget and `/utf-8` **after** cmake's own `/std` flag, so last-wins
-promotes past the profile's `/std:c++23`.
+15, clang 20, apple-clang 16 and msvc 196. The profile's `compiler.cppstd`
+follows conan's own table on every lane, the cross lanes and emscripten
+included: MSVC gets 23, because conan caps it there; gcc below major 14,
+clang below 17 and apple-clang below 16 get 23; the rest get 26, and a
+compiler outside that table is refused.
+That setting is what the dependencies build at, and nothing below changes
+it.
+
+The project's own targets build at the first of:
+
+1. the module's `Init_submodule(STANDARD n)`;
+2. `[project] cxx_standard = n` in `buildutil.toml`;
+3. the lane's standard: the profile's `compiler.cppstd`, except cl,
+   which is 26.
+
+`n` is 20, 23 or 26. `STANDARD` reaches the module's library, its
+executable, its tests, its benches and its `*.pybind.cpp` bridge; an
+`Init_python_module()` module and its tests and benches take no
+`STANDARD` and follow the project's; targets an extension creates itself
+(watcom's ROM images) are not touched. Each gets `CXX_STANDARD n` with
+`CXX_STANDARD_REQUIRED ON` and `CXX_EXTENSIONS OFF`.
+
+For 0.96 only, a directory's own `set(CMAKE_CXX_STANDARD n)` that differs
+from the root's still reaches the modules below it, checked against the
+ceiling and reported once as deprecated; 0.97.0 removes it (#175).
+
+MSVC (cl; clang-cl is a clang here) has no cmake flag past 23, and cmake
+compiles cl's 23 as `/std:c++latest` already, so on cl 23 and 26 are the
+same mode today. At 26 buildutil still adds `/std:c++latest` itself, so
+26 stays 26 if cmake ever maps 23 to `/std:c++23preview`. On cl the
+machinery also applies `/bigobj`, a raised constexpr budget and `/utf-8`.
+
+A standard the lane's compiler cannot take is a configure error naming
+where it was declared (`Init_submodule(STANDARD n)` in a module,
+`[project] cxx_standard = n`, or the lane's `compiler.cppstd=n`), the
+standard and the lane's ceiling: the highest `cxx_std_<n>` in cmake's
+`CMAKE_CXX_COMPILE_FEATURES`, 26 on cl. It is never silently lowered. The
+project value is checked once, when the machinery is included; a module's
+own value, in that module. `buildutil vscode` writes the resolved project
+standard as `cppStandard`, and the reflect generator is handed it on its
+command line, so a changed standard reruns every parse; run by hand
+without `--std`, it reads the build tree inside the repo that holds its
+output, else c++23.
 
 ## Linux, native
 

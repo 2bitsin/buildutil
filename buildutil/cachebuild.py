@@ -77,24 +77,28 @@ def main(argv: list[str]) -> None:
                   default="static",
                   help="linkage for untagged modules; the recipe maps "
                        "its conan `shared` option here")
+  ap.add_argument("--package-version", default="",
+                  help="the version conan builds this package as, which "
+                       "_Public_() exports at the major of")
   a = ap.parse_args(argv)
   # before the chdir, and absolute: cmake resolves a relative toolchain
   # against the BUILD tree before the source tree
   toolchain = Path(a.toolchain).resolve()
 
-  from . import config, deposit, modules
+  from . import buildinfo, config, deposit, modules
   root = config.require_project()
   os.chdir(root)
   _require_declared_deps()
 
   deposit_dir = deposit.ensure(root, config.PROJECT,
                                config.PROJECT["cmake_extensions"])
-  # A project's version codegen may declare buildinfo.json as an input;
-  # a cache build has no build counter, and saying so beats a
-  # missing-file failure at configure.
+  # The build identity the rendered cmake reads, and an input a project's
+  # version codegen may declare; a cache build has no build counter and no
+  # git tree, and saying so beats a missing-file failure at configure.
   config.BDUDATA_DIR.mkdir(exist_ok=True)
   (config.BDUDATA_DIR / "buildinfo.json").write_text(json.dumps(
-    {"number": 0, "commit": "conan-cache", "dirty": False}) + "\n")
+    dict(buildinfo.NEUTRAL, commit="conan-cache", version="conan-cache",
+         package=a.package_version)) + "\n")
 
   # The BUILDUTIL=<version> contract the driver gives every child — the
   # rendered guard refuses configure/build without it. The vendored

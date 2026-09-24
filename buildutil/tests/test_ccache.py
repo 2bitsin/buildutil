@@ -65,7 +65,7 @@ def test_configure_splices_launcher_into_cmake_argv(monkeypatch, tmp_path):
   # the helper's flags to cmake — the helper being correct is not enough.
   monkeypatch.setattr(engine.shutil, "which",
                       lambda name: "/usr/bin/ccache" if name == "ccache" else None)
-  monkeypatch.setattr(engine, "_stamp_build_info", lambda: None)
+  monkeypatch.setattr(engine, "_stamp_build_info", lambda package="": None)
   monkeypatch.setattr(engine, "_regen_clangd", lambda build_dir: None)
   import buildutil.vscode
   monkeypatch.setattr(buildutil.vscode, "refresh", lambda active=None: None)

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from buildutil import deposit
+from buildutil import deposit, packaging
 
 CFG = {"cmake_option_prefix": "ACME", "module_define_prefix": "ACM"}
 
@@ -137,13 +137,24 @@ for n in ("CMakeDeps", "CMakeToolchain", "cmake_layout"):
 errors = types.ModuleType("conan.errors")
 class ConanInvalidConfiguration(Exception): pass
 errors.ConanInvalidConfiguration = ConanInvalidConfiguration
+errors.ConanException = Exception
+build = types.ModuleType("conan.tools.build")
+build.cross_building = lambda conanfile: False
+scm = types.ModuleType("conan.tools.scm")
+scm.Version = object
 sys.modules.update({"conan": conan, "conan.tools": types.ModuleType("conan.tools"),
-                    "conan.tools.cmake": tools, "conan.errors": errors})
+                    "conan.tools.cmake": tools, "conan.errors": errors,
+                    "conan.tools.build": build, "conan.tools.scm": scm})
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
 ns = {"__file__": sys.argv[1]}   # the template reads [package] beside itself
 exec(open(sys.argv[1]).read(), ns)
 recipe = ns[next(k for k, v in ns.items()
                  if isinstance(v, type) and issubclass(v, ConanFile)
                  and v is not ConanFile)]()
+recipe.recipe_folder = os.path.dirname(sys.argv[1])
+recipe.settings = types.SimpleNamespace(os="Linux")
+recipe.ref = "t/0.0.0"
+recipe.dependencies = types.SimpleNamespace(host={}, direct_host={})
 os.environ.pop("BUILDUTIL", None)
 try:
   recipe.validate()
@@ -155,6 +166,9 @@ os.environ["BUILDUTIL"] = "1"
 recipe.validate()
 print("GUARD-OK")
 """)
+  shutil.copy(packaging.REQUIRES_PARSER, tmp_path)
+  (tmp_path / "sources").mkdir()
+  (tmp_path / "sources" / "CMakeLists.txt").write_text("")
   recipe = tmp_path / "conanfile.py"
   recipe.write_text(template.replace("@NAME@", "t")
                     .replace("@CONAN_NAME@", "t"))

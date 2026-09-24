@@ -13,7 +13,7 @@ BUILD-TREE binary, pre-launched by the matching targeted build task.
 Deps tasks pre-install the conan graph per configuration.
 c_cpp_properties is UPSERTED, not rewritten: each build refreshes the
 just-built profile's entry and moves it to the top (vscode's default),
-never dropping entries for profiles built earlier or added by hand.
+pruning missing build databases while keeping hand-added entries.
 
 These three files are GITIGNORED (regenerated); .vscode/settings.json
 is hand-maintained and stays tracked.
@@ -25,17 +25,18 @@ import platform
 import shlex
 from pathlib import Path
 
-from .config import PROJECT_NAME, REPO_ROOT, VENV_PY, cmake_path
+from .config import (PROJECT_NAME, REPO_ROOT, VENV_PY, cmake_cache_entry,
+                     cmake_path)
 
 # ===========================================================================
 # CONFIG -- what to generate and its general shape. Edit here, not the JSON.
 # ===========================================================================
 
-# buildutil flags every build/test/bench task carries. --no-watchdog:
+# buildutil flags every build/test/bench task carries. --i-am-willingly-circumventing-build-and-test-time-safeguards:
 # the watchdog exists so an AGENT invoking buildutil can't hang forever
 # on a wedged build; vscode tasks are driven by a human watching the
 # terminal, who interrupts long-running work themselves (owner ruling).
-COMMON_FLAGS = ["--no-watchdog", "--max-errors=3", "--jump-to-error=1"]
+COMMON_FLAGS = ["--i-am-willingly-circumventing-build-and-test-time-safeguards", "--max-errors=3", "--jump-to-error=1"]
 JOBS: int | None = None                    # None = all cores; int caps -j
 
 # flavor label -> the --release/--debug spelling that build/test/run all
@@ -43,7 +44,7 @@ JOBS: int | None = None                    # None = all cores; int caps -j
 FLAVORS = {
   "debug":          ["--debug"],
   "release":        ["--release"],
-  "relwithdebinfo": ["--release", "--debug"],
+  "relwithdebinfo": ["--relwithdebinfo"],
 }
 # launch configs only for flavors that carry debug info
 LAUNCH_FLAVORS = ("debug", "relwithdebinfo")
@@ -156,6 +157,11 @@ def _has_pytests() -> bool:
   """Mirror of engine._run_pytests' discovery: tools/*/pytest.ini."""
   return bool(sorted((REPO_ROOT/"tools").glob("*/pytest.ini")))
 
+def _build_dir(profile: str = "") -> Path:
+  """_build/, or one profile's build tree under it."""
+  return REPO_ROOT/"_build"/profile
+
+
 def _profile_prefix() -> str | None:
   """'<arch>-<os>-<compiler>' of the host toolchain — the stem of every
   _build/<profile>/ this machine produces. Detection first (works
@@ -165,7 +171,7 @@ def _profile_prefix() -> str | None:
     s = engine._detect_settings("Debug")
     return "-".join([s["arch"], s["os"], s["compiler"]]).lower()
   except Exception:
-    builds = REPO_ROOT/"_build"
+    builds = _build_dir()
     if builds.is_dir():
       for entry in sorted(builds.iterdir()):
         parts = entry.name.split("-")
@@ -341,7 +347,7 @@ def _tasks_document(modules: dict, has_pytests: bool) -> dict:
     tasks += _module_tasks(name, modules[name])
   tasks.append({
     "label": f"{PROJECT_NAME}: refresh .vscode", "type": "shell",
-    "command": _buildutil_command(), "args": ["--no-watchdog", "vscode"],
+    "command": _buildutil_command(), "args": ["--i-am-willingly-circumventing-build-and-test-time-safeguards", "vscode"],
     "presentation": {"reveal": "silent", "panel": "shared"},
     "options": {"cwd": "${workspaceFolder}"},
   })
@@ -467,32 +473,37 @@ def _launch_document(modules: dict, prefix: str | None) -> dict:
 
 _VSCODE_OS = {"linux", "macos", "windows"}
 _VSCODE_ARCH = {"x86_64": "x64", "armv8": "arm64", "aarch64": "arm64"}
-_CPPSTD_RANK = {"c++20": 0, "c++23": 1, "c++26": 2}
+_COMPILER_FAMILIES = {"apple-clang": "clang", "msvc": "msvc",
+                      "gcc": "gcc", "clang": "clang"}
 
 def _compiler_family(driver: str) -> str:
   base = Path(driver).name.lower().removesuffix(".exe")
-  return "msvc" if base == "cl" else "clang" if "clang" in base else "gcc"
+  if base == "cl":
+    base = "msvc"
+  return next((family for name, family in _COMPILER_FAMILIES.items()
+               if name in base), _COMPILER_FAMILIES["gcc"])
 
-def _cpp_standard(args: list) -> str:
-  best = "c++23"
-  for arg in args:
-    token = arg.lstrip("-/").lower()
-    if not token.startswith("std"):
-      continue
-    value = token.partition("=")[2] or token.partition(":")[2]
-    name = {"c++2c": "c++26", "c++26": "c++26", "c++latest": "c++26",
-            "c++2b": "c++23", "c++23": "c++23",
-            "c++2a": "c++20", "c++20": "c++20"}.get(value)
-    if name and _CPPSTD_RANK[name] > _CPPSTD_RANK[best]:
-      best = name
-  return best
+def _cpp_standard(profile_name: str) -> dict:
+  """The standard the build resolved for the project's own targets."""
+  cache = _build_dir(profile_name)/"CMakeCache.txt"
+  if not cache.exists():
+    return {}
+  standard = cmake_cache_entry(cache, "BUILDUTIL_CXX_STANDARD")
+  return {"cppStandard": f"c++{standard}"} if standard else {}
 
-def _intellisense_mode(profile_name: str, driver: str) -> str | None:
+def _intellisense_mode(profile_name: str, driver: str | None = None) -> str | None:
   parts = profile_name.split("-")
-  if len(parts) < 2 or parts[1] not in _VSCODE_OS:
+  if len(parts) >= 3 and parts[1] in _VSCODE_OS:
+    arch, os_name = parts[:2]
+    compiler = "-".join(parts[2:])
+  else:
     return None
-  return (f"{parts[1]}-{_compiler_family(driver)}"
-          f"-{_VSCODE_ARCH.get(parts[0], parts[0])}")
+  family = _compiler_family(driver) if driver else next(
+    (family for name, family in _COMPILER_FAMILIES.items()
+     if compiler == name or compiler.startswith(name + "-")), None)
+  if family is None:
+    return None
+  return f"{os_name}-{family}-{_VSCODE_ARCH.get(arch, arch)}"
 
 def _forced_include(profile_name: str) -> dict:
   """The options header the compiler is force-fed, so IntelliSense and the
@@ -506,10 +517,9 @@ def _forced_include(profile_name: str) -> dict:
 
 
 def _cpp_configuration(profile_name: str) -> dict | None:
-  """A configuration entry for one _build/<profile>. Enriched from the
-  profile's compile DB when it exists; a DB-less skeleton otherwise, so
-  the file exists (with the compileCommands path the first build will
-  fill) even before anything was built."""
+  database = _build_dir(profile_name)/"compile_commands.json"
+  if not database.exists():
+    return None
   base = {
     "name": profile_name,
     "compileCommands":
@@ -517,15 +527,6 @@ def _cpp_configuration(profile_name: str) -> dict | None:
     "cStandard": "c17",
     **_forced_include(profile_name),
   }
-  database = REPO_ROOT/"_build"/profile_name/"compile_commands.json"
-  if not database.exists():
-    parts = profile_name.split("-")
-    if len(parts) < 2 or parts[1] not in _VSCODE_OS:
-      return None
-    driver = parts[2] if len(parts) > 2 else "gcc"
-    mode = _intellisense_mode(profile_name, driver)
-    return {**base, "cppStandard": "c++26",
-            **({"intelliSenseMode": mode} if mode else {})}
   entries = json.loads(database.read_text())
   if not entries:
     return None
@@ -535,29 +536,36 @@ def _cpp_configuration(profile_name: str) -> dict | None:
   if not args:
     return None
   mode = _intellisense_mode(profile_name, args[0])
-  return {**base, "compilerPath": args[0], "cppStandard": _cpp_standard(args),
+  return {**base, "compilerPath": args[0], **_cpp_standard(profile_name),
           **({"intelliSenseMode": mode} if mode else {})}
 
 def _cpp_document(prefix: str | None, active: str | None) -> dict:
-  """UPSERT semantics (user spec): keep whatever configurations the
-  file already holds, refresh every profile we can see (built dirs +
-  the three this host is expected to produce), and move the
-  just-built profile to the TOP — vscode selects the first entry by
-  default, so the active build wins IntelliSense."""
+  """VS Code selects the first configuration, so the active build goes first."""
   path = REPO_ROOT/".vscode"/"c_cpp_properties.json"
   try:
     existing = json.loads(path.read_text()).get("configurations", [])
   except (OSError, ValueError):
     existing = []
-  by_name = {c["name"]: c for c in existing if isinstance(c, dict) and "name" in c}
+  by_name = {}
+  build_prefix = "${workspaceFolder}/_build/"
+  for config in existing:
+    if not isinstance(config, dict) or "name" not in config:
+      continue
+    database = config.get("compileCommands", "")
+    if isinstance(database, str) and database.startswith(build_prefix):
+      if not (_build_dir()/database[len(build_prefix):]).exists():
+        continue
+    by_name[config["name"]] = config
   names = set(by_name)
-  builds = REPO_ROOT/"_build"
+  builds = _build_dir()
   if builds.is_dir():
     names |= {e.name for e in builds.iterdir()
               if e.is_dir() and (e/"compile_commands.json").exists()}
-  if prefix:
-    names |= {f"{prefix}-{flavor}" for flavor in FLAVORS}
   for name in sorted(names):
+    database = by_name.get(name, {}).get("compileCommands")
+    if database is not None and not (
+        isinstance(database, str) and database.startswith(build_prefix)):
+      continue
     refreshed = _cpp_configuration(name)
     if refreshed:
       by_name[name] = refreshed

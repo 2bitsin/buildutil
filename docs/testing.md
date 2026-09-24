@@ -11,15 +11,18 @@ filtering, coverage attribution and the editor's task list.
 ## `buildutil test`
 
 The verb builds incrementally, runs ctest, and then runs the project's
-python suites. Its build type is unique among the verbs: with neither
-`--release` nor `--debug` it follows whatever `build` last acted on, and
-falls back to Release on a tree that was never built.
+python suites. With no explicit [profile flag](commands.md#building) it
+builds and tests Release, whatever the tree built before.
+The `profile:` line says where that choice came from: `(default)`, or
+the explicit flags `(--debug)`, `(--release)`, `(--relwithdebinfo)` or
+`(--release --debug)` (RelWithDebInfo). Project option overrides follow
+that note.
 
 The ctest invocation is:
 
 ```
 ctest --test-dir <build_dir> [--output-on-failure] --no-tests=error
-      --timeout <T> [-L ^(mod1|mod2)$] [-R <FILTER>] [--parallel <N>]
+      --timeout <T> [-L ^(mod1|mod2)$] [-R <FILTER>] [-LE <REGEX>]... [--parallel <N>]
 ```
 
 `--no-tests=error` is unconditional: a filter that matches nothing, or
@@ -28,11 +31,30 @@ targets become ctest **labels**, not names — `buildutil test widget` runs
 everything the module `widget` owns — while `--filter`/`-f` is a regex
 over test *names*. `--timeout` is ctest's per-test wall clock and
 defaults to 60 seconds, bounding every entry that declares none of its own
-(an entry with a declared bound keeps it), `--parallel` opts into parallel
-execution (serial is the default) with `--jobs`, `--quiet` drops
-`--output-on-failure`, and `--no-build` runs what is already there,
-refusing when there is no test tree to run. `--no-native` runs only the python suites and `--no-pytest`
+(an entry with a declared bound keeps it). ctest runs in parallel by
+default over 0.7 x the core count, rounded down and at least 1, or over
+`--jobs N`; `--no-parallel` runs serially, and the retired `--parallel`
+exits 2 naming the new default so an old script is found. `coverage`
+takes the same switches. `--quiet` drops `--output-on-failure`, and
+`--no-build` runs what is already there, refusing when there is no test
+tree to run. `--no-native` runs only the python suites and `--no-pytest`
 only the native ones.
+
+`--label-exclude <regex>` is repeatable and passes one `-LE <regex>` to
+ctest per value. To exclude labels from the default gate, configure:
+
+```toml
+[test]
+exclude_labels = ["measurement"]
+```
+
+These are literal label names, escaped and combined into an anchored regex
+such as `^(measurement|slow)$`. The default is an empty list. Configured
+exclusions apply only when there are no positional targets and no
+`--label-exclude` flags; `--filter` alone keeps them. An explicit target,
+such as `buildutil test measurement`, overrides the configured exclusions.
+Explicit `--label-exclude` flags replace the defaults and apply even with
+targets. Exclusions affect ctest entries only.
 
 `-O`/`--test-option` passes an option through to pytest: `name` becomes
 `--name`, `name:value` becomes `--name=value`, and a **one-character**
@@ -59,6 +81,12 @@ gets the module's own directory restated as a private include root, since
 a translation unit under `*.test/` is not next to its headers. Where the
 module also has an executable, the suite depends on it, so an end-to-end
 suite can never run a stale binary and pass.
+
+Support code several suites share is a test-lane module
+(`sources/<group>/<name>.test/`, see [layout.md](layout.md#kind-tags))
+linked under `TEST` or `BENCH`: each suite gets every object of it, gtest
+registrations included. `--no-tests` drops it unless benches build, which
+keep it.
 
 Registration is `gtest_discover_tests`, never `add_test`, with three
 details worth knowing. The label is the module target, which is what
@@ -98,6 +126,15 @@ runs nothing. The third path is buildutil's own: `tools/*/pytest.ini`
 suites are run directly, skipping any directory `[test] python` already
 covers, and pytest's "no tests collected" exit is treated as success
 there.
+
+Both declared `[test] python` suites and direct `tools/*/pytest.ini`
+suites get `PATH` with the absolute `<build dir>/bin` prepended,
+`BUILDUTIL_BUILD_DIR` set to the absolute build directory, and
+`BUILDUTIL_PROFILE` set to its profile name (for example,
+`x86_64-linux-gcc-release`). `test` does not refresh an install tree,
+so it adds no install directory to `PATH`. With `--no-native` there is
+no build directory: `PATH` is unchanged and `BUILDUTIL_BUILD_DIR` and
+`BUILDUTIL_PROFILE` are absent.
 
 A `--timeout` sized for one gtest case is the wrong bound for an entry
 holding twenty pytest cases, so a suite may carry its own wall clock:

@@ -28,8 +28,10 @@ def run(
        "buildutil.toml (`default`, with per-OS `default_linux`/"
        "`default_windows`/`default_macos` overrides).",
   ),
-  release: bool = typer.Option(False, "--release", help="Optimized build."),
-  debug: bool = typer.Option(False, "--debug", help="Debug build (default)."),
+  release: bool = typer.Option(False, "--release", help="Optimized build (default)."),
+  debug: bool = typer.Option(False, "--debug", help="Debug build."),
+  relwithdebinfo: bool = typer.Option(
+    False, "--relwithdebinfo", help="Optimized build with debug info."),
   no_build: bool = typer.Option(
     False, "--no-build",
     help="Skip the incremental build/install step; just exec the existing binary.",
@@ -70,6 +72,7 @@ def run(
     buildutil run --target hello
   """
   from ..config import default_run_target
+  build_type = _resolve_build_type(release, debug, relwithdebinfo)
   _enter(conan_home)
   if target is None:
     target = default_run_target(platform.system())
@@ -104,20 +107,19 @@ def run(
   # _detect_settings otherwise.
   if not no_build:
     _select_compiler(compiler, "auto")
-    build_type = _resolve_build_type(release, debug)
     settings = _detect_settings(build_type)
     profile = _ensure_profile(settings)
     build_dir = Path("_build") / _profile_name(settings)
 
     _warn_dependency_upload_skipped(skip_dependency_upload)
-    _conan_install(profile)
+    _conan_install(profile, build_dir)
     _cmake_configure(build_dir, build_type, tests=True, bench=False)
     _cmake_build(build_dir)
     subprocess.check_call([
       "cmake", "--install", str(build_dir), "--prefix", str(INSTALL_PREFIX),
     ])
     if not skip_dependency_upload:
-      _upload_to_remote()
+      _upload_to_remote([build_dir / "conan-graph.json"])
 
   # Resolve the binary. --no-build prefers the freshest build-tree
   # copy: `buildutil bench` (and build-time generator scripts that

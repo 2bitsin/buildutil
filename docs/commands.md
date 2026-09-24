@@ -33,7 +33,7 @@ properties rather than runner flags.
 | `--fail-fast` | off | sugar for `--max-errors 1`; an explicit `--max-errors` wins |
 | `--jobs N`, `-j N` | 80 | build parallelism as a **percent** of cores, clamped to 1..100 |
 | `--jump-to-error N` | 0 | on a failed build, opens the first N in-project error sites with `code -r -g` |
-| `--no-watchdog` | off | drops the wall-clock budget for this invocation |
+| `--i-am-willingly-circumventing-build-and-test-time-safeguards` | off | drops the wall-clock budget for this invocation |
 | `--watchdog-budget SECONDS` | 180 | moves the budget; an explicit value arms the watchdog even in CI |
 | `--no-timing` | off | suppresses the `buildutil: command took N.Ns` line |
 | `--no-conan-update` | off | resolves version ranges against the local conan cache only |
@@ -59,6 +59,11 @@ one of the project options `buildutil.toml` declares, for one build. See
 clang). See [toolchains.md](toolchains.md). `--conan-home PATH` moves the
 conan cache off the default `<repo>/_conanhome`.
 
+Dependency uploads include only binaries built or found in the cache in
+this invocation's resolved Conan graphs. The project's own package name
+is excluded at every version and user/channel; unrelated cached packages
+are never uploaded. Publish combines the graphs of all built configurations.
+
 The dependency upload after a build is the fleet's binary cache, so it
 happens by default — whenever the remote seam carries credentials the
 server accepted; an unset, anonymous or refusing remote skips it with a
@@ -81,7 +86,8 @@ current directory or an ancestor and refuses without one.
 **`buildutil init`** scaffolds a buildable project: `buildutil.toml`, a
 four-line root `CMakeLists.txt`, a `sources/CMakeLists.txt` with
 GoogleTest and google-benchmark wired through `Require(...)`, a
-`conanfile.py` that parses those same calls, a `.gitignore` covering the
+`conanfile.py` that parses those same calls through the
+`buildutil_requires.py` beside it, a `.gitignore` covering the
 `_*` convention, a `./buildutil` launcher, and an example `hello` module
 carrying a library, an executable, a test and a bench. Existing files are
 never overwritten and the example is skipped when `sources/` already
@@ -130,6 +136,17 @@ and it is described in [packaging.md](packaging.md).
 
 ## Building
 
+`build`, `test`, `run`, `godbolt`, `bench`, `analyze`, `publish`, and `deps` accept
+`--relwithdebinfo` for an optimized build with debug info (CMake
+`RelWithDebInfo`), using its own `_build/<profile>` directory ending in
+`-relwithdebinfo`; VS Code tasks use the same flag.
+Select one of `--release`, `--debug`, or `--relwithdebinfo`; conflicting
+flags are usage errors. The old spelling `--release --debug` remains
+accepted as RelWithDebInfo. With none of them, `build`, `test`, `run`,
+`godbolt` and `bench` build Release, whatever the tree built before;
+`analyze` keeps its Debug lane, `coverage` is always Debug, and `deps`
+and `publish` cover every configuration.
+
 **`buildutil setup`** re-renders the cmake machinery, rewrites the venv
 console script, forces a fresh conan remote registration and login, and
 installs the agent skill (`--no-agents` skips that).
@@ -140,7 +157,7 @@ three configurations are warmed.
 
 **`buildutil build`** runs conan install, cmake configure and cmake build,
 then installs into `_install/` and uploads the dependency binaries.
-`--release` and `--debug` pick the configuration (Debug is this verb's
+The profile flags pick the configuration (Release is the
 default), `--no-tests` drops the test targets and the test-only
 requirements with them, `--include-bench` builds the benches that are off
 by default, `--target NAME[,NAME...]` builds only those cmake targets and
@@ -165,10 +182,19 @@ libraries. **`buildutil extend [NAME]`** declares a cmake extension in
 
 ## Running, testing and measuring
 
+`build` and `test` print a `profile:` line naming the origin of the
+configuration in parentheses: `default`, or the explicit flags
+(`--release`, `--debug`, `--relwithdebinfo`, or `--release --debug`).
+Project option overrides follow the origin note.
+
 `test`, `bench`, `coverage`, `run` and `analyze` have a page of their own:
 [testing.md](testing.md). `publish` has [packaging.md](packaging.md).
 `vscode` regenerates the editor wiring and is described in
 [agents.md](agents.md).
+
+`test --label-exclude <regex>` is repeatable: each value becomes ctest
+`-LE <regex>`. It replaces `[test] exclude_labels` defaults. Positional
+test targets also override those defaults; explicit exclusions still apply.
 
 ## `buildutil godbolt`
 
@@ -203,7 +229,7 @@ since scaffolding assembly is not what the report is for.
 report to chosen functions and `-m MODULE` to chosen modules;
 `--project-only` drops dependency code completely and `--all-functions`
 shows everything, and asking for both is an error. `--include-tests` and
-`--include-benches` bring the scaffolding back, `--release` / `--debug`
+`--include-benches` bring the scaffolding back, the profile flags
 pick the configuration, `--no-build` reuses what is there, and `-o DIR`
 picks the output directory, which defaults to
 `_build/<profile>/godbolt-report/`. gcc and clang only; MSVC exits 2.

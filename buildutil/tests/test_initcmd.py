@@ -1,6 +1,7 @@
 """`buildutil init` scaffolds a buildable hello-world tree — and never
 overwrites what a project already owns."""
 import ast
+import re
 import shutil
 import subprocess
 
@@ -60,7 +61,7 @@ def test_prefixes_and_name_substituted(fresh):
   # the conan name is the template's FALLBACK since [package] took over
   assert '_PKG.get("name", "my-demo")' in conanfile
   assert 'os.environ.get("MYD_SKIP_TEST_DEPS")' in conanfile
-  assert "@" not in conanfile  # no token left behind
+  assert not re.search(r"@[A-Z_]+@", conanfile)  # no token left behind
   # the package directory is the project name verbatim -- it is the
   # prefix every exported header is qualified by, so it has to be the
   # name the project actually calls itself

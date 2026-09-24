@@ -222,6 +222,13 @@ library does not actually export the clang C API — an explicit load
 probe, which is what caught a distribution shipping the wrong `.so` under
 a plausible name. `BUILDUTIL_LIBCLANG` settles it outright.
 
+If the MSVC STL rejects the parser with `STL1000` and “expected Clang N
+or newer”, reflection stops with one error before reporting missing schemes.
+The message names `yvals_core.h`, the required Clang version, and the major
+version and path of the loaded libclang (system first, then the bundled
+wheel). Install `clang-N` or newer, or point `BUILDUTIL_LIBCLANG` at a
+compatible libclang library.
+
 **The parse runs on the host**, whatever the build targets, so a host
 with no C++ toolchain loses every standard header. That is reported as
 what it is — the generator names the standard headers it could not find

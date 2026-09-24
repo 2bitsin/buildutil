@@ -27,6 +27,12 @@ TEMPLATES = Path(initcmd.__file__).resolve().parent / "templates"
 def _conan_stubs():
   for name, attrs in (("conan", {"ConanFile": object}),
                       ("conan.tools", {}),
+                      ("conan.errors", {
+                        "ConanException": type("ConanException", (Exception,), {}),
+                        "ConanInvalidConfiguration":
+                          type("ConanInvalidConfiguration", (Exception,), {})}),
+                      ("conan.tools.build", {"cross_building": lambda conanfile: False}),
+                      ("conan.tools.scm", {"Version": object}),
                       ("conan.tools.cmake", {"CMakeDeps": object,
                                              "CMakeToolchain": object,
                                              "cmake_layout": lambda *a: None})):
@@ -48,12 +54,14 @@ def _recipe(tmp_path):
     f"recipe_{tmp_path.name}", path)
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
+  mod.cross_building = lambda conanfile: False
   recipe = mod.ProjectRecipe()
   recipe.source_folder = str(tmp_path)
   recipe.recipe_folder = str(tmp_path)
   recipe.generators_folder = str(tmp_path / "gen")
   recipe.build_folder = str(tmp_path / "bld")
   recipe.settings = SimpleNamespace(build_type="Debug")
+  recipe.version = "1.2.3.4"
   recipe.options = SimpleNamespace(get_safe=lambda name: None)
   return recipe
 
@@ -71,6 +79,7 @@ def test_a_baked_package_builds_in_cache_through_the_vendored_driver(
   cmd, cwd = calls[0]
   assert "-m buildutil cache-build" in cmd
   assert "--build-type Debug" in cmd
+  assert "--package-version 1.2.3.4" in cmd
   assert "--linkage static" in cmd            # no shared option set
   assert str(tmp_path / "gen" / "conan_toolchain.cmake") in cmd
   assert cwd == str(tmp_path)
@@ -90,10 +99,7 @@ def test_the_baked_lane_maps_the_shared_option_to_linkage(tmp_path):
 
 def test_an_unbaked_package_still_refuses_the_cache_build(tmp_path):
   recipe = _recipe(tmp_path)
-  errors = types.ModuleType("conan.errors")
-  class ConanException(Exception): ...
-  errors.ConanException = ConanException
-  sys.modules["conan.errors"] = errors
+  ConanException = type(recipe).build.__globals__["ConanException"]
   with pytest.raises(ConanException, match="bake-buildutil"):
     recipe.build()
 

@@ -27,6 +27,12 @@ TEMPLATES = Path(initcmd.__file__).resolve().parent / "templates"
 def _conan_stubs():
   for name, attrs in (("conan", {"ConanFile": object}),
                       ("conan.tools", {}),
+                      ("conan.errors", {
+                        "ConanException": type("ConanException", (Exception,), {}),
+                        "ConanInvalidConfiguration":
+                          type("ConanInvalidConfiguration", (Exception,), {})}),
+                      ("conan.tools.build", {"cross_building": lambda conanfile: False}),
+                      ("conan.tools.scm", {"Version": object}),
                       ("conan.tools.cmake", {"CMakeDeps": object,
                                              "CMakeToolchain": object,
                                              "cmake_layout": lambda *a: None})):
@@ -51,6 +57,7 @@ def _recipe_module(tmp_path, toml_text=None):
     f"recipe_{tmp_path.name}", path)
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
+  mod.cross_building = lambda conanfile: False
   return mod
 
 
@@ -138,10 +145,7 @@ def test_package_info_discovers_the_library_mirror(tmp_path):
 def test_cache_source_build_is_refused_with_the_story(tmp_path):
   mod = _recipe_module(
     tmp_path, '[package]\nkind = "library"\nname = "s"\n')
-  errors = types.ModuleType("conan.errors")
-  class ConanException(Exception): ...
-  errors.ConanException = ConanException
-  sys.modules["conan.errors"] = errors
+  ConanException = mod.ConanException
   class Settings:
     def get_safe(self, name):
       return {"build_type": "Debug", "compiler": "gcc",
@@ -168,10 +172,7 @@ def test_the_refusal_survives_a_bare_recipe_without_settings(tmp_path):
   story with an AttributeError)."""
   mod = _recipe_module(
     tmp_path, '[package]\nkind = "library"\nname = "s"\n')
-  errors = types.ModuleType("conan.errors")
-  class ConanException(Exception): ...
-  errors.ConanException = ConanException
-  sys.modules["conan.errors"] = errors
+  ConanException = mod.ConanException
   with pytest.raises(ConanException, match="buildutil publish"):
     mod.ProjectRecipe().build()
 
@@ -448,19 +449,26 @@ def test_publish_refuses_ranged_runtime_requires(tmp_path, monkeypatch):
 
 # ----------------------------------------------- command assembly --
 
-def test_export_and_test_carry_version_and_profiles(monkeypatch):
+@pytest.mark.parametrize("user,channel", [(None, None), ("buildutil", "smoke")])
+def test_export_and_test_carry_version_and_profiles(monkeypatch, user, channel):
   _fake_project(monkeypatch, package_kind="application",
                 package_name="tool")
   calls = []
   packaging.export_pkg("0.3.0.2", Path("/p/host"), Path("/p/build"),
-                       run=calls.append)
+                       run=calls.append, user=user, channel=channel)
   packaging.run_package_test("0.3.0.2", Path("/p/host"), Path("/p/build"),
-                             run=calls.append)
+                             run=calls.append, user=user, channel=channel)
   assert calls[0][:3] == ["conan", "export-pkg", "."]
   assert "--version=0.3.0.2" in calls[0]
   assert "--profile:host=/p/host" in calls[0]
   assert "--profile:build=/p/build" in calls[0]
-  assert calls[1][:4] == ["conan", "test", "test_package", "tool/0.3.0.2"]
+  reference = "tool/0.3.0.2" + ("@buildutil/smoke" if user else "")
+  assert calls[1][:4] == ["conan", "test", "test_package", reference]
+  if user:
+    assert calls[0][calls[0].index("--user"):][:4] == [
+      "--user", user, "--channel", channel]
+  else:
+    assert "--user" not in calls[0] and "--channel" not in calls[0]
   assert "--build=missing" in calls[1]
 
 
@@ -477,6 +485,25 @@ def test_upload_refuses_without_a_remote(monkeypatch):
   packaging.upload("1.0.0.1", run=calls.append)
   assert calls == [["conan", "upload", "s/1.0.0.1", "-r", "site",
                     "--confirm"]]
+
+
+def test_upload_publishes_the_runtime_host_wrapper_recipes(tmp_path,
+                                                          monkeypatch):
+  _fake_project(monkeypatch, package_kind="library", package_name="s")
+  from buildutil import config
+  monkeypatch.setattr(config, "REPO_ROOT", tmp_path)
+  root = tmp_path
+  (root / "sources").mkdir()
+  (root / "sources" / "CMakeLists.txt").write_text(
+    'Require(OpenSSL VERSION ">=3" SYSTEM)\n'
+    'Require(GTest VERSION ">=1" SYSTEM TEST CONAN gtest)\n')
+  from buildutil import bootstrap
+  monkeypatch.setattr(bootstrap, "conan_remote_env",
+                      lambda: ("site", "https://x", "u", "p"))
+  calls = []
+  packaging.upload("1.0.0.1", run=calls.append)
+  assert calls[1:] == [["conan", "upload", "openssl/system@host", "-r",
+                        "site", "--confirm", "--only-recipe"]]
 
 
 def test_ref_falls_back_to_the_project_name(monkeypatch):
@@ -686,9 +713,11 @@ class _CppInfo(SimpleNamespace):
     self.properties[name] = value
 
 
-def _described(tmp_path, toml_text, files, manifest=None):
+def _described(tmp_path, toml_text, files, manifest=None, wrappers=(),
+               cross=False):
   """package_info() over a package tree of exactly these files."""
   mod = _recipe_module(tmp_path, toml_text)
+  mod.cross_building = lambda conanfile: cross
   pkg = tmp_path / "pkg"
   for rel in files:
     path = pkg / rel
@@ -701,13 +730,61 @@ def _described(tmp_path, toml_text, files, manifest=None):
   recipe = mod.ProjectRecipe()
   recipe.package_folder = str(pkg)
   recipe.cpp_info = _CppInfo()
+  direct_host = {wrapper.ref.name: wrapper for wrapper in wrappers}
+  recipe.dependencies = SimpleNamespace(direct_host=direct_host)
   recipe.package_info()
   return recipe.cpp_info
+
+
+def _info(**properties):
+  return SimpleNamespace(get_property=properties.get, components={})
+
+
+def _dependency(name, root_target=None, host_targets=None, **components):
+  """A direct dependency: component names to their cmake_target_name."""
+  cpp_info = _info(cmake_target_name=root_target,
+                   buildutil_host_targets=host_targets)
+  cpp_info.components = {component: _info(cmake_target_name=target)
+                         for component, target in components.items()}
+  return SimpleNamespace(ref=SimpleNamespace(name=name), cpp_info=cpp_info)
+
+
+def _wrapper(name, targets):
+  """A <name>/system@host dependency declaring these host targets."""
+  return _dependency(name, host_targets=targets)
+
+
+OXBOX = _dependency("oxbox", platform="oxbox::platform")
+
+FREERDP_WRAPPERS = (
+  _wrapper("freerdp-server",
+           {"freerdp-server": "freerdp-server::freerdp-server"}),
+  _wrapper("freerdp", {"freerdp": "freerdp::freerdp"}),
+  _wrapper("winpr", {"winpr": "winpr::winpr"}),
+  _wrapper("openssl", {"OpenSSL::SSL": "openssl::ssl",
+                       "OpenSSL::Crypto": "openssl::crypto"}),
+  OXBOX)
 
 
 CORES = '[package]\nkind = "library"\nname = "cores"\n'
 NOT_LINKABLE = CORES + "linkable = false\n"
 PAYLOAD = ["lib/genesis_plus_gx_libretro.so", "include/cores/libretro.h"]
+
+
+@pytest.mark.parametrize("chain", [
+  ["libSDL3.so", "libSDL3.so.0", "libSDL3.so.3.4.8"],
+  ["libSDL3.dylib", "libSDL3.0.dylib", "libSDL3.3.4.8.dylib"],
+])
+def test_a_versioned_shared_library_is_named_once(tmp_path, chain):
+  """A soversion ships the full-version file behind two links (#129)."""
+  lib = tmp_path / "pkg" / "lib"
+  lib.mkdir(parents=True)
+  (lib / chain[-1]).write_bytes(b"")
+  for link, target in zip(chain, chain[1:]):
+    (lib / link).symlink_to(target)
+  info = _described(tmp_path, CORES, [])
+  assert info.libs == ["SDL3"]
+  assert info.libdirs == ["lib"]
 
 
 def test_a_runtime_payload_is_advertised_as_a_library_by_default(tmp_path):
@@ -769,6 +846,78 @@ def test_a_linkable_package_still_componentises_its_libraries(tmp_path):
                "external": []}])
   assert info.components["genesis"].libs == ["genesis"]
   assert info.components["snes"].libs == []
+
+
+def test_a_host_target_names_the_wrapper_component_it_is(tmp_path):
+  """sdl-rdp's links, not -lfreerdp-server: each target is its own
+  wrapper's, even when FreeRDP-Server's config imported winpr first or a
+  conan dependency's config created OpenSSL::SSL before the SYSTEM find."""
+  info = _described(
+    tmp_path, CORES, ["lib/libbackend.a", "lib/libsample.a"],
+    manifest=[{"path": "backend", "lib": "backend", "needs": [],
+               "external": ["oxbox::platform", "OpenSSL::SSL"],
+               "host": ["freerdp-server", "freerdp", "winpr"]},
+              {"path": "sample", "lib": "sample", "needs": ["backend"],
+               "external": [], "host": []}],
+    wrappers=FREERDP_WRAPPERS)
+  assert info.components["backend"].requires == [
+    "oxbox::platform", "openssl::ssl", "freerdp-server::freerdp-server",
+    "freerdp::freerdp", "winpr::winpr"]
+  assert info.components["backend"].system_libs == []
+  assert info.components["sample"].requires == ["backend"]
+
+
+BACKEND = [{"path": "backend", "lib": "backend", "needs": [],
+            "external": ["oxbox::platform"],
+            "host": ["freerdp", "winpr", "OpenSSL::Crypto3"]},
+           {"path": "sample", "lib": "sample", "needs": ["backend"],
+            "external": [], "host": []}]
+
+
+def test_a_host_target_no_wrapper_declares_is_refused_by_name(tmp_path):
+  with pytest.raises(Exception, match=(
+      r"module backend links \['winpr', 'OpenSSL::Crypto3'\], which a SYSTEM "
+      r"find imported and no host wrapper this package requires declares")):
+    _described(tmp_path, CORES, ["lib/libbackend.a", "lib/libsample.a"],
+               manifest=BACKEND, wrappers=(FREERDP_WRAPPERS[1], OXBOX))
+
+
+def test_a_cross_build_declares_no_host_target(tmp_path):
+  """A cross build forces no wrapper: its host targets are the target's."""
+  info = _described(tmp_path, CORES, ["lib/libbackend.a", "lib/libsample.a"],
+                    manifest=BACKEND, wrappers=(OXBOX,), cross=True)
+  assert info.components["backend"].requires == ["oxbox::platform"]
+  assert info.components["backend"].system_libs == []
+
+
+def test_a_conan_dependencys_cmake_targets_are_its_components(tmp_path):
+  """#153: OpenSSL::SSL from Require(OpenSSL ... CONAN openssl) is
+  openssl::ssl, a root target is the package, a default spelling stays."""
+  openssl = _dependency("openssl", root_target="OpenSSL::OpenSSL",
+                        ssl="OpenSSL::SSL", crypto="OpenSSL::Crypto")
+  fake = _dependency("fake", a=None, b="Fake::B")
+  info = _described(
+    tmp_path, CORES, ["lib/libbackend.a", "lib/libsample.a"],
+    manifest=[{"path": "backend", "lib": "backend", "needs": [],
+               "external": ["OpenSSL::SSL", "OpenSSL::OpenSSL", "fake::a",
+                            "Fake::B", "pthread"], "host": []},
+              {"path": "sample", "lib": "sample", "needs": ["backend"],
+               "external": [], "host": []}],
+    wrappers=(openssl, fake))
+  assert info.components["backend"].requires == [
+    "openssl::ssl", "openssl::openssl", "fake::a", "fake::b"]
+  assert info.components["backend"].system_libs == ["pthread"]
+
+
+def test_a_namespaced_link_no_dependency_declares_is_refused(tmp_path):
+  with pytest.raises(Exception, match=(
+      r"module backend links \['Nowhere::lib'\], which no direct dependency")):
+    _described(tmp_path, CORES, ["lib/libbackend.a", "lib/libsample.a"],
+               manifest=[{"path": "backend", "lib": "backend", "needs": [],
+                          "external": ["Nowhere::lib"], "host": []},
+                         {"path": "sample", "lib": "sample", "needs": [],
+                          "external": [], "host": []}],
+               wrappers=(OXBOX,))
 
 
 def test_a_missing_conan_binary_is_no_answer(monkeypatch):

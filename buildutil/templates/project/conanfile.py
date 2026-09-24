@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import os
 import json
-import re
 from pathlib import Path
 
 from conan import ConanFile
+from conan.errors import ConanException, ConanInvalidConfiguration
+from conan.tools.build import cross_building
 from conan.tools.cmake import CMakeDeps, CMakeToolchain, cmake_layout
+from conan.tools.scm import Version
+
+import buildutil_requires
 
 
 def _package_section() -> dict:
@@ -34,171 +38,203 @@ def _package_section() -> dict:
 
 _PKG = _package_section()
 
-
-REQUIRE_RE = re.compile(
-  # Package name permits letters, digits, underscores, and hyphens
-  # (yaml-cpp et al. aren't \w-only).
-  r'^\s*Require\s*\(\s*([\w-]+)\s+VERSION\s+"([^"]+)"(.*?)\)',
-  re.MULTILINE | re.DOTALL,
-)
+_HOST_REQUIRES = 1
 
 
-_KEYWORDS = {"TEST", "BENCH", "TOOL", "SYSTEM", "CONAN", "COMPONENTS",
-             "PLATFORM", "OPTIONS", "PUBLIC"}
-
-
-def _coerce_option(value: str):
-  """Conan option values as their natural types: True/False, ints,
-  everything else verbatim."""
-  if value in ("True", "False"):
-    return value == "True"
-  try:
-    return int(value)
-  except ValueError:
-    return value
-
-
-def _parse_extra(extra: str) -> dict:
-  tokens = extra.replace("\n", " ").split()
-  out = {"test": False, "bench": False, "tool": False, "system": False,
-         "public": False, "conan": None, "components": [], "platform": [],
-         "options": {}}
-  sugar = []
-  i = 0
-  while i < len(tokens):
-    # exact-case matching, same as cmake_parse_arguments: a lowercase
-    # `system` is a VALUE (Boost's system component!), not the SYSTEM
-    # keyword -- the .upper() this used to do read `COMPONENTS system`
-    # as SYSTEM and silently dropped the package from the conan graph
-    t = tokens[i]
-    if t == "TEST":
-      out["test"] = True
-      i += 1
-    elif t == "SYSTEM":
-      out["system"] = True
-      i += 1
-    elif t == "BENCH":
-      out["bench"] = True
-      i += 1
-    elif t == "TOOL":
-      out["tool"] = True
-      i += 1
-    elif t == "PUBLIC":
-      out["public"] = True
-      i += 1
-    elif t == "CONAN":
-      out["conan"] = tokens[i + 1]
-      i += 2
-    elif t == "COMPONENTS":
-      i += 1
-      while i < len(tokens) and tokens[i] not in _KEYWORDS:
-        # A leading + or - makes the token conan OPTION shorthand rather
-        # than a find_package component. Collected, not applied: OPTIONS
-        # may be written after COMPONENTS on the same call, and the
-        # conflict between the two spellings is only knowable once both
-        # have been read.
-        if tokens[i][:1] in ("+", "-"):
-          sugar.append(tokens[i])
-        else:
-          out["components"].append(tokens[i])
-        i += 1
-    elif t == "PLATFORM":
-      i += 1
-      while i < len(tokens) and tokens[i] not in _KEYWORDS:
-        out["platform"].append(tokens[i])
-        i += 1
-    elif t == "OPTIONS":
-      # key=value tokens, passed to conan on the requires call. A token
-      # without '=' is refused loudly — a typo'd option that silently
-      # vanished would leave the package built with the wrong defaults,
-      # which is the exact failure OPTIONS exists to end.
-      i += 1
-      while i < len(tokens) and tokens[i] not in _KEYWORDS:
-        key, eq, value = tokens[i].partition("=")
-        if not eq or not key:
-          raise ValueError(
-            f"Require OPTIONS token {tokens[i]!r} is not key=value")
-        out["options"][key] = _coerce_option(value)
-        i += 1
-    else:
-      i += 1
-  _apply_sugar(out, sugar)
-  return out
-
-
-def _apply_sugar(out: dict, sugar: list) -> None:
-  """COMPONENTS tokens written +name / -name, as the options they mean.
-
-  `+asio` is `with_asio=True`, `-json` is `without_json=True` — the
-  per-library options a boost-shaped recipe exposes, one token instead of
-  one key=value line each. Whether the recipe HAS that option is conan's
-  question and conan answers it by name; nothing here keeps a copy of
-  every recipe's option list.
-  """
-  signs = {}
-  for token in sugar:
-    sign, name = token[0], token[1:]
-    if not name:
-      raise ValueError(
-        f"Require COMPONENTS token {token!r} names no option")
-    if signs.setdefault(name, sign) != sign:
-      raise ValueError(
-        f"Require COMPONENTS has both '+{name}' and '-{name}'")
-    for spelling in (f"with_{name}", f"without_{name}"):
-      if spelling in out["options"]:
-        raise ValueError(
-          f"Require COMPONENTS {token!r} and OPTIONS "
-          f"{spelling}={out['options'][spelling]!r} both set an option "
-          f"for {name!r}")
-    out["options"]["with_" + name if sign == "+" else "without_" + name] = True
-  if sugar and out["system"]:
-    raise ValueError(
-      "Require COMPONENTS option shorthand with SYSTEM is meaningless — "
-      "a SYSTEM dep is the host's package and conan never builds it")
-
-
-def _to_conan_version(v: str) -> str:
-  v = v.strip()
-  if v == "*":
-    return "[*]"
-  ops = (">=", "<=", ">", "<", "~", "^")
-  if not any(v.startswith(op) for op in ops):
-    return v
-  # Cap the range at (major+1) so non-semver recipe versions like
-  # "cci.20210126" — which sort lexically above real releases — don't
-  # get picked by conan's resolver.
-  m = re.match(r"^[><=~^]+\s*(\d+)\.", v)
-  if m:
-    major = int(m.group(1))
-    return f"[{v} <{major + 1}]"
-  return f"[{v}]"
-
-
-def _parse_requires(recipe_folder: Path, target_os: str) -> list[dict]:
+def _parse_requires(recipe_folder: Path, target_os: str,
+                    host_packages: bool = True) -> list[dict]:
+  """The Require() calls active on target_os, SYSTEM ones if host_packages."""
   text = (recipe_folder / "sources" / "CMakeLists.txt").read_text()
-  entries = []
-  for name, version, extra in REQUIRE_RE.findall(text):
-    info = _parse_extra(extra)
-    # Skip deps gated to other platforms. Empty PLATFORM list means
-    # "all platforms".
-    if info["platform"] and target_os not in info["platform"]:
+  return [entry for entry in buildutil_requires.requires(text, target_os)
+          if host_packages or not entry["system"]]
+
+
+def _pin_satisfied(pin: str, host: str) -> bool:
+  """An exact pin is met at or above it in its major, a [range] inside it."""
+  if pin.startswith("[") and pin.endswith("]"):
+    return Version(host).in_range(pin[1:-1])
+  return (Version(host) >= Version(pin)
+          and Version(host).major == Version(pin).major)
+
+
+def _host_findings(project: str, entry: dict, resolved: str, host: str,
+                   pins: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+  """(refusals, warnings) for one SYSTEM entry against the pins it replaced."""
+  cmake, conan = entry["cmake_name"], entry["conan_name"]
+  if resolved != entry["ref"]:
+    return ([f"{project}: {resolved} replaced the host's {cmake}: a "
+             f"requirement downstream pinned {conan} and beat "
+             f"Require({cmake} ... SYSTEM). Drop that pin, or depend on "
+             f"{project} without it."], [])
+  if not _pin_satisfied(entry["version"], host):
+    return ([f"{project}: the host's {cmake} is {host}, below this project's "
+             f'Require({cmake} VERSION "{entry["floor"]}"). '
+             "Upgrade the host."], [])
+  unmet = [(owner, pin) for owner, pin in sorted(set(pins))
+           if not _pin_satisfied(pin.partition("/")[2], host)]
+  if entry["force"]:
+    return [], [f"{cmake}: the host's {host} is forced over {owner}'s pin "
+                f"{pin} (FORCE)" for owner, pin in unmet]
+  return [f"{project}: {owner} pins {pin}; the host's {cmake} is {host} "
+          f"(Require({cmake} ... SYSTEM) makes the host's win). Lower the "
+          f"pin in {owner.partition('/')[0]}, upgrade the host, or add FORCE "
+          "to take the host's anyway." for owner, pin in unmet], []
+
+
+def _cross_findings(project: str, entry: dict, resolved: str) -> list[str]:
+  """A cross build takes nothing from the host, so conan's copy is refused."""
+  cmake = entry["cmake_name"]
+  return [f"{project}: {resolved} is in this cross build's graph, but "
+          f"Require({cmake} ... SYSTEM) takes {cmake} from the target's own "
+          "environment; a cross build cannot force the host's over it. "
+          f"Drop the pin, or split the line by PLATFORM."]
+
+
+def _replaced_pins(conanfile, conan: str) -> list[tuple[str, str]]:
+  """(owner, pin) for every requirement of conan a force replaced."""
+  pins = []
+  for dependency in conanfile.dependencies.values():
+    for requirement, _ in dependency.dependencies.items():
+      replaced = requirement.overriden_ref
+      if (requirement.ref.name == conan and replaced is not None
+          and replaced.user != "host"):
+        pins.append((f"{dependency.ref.name}/{dependency.ref.version}",
+                     f"{replaced.name}/{replaced.version}"))
+  return pins
+
+
+def _entry_findings(conanfile, entry: dict) -> tuple[list[str], list[str]]:
+  """_host_findings for one SYSTEM entry, read off the resolved graph."""
+  found = conanfile.dependencies[entry["conan_name"]]
+  resolved = f"{found.ref.name}/{found.ref.version}" + (
+    f"@{found.ref.user}" if found.ref.user else "")
+  if cross_building(conanfile):
+    return _cross_findings(conanfile.name, entry, resolved), []
+  return _host_findings(conanfile.name, entry, resolved,
+                        str(found.options.get_safe("host_version")),
+                        _replaced_pins(conanfile, entry["conan_name"]))
+
+
+def _in_graph(conanfile, entry: dict) -> bool:
+  """A runtime SYSTEM entry is in a native graph; any may be in a cross one."""
+  present = entry["conan_name"] in conanfile.dependencies
+  lane = entry["test"] or entry["bench"] or cross_building(conanfile)
+  if not present and not lane:
+    raise ConanException(
+      f"{conanfile}: Require({entry['cmake_name']} ... SYSTEM) forced "
+      f"{entry['ref']}, and the resolved graph has no {entry['conan_name']}")
+  return present
+
+
+def _dependency_targets(dependency) -> dict[str, str]:
+  """One dependency's cmake targets, defaults and declared, as <conan>::<component>."""
+  name, info = dependency.ref.name, dependency.cpp_info
+  infos = [(name, info), *info.components.items()]
+  targets = {f"{name}::{component}": f"{name}::{component}"
+             for component, _ in infos}
+  targets.update({part.get_property("cmake_target_name"): f"{name}::{component}"
+                  for component, part in infos
+                  if part.get_property("cmake_target_name")})
+  targets.update(info.get_property("buildutil_host_targets") or {})
+  return targets
+
+
+def _linked_targets(conanfile) -> dict[str, str]:
+  """Every cmake target the direct dependencies declare, conan-spelled."""
+  targets = {}
+  for dependency in conanfile.dependencies.direct_host.values():
+    targets.update(_dependency_targets(dependency))
+  return targets
+
+
+def _wrapper_ref(recipe_folder: Path, entry: dict) -> str:
+  """The wrapper pinned to the revision this checkout's driver rendered; a
+  recipe in the cache has no rendering and leaves the pin to its consumer."""
+  rendered = buildutil_requires.wrapper_recipe(recipe_folder, entry["conan_name"])
+  if not rendered.is_file():
+    return entry["ref"]
+  return f"{entry['ref']}#{buildutil_requires.recipe_revision(rendered.read_bytes())}"
+
+
+def _wrapper_requests(conanfile) -> dict[str, list[tuple[str, dict]]]:
+  """Every recipe's options on each host wrapper it requires, by wrapper."""
+  requesters = [(str(conanfile.ref), conanfile.dependencies)] + [
+    (str(dependency.ref), dependency.dependencies)
+    for dependency in conanfile.dependencies.host.values()]
+  requests = {}
+  for requester, dependencies in requesters:
+    for requirement, _ in dependencies.direct_host.items():
+      if requirement.ref.user == "host" and requirement.options:
+        requests.setdefault(requirement.ref.name, []).append(
+          (requester, requirement.options))
+  return requests
+
+
+def _request_view(options: dict, used: set[str]) -> tuple[str, str]:
+  """The components asked for, and the packages entries the wrapper reads."""
+  entries = [entry for entry in str(options.get("packages", "")).split()
+             if entry.partition("=")[2].partition(":")[0] in used]
+  return str(options.get("components", "")), " ".join(sorted(entries))
+
+
+def _cmake_name(wrapper: str, requests: list[tuple[str, dict]]) -> str:
+  """The Require() name a wrapper stands for, from the packages entries."""
+  names = [entry.partition("=")[0] for _, options in requests
+           for entry in str(options.get("packages", "")).split()
+           if entry.partition("=")[2].partition(":")[0] == wrapper]
+  return next(iter(names), wrapper)
+
+
+def _widen_advice(cmake: str, first: tuple, second: tuple) -> str:
+  """Which Require line to widen so two requests of one wrapper agree."""
+  (asker, (asked, _)), (other, (wanted, _)) = first, second
+  if asked == wanted:
+    return ("Declare the SYSTEM Require of every package this wrapper finds "
+            f"the same way in {asker} and {other}")
+  mine, theirs = set(asked.split()), set(wanted.split())
+  narrower = asker if mine < theirs else other if theirs < mine else \
+    f"{asker} and {other}"
+  union = " ".join(sorted(mine | theirs))
+  return f"Widen Require({cmake} ... SYSTEM COMPONENTS {union}) in {narrower}"
+
+
+def _option_conflicts(conanfile) -> list[str]:
+  """Two recipes asking one host wrapper for different options: one wins
+  silently in conan, so each such pair is a refusal."""
+  refusals = []
+  for wrapper, requests in _wrapper_requests(conanfile).items():
+    used = {dependency.ref.name for dependency in
+            conanfile.dependencies[wrapper].dependencies.direct_host.values()}
+    views = [(asker, _request_view(options, used)) for asker, options in requests]
+    first = views[0]
+    for second in views[1:]:
+      if second[1] != first[1]:
+        refusals.append(
+          f"{wrapper}/system@host: {first[0]} asks components={first[1][0]!r} "
+          f"packages={first[1][1]!r}, {second[0]} asks "
+          f"components={second[1][0]!r} packages={second[1][1]!r}; one wrapper "
+          "serves the whole graph and an option holds one value. "
+          f"{_widen_advice(_cmake_name(wrapper, requests), first, second)}.")
+  return refusals
+
+
+def _refuse_foreign_copies(conanfile) -> None:
+  """Refuse a SYSTEM package not the host's, or below a pin it replaced."""
+  entries = _parse_requires(Path(conanfile.recipe_folder),
+                            str(conanfile.settings.os))
+  refusals = []
+  for entry in entries:
+    if not entry["system"] or not _in_graph(conanfile, entry):
       continue
-    # SYSTEM: the host provides it. find_package only, no conan graph
-    # entry -- asking conan for a recipe that does not exist fails the
-    # install outright, which is what made projects reach for a bare
-    # find_package that works only because this parser cannot see it.
-    if info["system"]:
-      continue
-    entries.append({
-      "conan_name": info["conan"] or name.lower(),
-      "version": _to_conan_version(version),
-      "test":  info["test"],
-      "bench": info["bench"],
-      "tool":  info["tool"],
-      "public": info["public"],
-      "options": info["options"],
-    })
-  return entries
+    refused, warned = _entry_findings(conanfile, entry)
+    refusals += refused
+    for line in warned:
+      conanfile.output.warning(line)
+  refusals += _option_conflicts(conanfile)
+  if refusals:
+    # ConanException, not ConanInvalidConfiguration: conan reports an invalid
+    # consumer only after building every dependency, this stops the graph.
+    raise ConanException("\n".join(refusals))
 
 
 class ProjectRecipe(ConanFile):
@@ -217,7 +253,8 @@ class ProjectRecipe(ConanFile):
     # exports ride WITH the recipe into the cache — the cached copy
     # still reads its [package] section and parses the Require() calls
     # at graph time (exports_sources only materialize for builds)
-    exports = ("buildutil.toml", "sources/CMakeLists.txt")
+    exports = ("buildutil.toml", "sources/CMakeLists.txt",
+               "buildutil_requires.py")
     # THE EXCLUSIONS ARE THE POINT OF THE SECOND LINE. sources/* goes in
     # wholesale, and conan hashes what it exports into the RECIPE
     # REVISION -- so one generated file that exists on one machine and
@@ -252,12 +289,12 @@ class ProjectRecipe(ConanFile):
     # has no such parent and would resolve a graph outside the driver's
     # profile/venv contracts
     if not os.environ.get("BUILDUTIL"):
-      from conan.errors import ConanInvalidConfiguration
       raise ConanInvalidConfiguration(
         "this project is controlled by buildutil — run `buildutil build` "
         "(conan is orchestrated: profile, CONAN_HOME and the dependency "
         "graph all come from the driver). If you really need direct "
         "conan, set BUILDUTIL=1 in the environment.")
+    _refuse_foreign_copies(self)
 
   def layout(self):
     cmake_layout(self)
@@ -270,40 +307,53 @@ class ProjectRecipe(ConanFile):
     CMakeDeps(self).generate()
 
   def requirements(self):
-    target_os = str(self.settings.os)
-    for entry in _parse_requires(Path(self.recipe_folder), target_os):
-      if entry["tool"]:
-        continue                       # build_requirements() owns these
-      ref = f"{entry['conan_name']}/{entry['version']}"
-      # OPTIONS ride the requires call itself (conan 2 supports it on
-      # every requires kind) rather than default_options: the option
-      # then follows the entry's own gating — a PLATFORM-skipped or
-      # SYSTEM dep never leaves a stray pattern behind.
-      kwargs = {"options": entry["options"]} if entry["options"] else {}
-      # PUBLIC: this dep's headers appear in headers this package
-      # exports, so consumers must see them too — conan does not
-      # propagate a static-lib requirement's headers by default, and
-      # every consumer of such a package failed to compile.
-      # transitive_libs stays derived (True for a static library).
-      if entry["public"]:
-        kwargs["transitive_headers"] = True
-      # BENCH deps follow the same test-only semantics as TEST: they
-      # only land when BUILD_BENCHMARKING is on, never propagate into
-      # the runtime graph. conan has no "bench_requires" so we fold
-      # them onto test_requires.
-      if entry["test"] or entry["bench"]:
-        if os.environ.get("@CMAKE_OPTION_PREFIX@_SKIP_TEST_DEPS") != "1":
-          self.test_requires(ref, **kwargs)   # --no-tests drops these
-      else:
-        self.requires(ref, **kwargs)
+    entries = _parse_requires(Path(self.recipe_folder), str(self.settings.os),
+                              not cross_building(self))
+    packages = " ".join(
+      f"{entry['cmake_name']}={entry['conan_name']}"
+      + (":" + ",".join(entry["components"]) if entry["components"] else "")
+      for entry in entries if entry["system"])
+    for entry in entries:
+      if not entry["tool"]:                # build_requirements() owns these
+        self._require(entry, packages)
+
+  def _require(self, entry: dict, packages: str) -> None:
+    """One Require() line as its conan requirement."""
+    # OPTIONS ride the requires call itself (conan 2 supports it on
+    # every requires kind) rather than default_options: the option
+    # then follows the entry's own gating — a PLATFORM-skipped or
+    # SYSTEM dep never leaves a stray pattern behind.
+    kwargs = {"options": entry["options"]} if entry["options"] else {}
+    # PUBLIC: this dep's headers appear in headers this package
+    # exports, so consumers must see them too — conan does not
+    # propagate a static-lib requirement's headers by default.
+    if entry["public"]:
+      kwargs["transitive_headers"] = True
+    # BENCH deps follow TEST's test-only semantics (conan has no
+    # bench_requires); a test-only SYSTEM overrides without entering the
+    # runtime graph.
+    if entry["test"] or entry["bench"]:
+      if os.environ.get("@CMAKE_OPTION_PREFIX@_SKIP_TEST_DEPS") != "1":
+        if entry["system"]:
+          self.requires(_wrapper_ref(Path(self.recipe_folder), entry),
+                        override=True)
+        else:
+          self.test_requires(entry["ref"], **kwargs)   # --no-tests drops these
+    elif entry["system"]:
+      kwargs["options"] = {"components": " ".join(entry["components"]),
+                           "packages": packages}
+      self.requires(_wrapper_ref(Path(self.recipe_folder), entry), force=True,
+                    **kwargs)
+    else:
+      self.requires(entry["ref"], **kwargs)
 
   def build_requirements(self):
     target_os = str(self.settings.os)
-    for entry in _parse_requires(Path(self.recipe_folder), target_os):
+    for entry in _parse_requires(Path(self.recipe_folder), target_os,
+                                 host_packages=False):
       if entry["tool"]:
         kwargs = {"options": entry["options"]} if entry["options"] else {}
-        self.tool_requires(
-          f"{entry['conan_name']}/{entry['version']}", **kwargs)
+        self.tool_requires(entry["ref"], **kwargs)
 
   # ---- packaging (active only with [package] in buildutil.toml) ----
   # The flow is export-pkg-based: `buildutil publish` (and the package
@@ -340,6 +390,7 @@ class ProjectRecipe(ConanFile):
           f' --build-dir "{self.build_folder}"'
           f' --toolchain "{toolchain}"'
           f' --build-type {self.settings.build_type}'
+          f' --package-version {self.version}'
           f' --linkage {"shared" if shared else "static"}',
           cwd=str(source))
       finally:
@@ -348,7 +399,6 @@ class ProjectRecipe(ConanFile):
         else:
           os.environ["PYTHONPATH"] = previous
       return
-    from conan.errors import ConanException
     # version/settings may be unset (tests, a bare export — settings is
     # still the class-level tuple until conan populates it); the story
     # is worth telling either way, with "?" for what is missing
@@ -399,76 +449,110 @@ class ProjectRecipe(ConanFile):
     if modules:
       self.cpp_info.set_property("cmake_build_modules", modules)
     if _PKG["kind"] == "application":
-      bindirs = sorted({
-        str(p.parent.relative_to(root)) for p in root.rglob("*")
-        if p.is_file() and os.access(p, os.X_OK)})
-      self.cpp_info.bindirs = bindirs or ["."]
-      self.cpp_info.libdirs = []
-      self.cpp_info.includedirs = []
+      self._application_info(root)
       return
-    # library: discover what the mirror actually shipped — libs by
-    # extension wherever they landed, headers under include/
-    libs, libdirs = set(), set()
-    for p in root.rglob("*"):
-      if not p.is_file():
-        continue
-      if p.suffix in (".a", ".lib") or p.suffix in (".so", ".dylib") \
-         or ".so." in p.name:
-        stem = p.name.split(".")[0]
-        libs.add(stem[3:] if stem.startswith("lib") else stem)
-        libdirs.add(str(p.parent.relative_to(root)))
-    # `[package] linkable = false`: what this package ships is loaded at
-    # run time, not linked -- libretro cores a front-end dlopens, plugins,
-    # a data-only payload. They keep their libdirs (that is where the
-    # loader is pointed) and advertise no link target, so a consumer
-    # spelling target_link_libraries against the package gets nothing on
-    # its link line instead of -l<the-thing-it-must-not-link>.
-    if not _PKG.get("linkable", True):
-      libs = set()
+    libs, libdirs = _shipped_libraries(root)
     incdirs = ["include"] if (root / "include").is_dir() else []
-    # COMPONENTS. A multi-module package lets a consumer link ONE module
-    # (<pkg>::<module>) instead of the whole package; conan keeps
-    # <pkg>::<pkg> as the aggregate that requires them all, so the coarse
-    # spelling never breaks. The graph comes from the manifest the build
-    # wrote — Link_dependencies is cmake and this recipe cannot see it.
-    manifest = root / "share" / "buildutil" / "buildutil-components.json"
-    comps = []
-    if manifest.is_file():
-      try:
-        comps = json.loads(manifest.read_text()).get("components", [])
-      except ValueError:
-        comps = []
+    components = _manifest_components(root)
     # one module is not worth componentising: the aggregate IS the module
-    if len(comps) > 1:
-      def _cname(path):
-        # sources/-relative path -> component name. Drop a leading element
-        # equal to the package name (sources/<pkg>/utilities -> utilities),
-        # so the target reads <pkg>::utilities rather than the stuttering
-        # <pkg>::<pkg>-utilities. A project without that level is
-        # unaffected. Nested modules keep their depth: net/http -> net-http.
-        parts = [x for x in path.split("/") if x]
-        if parts and parts[0] == self.name:
-          parts = parts[1:]
-        return "-".join(parts) or self.name
-      by_path = {c["path"]: _cname(c["path"]) for c in comps}
-      for c in comps:
-        name = by_path[c["path"]]
-        comp = self.cpp_info.components[name]
-        comp.libs = [c["lib"]] if c["lib"] in libs else []
-        comp.libdirs = sorted(libdirs) or ["lib"]
-        comp.includedirs = incdirs
-        reqs = [by_path[n] for n in c.get("needs", []) if n in by_path]
-        for ext in c.get("external", []):
-          # a conan target is pkg::comp; anything else is a system lib
-          if "::" in ext:
-            reqs.append(ext)
-          else:
-            comp.system_libs.append(ext)
-        comp.requires = reqs
+    if len(components) > 1:
+      self._component_info(components, libs, libdirs, incdirs)
       return
     self.cpp_info.libs = sorted(libs)
-    self.cpp_info.libdirs = sorted(libdirs) or ["lib"]
+    self.cpp_info.libdirs = libdirs
     self.cpp_info.includedirs = incdirs
+
+  def _application_info(self, root: Path) -> None:
+    """An application advertises the directories of its executables only."""
+    self.cpp_info.bindirs = sorted({
+      str(p.parent.relative_to(root)) for p in root.rglob("*")
+      if p.is_file() and os.access(p, os.X_OK)}) or ["."]
+    self.cpp_info.libdirs = []
+    self.cpp_info.includedirs = []
+
+  def _component_info(self, components: list[dict], libs: set[str],
+                       libdirs: list[str], incdirs: list[str]) -> None:
+    """One conan component per module, its requires from the manifest."""
+    by_path = {c["path"]: _component_name(c["path"], self.name)
+               for c in components}
+    linked = any(c.get("external") or c.get("host") for c in components)
+    targets = _linked_targets(self) if linked else {}
+    for c in components:
+      component = self.cpp_info.components[by_path[c["path"]]]
+      component.libs = [c["lib"]] if c["lib"] in libs else []
+      component.libdirs = libdirs
+      component.includedirs = incdirs
+      external = c.get("external", [])
+      component.requires = [by_path[n] for n in c.get("needs", [])
+                            if n in by_path] + self._external_requires(
+        c, targets) + self._host_requires(c, targets)
+      component.system_libs = [item for item in external
+                               if item not in targets and "::" not in item]
+
+  def _external_requires(self, component: dict,
+                         targets: dict[str, str]) -> list[str]:
+    """A component's namespaced links as the dependency components they are."""
+    namespaced = [t for t in component.get("external", [])
+                  if t in targets or "::" in t]
+    unresolved = [t for t in namespaced if t not in targets]
+    if unresolved:
+      raise ConanException(
+        f"{self.name}: module {component['path']} links {unresolved}, which "
+        "no direct dependency of this package declares as a cmake target; "
+        "Require the package that provides it.")
+    return [targets[t] for t in namespaced]
+
+  def _host_requires(self, component: dict,
+                     targets: dict[str, str]) -> list[str]:
+    """A component's host targets as the wrapper components declaring them;
+    a cross build forces no wrapper, so its targets are the target's own."""
+    if cross_building(self):
+      return []
+    unresolved = [t for t in component.get("host", []) if t not in targets]
+    if unresolved:
+      raise ConanException(
+        f"{self.name}: module {component['path']} links {unresolved}, which a "
+        "SYSTEM find imported and no host wrapper this package requires "
+        "declares; link the target of the package's own SYSTEM Require.")
+    return [targets[t] for t in component.get("host", [])]
+
+
+def _shipped_libraries(root: Path) -> tuple[set[str], list[str]]:
+  """The libraries the install mirror shipped, by extension, and their dirs."""
+  libs, libdirs = set(), set()
+  for p in root.rglob("*"):
+    if p.is_file() and (p.suffix in (".a", ".lib", ".so", ".dylib")
+                        or ".so." in p.name):
+      stem = p.name.split(".")[0]
+      libs.add(stem[3:] if stem.startswith("lib") else stem)
+      libdirs.add(str(p.parent.relative_to(root)))
+  # `[package] linkable = false`: what this package ships is loaded at
+  # run time, not linked (libretro cores, plugins, a data payload); it
+  # keeps its libdirs for the loader and advertises no link target.
+  if not _PKG.get("linkable", True):
+    libs = set()
+  return libs, sorted(libdirs) or ["lib"]
+
+
+def _manifest_components(root: Path) -> list[dict]:
+  """The module graph the build wrote; Link_dependencies is cmake and this
+  recipe cannot see it."""
+  manifest = root / "share" / "buildutil" / "buildutil-components.json"
+  if not manifest.is_file():
+    return []
+  try:
+    return json.loads(manifest.read_text()).get("components", [])
+  except ValueError:
+    return []
+
+
+def _component_name(path: str, package: str) -> str:
+  """sources/-relative path as a component: sources/<pkg>/net/http is
+  net-http, so the target reads <pkg>::net-http, not <pkg>::<pkg>-net-http."""
+  parts = [x for x in path.split("/") if x]
+  if parts and parts[0] == package:
+    parts = parts[1:]
+  return "-".join(parts) or package
 
 
 def _cmake_build_modules(root: Path, name: str) -> list[str]:

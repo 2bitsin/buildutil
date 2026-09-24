@@ -28,7 +28,9 @@ add_subdirectory(sources)
 `sources/CMakeLists.txt` holds the project's `Require(...)` declarations
 and one `Scan_subdirectories()`. The scaffolded `conanfile.py` re-parses
 that same file for its requirements, so a dependency and its version are
-written once.
+written once. It reads it through `buildutil_requires.py` beside it, the
+one Require() parser, which the driver also uses and rewrites whenever
+its own copy differs.
 
 Everything derived lives under a leading underscore and is gitignored:
 `_build/` (one tree per profile), `_install/` (the install mirror),
@@ -96,6 +98,7 @@ What a module builds is in its directory name:
 | `parser.lib/` | a static library (`.a` is a synonym; this is the default) |
 | `dip.so/` | a shared library (`.dll` and `.dylib` are synonyms) |
 | `dipapi.obj/` | an object-only module |
+| `rig.test/` | a test-lane module: support code for the suites |
 
 The tag is **never part of a name**: `sources/wd.exe/` is the module `wd`
 and ships a binary called `wd`. More than one kind tag is a configure
@@ -119,10 +122,142 @@ says "export everything" out loud — `WINDOWS_EXPORT_ALL_SYMBOLS` under
 MSVC, default visibility everywhere else. Both halves are settled at
 generate time, so no later flag can quietly take the visibility back.
 
+A `.test` module is what several suites share: fixtures, fakes, a headless
+client, gtest registrations. It builds when tests or benches build, links
+`GTest::gtest` itself (so `Require(... TEST)` packages are found in the
+bench lane too), and is linked from another module's `TEST` or `BENCH`
+group only; a positional link to it is a configure error naming both
+modules, whether spelled by leaf, full name or alias. Its own links are
+positional and may name test-only packages, because it is test lane
+already; a `TEST` or `BENCH` group in its own `Link_dependencies` is a
+configure error, since it has no suite for one to land in. It is an object
+module, so every object of it reaches each `-tests` and `-benches`
+executable that links it, directly or through other modules, and a
+registration nothing references still runs in every suite; the same sweep
+carries an ordinary `.obj` module into the suites. It has no suite of its
+own: a `*.test.cpp`, `*.bench.cpp`, `*.test/` or `*.bench/` subtree, a
+python suite, a `*.pybind.cpp` bridge or an `*.install/` tree inside it is
+refused by name, in every lane, and so is `Init_submodule(PUBLISH_SYMBOLS)`
+on it. It never ships: no archive, no header export, no entry in the package
+manifest. Its headers reach the suites at their `sources/`-relative spelling
+(`<sdl-rdp/headless-client.test/client.hpp>`). The tag is module-level only:
+a `*.test/` directory inside a module holding a `CMakeLists.txt`, or a
+`.test` group, reads two ways and is refused.
+
 A shared library can also be selected by presence: `main.so.cpp`,
 `main.dll.cpp` or `main.dylib.cpp` — the file holding `DllMain` or its
 equivalent, the way `main.cpp` selects an executable. `main.cpp` itself
 has no tagged spelling; the glob matches that name exactly.
+
+A shared library module's soname number is its `configure.py`'s
+`soversion()`, or else the package major (below), on every platform:
+`soversion(0, version="0.4.8")` gives `libX.so.0` and the full-version
+file `libX.so.0.4.8` it links to; without one the file is `libX.so.<major>`
+with the link `libX.so` beside it, and the install mirror ships the file
+and its links. A version fact lives beside what it describes, so there is
+no `buildutil.toml` key for it; a hook that declares one on a module that
+does not build as a shared library, or on a group, is refused.
+
+## Exporting symbols
+
+A shared module exports what its definitions mark and nothing else:
+
+```c
+#define SDLRDP_ABI_VERSION 7                               /* the ABI header, beside the prototypes */
+int sdlrdp_open(const sdlrdp_config*, sdlrdp_handle**);    /* the header stays plain C */
+auto _Public_() sdlrdp_open(sdlrdp_config const* c, sdlrdp_handle** h) -> int { ... }
+auto _Public_(SDLRDP_ABI_VERSION) sdlrdp_port(sdlrdp_handle const* h) -> uint16_t { ... }
+```
+
+`_Public_()` is the normal spelling: it exports the function at the
+package's semver major. The package version is the build identity's
+`package` field: the version `publish` builds as (`--version` included),
+the version conan builds a published recipe as, and for any other build
+the last reachable `x.y.z` tag; with no tag it is `0.0.0`, configure says
+so once, and `_Public_()` exports at 0, as it does for a version that is
+not semver (`publish --version dev`). Two clones of one commit build the
+same major. `_Public_(n)` exports at `n`, which after macro expansion is
+a decimal integer, zero or more with no leading zeros: a library that
+keeps its own ABI counter spells `_Public_(ABI_VERSION)`, one that pins
+an old function spells the old number.
+
+The mark goes on the **definition** of a function with external linkage,
+never on a prototype. `_Public_` is one name in a header buildutil
+force-includes into every C and C++ unit, and one name cannot tell a
+module's own units from a consumer's. It is default visibility with gcc
+and clang and `__declspec(dllexport)` under MSVC; a consumer calls the
+function without `dllimport`, which Windows allows for functions only.
+It also puts the function in the section `.text._Public_.<n>`, which is
+how the version reaches the link: the mark has no effect on code
+generation, and the linker merges the section into `.text`.
+
+On an ELF target, before a shared module links, buildutil reads its
+object files and those of the `.obj` modules it links directly, and
+every global or weak function in a mark section is an export at its
+version. A mark exports from the shared module that compiles the
+definition; a library module folded into it by static linkage exports
+nothing, because `--exclude-libs,ALL` hides its archive, and
+`module_linkage=shared` exports its marks from its own library. A module
+whose marks a shared module must re-export is declared `.obj`, whose
+objects the link takes whole. The link fails, naming the object and the
+symbol, on: a suffix that is neither empty nor such an integer
+(`_Public_(1.5)`, `_Public_(x)` with `x` undefined); a marked variable,
+thread-local or anything else that is not a function; a mark on a
+`static` or anonymous-namespace function, which is local; a mark section
+with no global function in it (ppc64 ELFv1, whose functions live in
+`.opd`); one symbol marked at two versions; and an LTO object without
+machine code, whose marks are not yet in any section. LTO
+(`CMAKE_INTERPROCEDURAL_OPTIMIZATION` or `-flto`) needs fat objects, so
+on ELF buildutil compiles every module with `-ffat-lto-objects` (gcc,
+clang 17 and later; without `-flto` it changes nothing); older clang
+emits bitcode, which fails naming the object. The marks become
+`<generated>/_buildutil/exports/<module>/exports.map`, one node
+`<OUTPUT_NAME>_<n>` per version, the library's output name upper-cased
+with every other character `_` (`libplug-in.so` gives `PLUG_IN_7`), each
+newer node inheriting the older, `local: *` in the oldest: nothing
+unmarked leaves the library, template instantiations of the standard
+library included. The node is what a consumer binds to, so renaming the
+output name renames every node and is an ABI break. The soname is the
+package major or the hook's `soversion()`, never a mark: a node above
+the soname is a symbol added since, as glibc's `GLIBC_2.34` lives in
+`libc.so.6`. A static module or package the library links never reaches
+its dynamic table: the link adds `--exclude-libs,ALL`.
+
+A package major bump moves every `_Public_()` symbol to the new node and
+the soname with it, so clients linked against the old one stop loading;
+a library that promises compatibility pins its existing functions with
+`_Public_(n)` at the bump.
+
+On macOS and Windows no scan runs: the ELF section name is not a valid
+Mach-O section name, so there the mark is visibility alone, and under
+Windows it is `dllexport`; either way the functions are unversioned and
+the soname number is the one rule above. The MSVC spelling
+(`code_seg(".text$_Public_.<n>")`) is not compiled by any lane of this
+repository's CI. An untagged module built shared by `module_linkage=shared`
+(which is what a conan `shared=True` build does) gets the header and no
+scan: its marks export by visibility only, unversioned, and it carries no
+soname, so `soversion()` is refused there as on any module that is not
+`main.<so|dll|dylib>.cpp` or `.so`.
+
+The package version the mark reads is also in `buildinfo.hpp`, which is
+included by hand ([options.md](options.md)):
+`<module_define_prefix>_PACKAGE_VERSION` (`"1.2.3"`) and
+`_PACKAGE_VERSION_MAJOR`, `_MINOR` and `_PATCH`, for a runtime check that
+two artifacts of one package agree on their ABI.
+`PUBLISH_SYMBOLS` stays for a plugin host resolving into its executable.
+
+A version script can also be written by hand: an `exports.map` beside
+`main.<so|dll|dylib>.cpp` or at the module root, or one the module's
+`configure.py` emits at a generated root (`emit("exports.map", ...)`).
+It replaces the generated one, and the library is then checked after
+the link: a marked function the script does not export fails the build
+naming the script and the symbol. Editing the script relinks.
+`PUBLISH_SYMBOLS` composes with it: the flag lifts hidden visibility, the
+script then decides which symbols the dynamic table keeps and under which
+node. ld64, link.exe and wasm-ld read no version script, so on macOS,
+Windows and Emscripten the library links without it and configure says
+so. An `exports.map` in a module that is not a shared library, or a
+checked-in one beside a hook-emitted one, is refused naming the files.
 
 ## Platform tags
 
@@ -192,7 +327,7 @@ and a platform tag goes **after** the suffix:
 
 | spelling | what it is |
 |---|---|
-| `*.test/` | every source under it is a test source for `<module>-tests` |
+| `*.test/` | every source under it is a test source for `<module>-tests`; a directory under `sources/` holding a `CMakeLists.txt` is a `.test` module instead (see Kind tags) |
 | `*.bench/` | likewise for `<module>-benches` |
 | `*.test/*.py` | a pytest suite registered as `<module>-pytest` |
 | `*.install/` | runtime data, shipped beside the binary |
@@ -297,12 +432,12 @@ An on-disk symlink not yet in git's index is a warning.
 
 | call | what it does |
 |---|---|
-| `Require(NAME [TEST\|BENCH\|TOOL\|SYSTEM] [PUBLIC] [VERSION v] [CONAN pkg] [COMPONENTS c...] [PLATFORM os...] [OPTIONS k=v...])` | declares an external dependency once |
+| `Require(NAME [TEST\|BENCH\|TOOL\|SYSTEM [FORCE]] [PUBLIC] [VERSION v] [CONAN pkg] [COMPONENTS c...] [PLATFORM os...] [OPTIONS k=v...])` | declares an external dependency once, in `sources/CMakeLists.txt` |
 | `Scan_subdirectories()` | computes the dormant set and scans for modules and groups |
-| `Init_submodule([PUBLISH_SYMBOLS])` | the whole presence-driven module |
+| `Init_submodule([PUBLISH_SYMBOLS] [STANDARD 20\|23\|26])` | the whole presence-driven module; `STANDARD` overrides `[project] cxx_standard` and reaches the module's library, its executable, its tests, its benches and its `*.pybind.cpp` bridge; an `Init_python_module()` module and its tests and benches take no `STANDARD` and follow the project's; targets an extension creates itself (watcom's ROM images) are not touched ([toolchains](toolchains.md#version-caps-and-the-c-standard)) |
 | `Init_python_module()` | the module builds as a python extension instead of a library |
 | `Init_script()` | installs the file named like the module as a program at the mirror |
-| `Link_dependencies(<dep>... [TEST <dep>...] [BENCH <dep>...])` | module and package dependencies |
+| `Link_dependencies(<dep>... [TEST <dep>...] [BENCH <dep>...] [RUNTIME <module>...])` | module and package dependencies |
 | `Add_generated_source(OUTPUT <rel> SCRIPT <path> [STAGE BUILD\|TEST\|BENCH\|DATA] [DEPENDS ...] [ARGS ...] [SIDE_OUTPUTS ...])` | registers a build-time generator |
 | `Resolve_generated_source(<rel> <out_var>)` | the patched copy where one was discovered, else the in-tree source |
 | `Init_firmware([LIBRARY] [OPROM] [BASE <hex>] [ORG <hex>])` | the watcom extension's raw 16-bit ROM image |
@@ -312,12 +447,36 @@ every conan install passes `--update`, so "fixed in x.y.z and my floor
 covers it" just works and a stale cached satisfier cannot masquerade as a
 broken fix. The floor is capped at the next major when it reaches conan,
 so a non-semver recipe version cannot sort above a real release.
-`SYSTEM` says the host provides the package: `find_package` still runs and
-nothing is asked of conan, and the directories of the shared libraries it
-found go on the app's install rpath so an installed binary starts with
-nothing in the environment. `TEST` and `BENCH` deps only materialise when
-tests or benches build, which is what makes `buildutil build --no-tests`
-drop GoogleTest from the graph entirely; `TOOL` deps are build tools, and
+`Require` lives only in `sources/CMakeLists.txt`, the one file the
+conanfile reads, once per NAME on a platform (a NAME split by
+`PLATFORM`, conan on one target and `SYSTEM` on another, is two lines).
+`SYSTEM` says the host's package wins over every conan pin of it
+anywhere in the graph: a `<conan>/system@host` wrapper is forced through
+the graph, travels to the consumers of a published package (see
+packaging.md, "Host packages in a published package"), and conan's copy
+is never installed. The project forces the wrapper at the revision this
+driver rendered, so `--update` cannot swap in one someone else
+published. `CONAN` names the conan package it replaces,
+`PUBLIC` is valid with it, and the host is refused before anything
+builds when it is below the floor or below any pin it replaced (at
+least the pin, same major); a requirement downstream that pins the
+package is refused by conan as a version conflict. `FORCE` waives the
+pin comparison, never the floor nor the conflict, and conan prints each
+waived pin once per conan install. A `SYSTEM` find reaches the host's
+own config or Find module, never conan's: `CMAKE_PREFIX_PATH`,
+`CMAKE_MODULE_PATH`, `CMAKE_LIBRARY_PATH`, `CMAKE_INCLUDE_PATH` and
+`CMAKE_PROGRAM_PATH` lose conan's generators folder and cache for that
+find, a `<NAME>_DIR` cached there is forgotten, and a target it imports
+from inside the conan cache is refused (the imported locations are
+checked, not the find's result variables). The wrapper's generated
+config serves conan dependants such as oxbox. The directories of the
+shared libraries the find imported go on the app's install rpath so an
+installed binary starts with nothing in the environment. A cross build
+forces no wrapper, since the probe would describe the build machine, and
+refuses a conan copy of the package in its graph; a package built so
+declares no host target (see packaging.md). `TEST` and `BENCH` deps only
+materialise when tests or benches build, which is what makes `buildutil
+build --no-tests` drop GoogleTest from the graph entirely; `TOOL` deps are build tools, and
 their bindir is handed to `find_program` and to a module's `configure.py`
 ahead of `PATH`. `COMPONENTS` tokens starting `+` or `-` are conan option
 shorthand and are stripped before `find_package`; `+x` together with `-x`,
@@ -328,7 +487,21 @@ rather than resolved by last-wins.
 library (INTERFACE if it is header-only), and its `TEST` and `BENCH`
 groups PRIVATE on the suite targets. Module names resolve to the library
 target, dormant names are dropped, and anything else passes through to
-cmake. There is no call for compile definitions and there will not be
+cmake. `RUNTIME` names sibling modules this one loads with `dlopen`
+rather than links: each must build as a shared library, and the loader
+(an application or a shared library) gets the loader-relative hop to the
+sibling's install mirror on its install rpath and the sibling's build
+directory on its build rpath, the way a linked sibling's are computed;
+an application's test and bench executables get the build rpath too,
+since the dynamic loader searches the rpath of the object calling
+`dlopen`, and in a test that object is the test executable.
+It adds no link, since a plugin that links its host would otherwise
+close a cycle; whatever runs the loader (its application, its test and
+bench executables) builds the sibling first. A sibling that does not
+build for the target platform is refused. Windows has no rpath, and
+configure warns that the DLL must sit beside the loading executable.
+
+There is no call for compile definitions and there will not be
 one: a constant belongs in the code, in a header the module already has,
 where a reader finds it and a debugger shows it. A value chosen per build
 is a different thing — see [options.md](options.md).

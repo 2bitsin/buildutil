@@ -83,6 +83,7 @@ def _configure(root, build):
   return subprocess.run(
     ["cmake", "-S", str(root), "-B", str(build), "-G", "Ninja",
      "-DBUILD_TESTING=ON",
+     "-DBUILDUTIL_PROFILE=x86_64-linux-gcc-release",
      f"-DBUILDUTIL_PY={sys.executable}",
      f"-DBUILDUTIL_PYSUPPORT={PYSUPPORT}"],
     capture_output=True, text=True)
@@ -141,9 +142,23 @@ def test_the_entry_is_what_a_module_suite_gets(tmp_path):
 
 @e2e
 def test_ctest_runs_the_declared_suite(tmp_path):
-  root = _project(tmp_path)
-  build = tmp_path / "b"
+  build = tmp_path / "build with spaces"
+  binary = build / "bin" / ("lane-probe.exe" if os.name == "nt" else "lane-probe")
+  root = _project(tmp_path, suite=SUITE + f"""
+import os
+import shutil
+
+
+def test_the_suite_receives_the_build_environment():
+  assert os.environ["BUILDUTIL_BUILD_DIR"] == {str(build)!r}
+  assert os.environ["BUILDUTIL_PROFILE"] == "x86_64-linux-gcc-release"
+  assert os.environ["PATH"].split(os.pathsep)[0] == {str(build / "bin")!r}
+  assert shutil.which("lane-probe") == {str(binary)!r}
+""")
   assert _configure(root, build).returncode == 0
+  binary.parent.mkdir(exist_ok=True)
+  binary.write_bytes(b"probe")
+  binary.chmod(0o755)
   run = subprocess.run(
     ["ctest", "--test-dir", str(build), "-R", "tools-pytest",
      "--output-on-failure"],

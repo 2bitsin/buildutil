@@ -59,6 +59,27 @@ def test_multiple_tags_are_refused():
     naming.kind_of("thing.lib.so")
 
 
+def test_a_test_lane_module_is_named_like_every_tagged_module():
+  parts = ("sdl-rdp", "headless-client.test")
+  assert naming.kind_of(parts[-1]) == ("headless-client", "test")
+  assert naming.module_name(parts) == "sdl-rdp-headless-client"
+  assert naming.app_name(parts) == "headless-client"
+  assert naming.mirror_parent(parts) == "sdl-rdp"
+
+
+@pytest.mark.parametrize("component", ["rig.obj.test", "rig.test.lib",
+                                       "rig.so.test"])
+def test_test_with_another_kind_tag_is_refused(component):
+  with pytest.raises(SystemExit):
+    naming.kind_of(component)
+
+
+@pytest.mark.parametrize("component", ["rig.linux.test", "rig.test.linux",
+                                       "rig.posix.test.linux"])
+def test_test_composes_with_platform_tags(component):
+  assert naming.kind_of(component) == ("rig", "test")
+
+
 def test_names_of_a_nested_tagged_module():
   parts = ("tools", "wd.exe")
   assert naming.module_name(parts) == "tools-wd"
@@ -181,7 +202,7 @@ def test_run_finds_a_nested_modules_installed_binary(tmp_path):
   installed.chmod(0o755)
   pkg_parent = Path(naming.__file__).resolve().parents[1]
   proc = subprocess.run(
-    [sys.executable, "-m", "buildutil", "--no-watchdog",
+    [sys.executable, "-m", "buildutil", "--i-am-willingly-circumventing-build-and-test-time-safeguards",
      "run", "--no-build", "--target", "testing-supa-full"],
     cwd=tmp_path, capture_output=True, text=True,
     env={**os.environ, "BUILDUTIL_SYSTEM": "1",

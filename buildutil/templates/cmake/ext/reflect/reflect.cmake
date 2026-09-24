@@ -123,14 +123,6 @@ function(_buildutil_reflect_kind_state variable out)
   endif()
 endfunction()
 
-function(_buildutil_reflect_std out)
-  if(CMAKE_CXX_STANDARD)
-    set(${out} "c++${CMAKE_CXX_STANDARD}" PARENT_SCOPE)
-  else()
-    set(${out} "c++23" PARENT_SCOPE)
-  endif()
-endfunction()
-
 # --- phase 1: configure -----------------------------------------------------
 
 function(_buildutil_ext_pre_scan)
@@ -216,7 +208,6 @@ function(_buildutil_ext_pre_scan)
   # one module target exists yet. Declaring the consumer before its producers
   # is fine: add_custom_target(DEPENDS) binds a file to the rule that makes it
   # at GENERATE time, and both ends land in this same directory.
-  _buildutil_reflect_std(std)
   set(outputs "")
   foreach(header IN LISTS headers)
     _buildutil_reflect_key("${header}" key)
@@ -241,7 +232,6 @@ function(_buildutil_ext_pre_scan)
   set_property(GLOBAL PROPERTY _buildutil_reflect_generated "${generated}")
   set_property(GLOBAL PROPERTY _buildutil_reflect_env "${env}")
   set_property(GLOBAL PROPERTY _buildutil_reflect_exe "${exe}")
-  set_property(GLOBAL PROPERTY _buildutil_reflect_std "${std}")
   set_property(GLOBAL PROPERTY _buildutil_reflect_macro_file "${macros}")
   cmake_language(DEFER DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
                  CALL _buildutil_reflect_emit_commands)
@@ -374,8 +364,17 @@ function(_buildutil_reflect_emit_commands)
   get_property(generated GLOBAL PROPERTY _buildutil_reflect_generated)
   get_property(env GLOBAL PROPERTY _buildutil_reflect_env)
   get_property(exe GLOBAL PROPERTY _buildutil_reflect_exe)
-  get_property(std GLOBAL PROPERTY _buildutil_reflect_std)
   get_property(macros GLOBAL PROPERTY _buildutil_reflect_macro_file)
+  get_property(options_header GLOBAL PROPERTY _buildutil_options_header)
+  set(force_include "")
+  if(options_header)
+    set(force_include --force-include "${options_header}")
+  endif()
+  # On the command line, so a changed standard reruns every parse.
+  set(std "")
+  if(BUILDUTIL_CXX_STANDARD)
+    set(std --std "c++${BUILDUTIL_CXX_STANDARD}")
+  endif()
 
   # A project's own macro file TEACHES the generator its spellings, so
   # editing it changes what every header means and every reflect file is
@@ -434,12 +433,12 @@ function(_buildutil_reflect_emit_commands)
               --depfile "${output}.d"
               --namespace "${_buildutil_reflect_namespace}"
               --macros "${macros}"
-              --std "${std}"
+              ${std}
               --include-spelling "${spelling}"
               --include-dir "${CMAKE_SOURCE_DIR}/sources"
               --include-dir "${generated}"
-              ${inherited} ${defined} ${defined_as_options}
-      DEPENDS "${header_abs}" ${macro_dep}
+              ${inherited} ${defined} ${defined_as_options} ${force_include}
+      DEPENDS "${header_abs}" ${macro_dep} ${options_header}
       DEPFILE "${output}.d"
       COMMENT "reflect ${spelling}"
       VERBATIM

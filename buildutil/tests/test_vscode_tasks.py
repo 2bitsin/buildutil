@@ -4,7 +4,7 @@ debug-info flavors, remembered prompt values, and an UPSERTED
 c_cpp_properties with the just-built profile on top."""
 import json
 import re
-from pathlib import PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -194,19 +194,107 @@ def test_every_prelaunch_task_exists(store):
 
 def test_cpp_upserts_and_promotes_active(tmp_path, monkeypatch):
   monkeypatch.setattr(vscode, "REPO_ROOT", tmp_path)
+  profiles = ["x86_64-linux-gcc-debug", "x86_64-linux-gcc-release"]
+  for profile in profiles:
+    database = tmp_path / "_build" / profile / "compile_commands.json"
+    database.parent.mkdir(parents=True)
+    database.write_text(json.dumps([{"arguments": ["g++", "-std=c++26"]}]))
+    (database.parent / "CMakeCache.txt").write_text(
+      "BUILDUTIL_CXX_STANDARD:INTERNAL=26\n")
   vsdir = tmp_path / ".vscode"
   vsdir.mkdir()
-  hand_added = {"name": "my-cross", "cppStandard": "c++20"}
+  old = {"name": profiles[0], "cppStandard": "c++20",
+         "compileCommands": f"${{workspaceFolder}}/_build/{profiles[0]}/compile_commands.json"}
   (vsdir / "c_cpp_properties.json").write_text(json.dumps(
-    {"version": 4, "configurations": [hand_added]}))
-  doc = vscode._cpp_document("x86_64-linux-gcc", "x86_64-linux-gcc-release")
-  names = [c["name"] for c in doc["configurations"]]
-  assert names[0] == "x86_64-linux-gcc-release"      # active on top
-  for flavor in ("debug", "relwithdebinfo"):
-    assert f"x86_64-linux-gcc-{flavor}" in names     # expected, pre-build
-  assert "my-cross" in names                         # upsert keeps others
-  assert doc["configurations"][0]["compileCommands"].endswith(
-    "_build/x86_64-linux-gcc-release/compile_commands.json")
+    {"version": 4, "configurations": [old]}))
+  doc = vscode._cpp_document("x86_64-linux-gcc", profiles[1])
+  assert [c["name"] for c in doc["configurations"]] == profiles[::-1]
+  assert all(c["cppStandard"] == "c++26" for c in doc["configurations"])
+
+
+def _configured(root: Path, profile: str, cache: str | None) -> None:
+  build = root / "_build" / profile
+  build.mkdir(parents=True)
+  (build / "compile_commands.json").write_text(
+    json.dumps([{"arguments": ["g++", "-std=c++26", "-c", "main.cpp"]}]))
+  if cache is not None:
+    (build / "CMakeCache.txt").write_text(cache)
+
+
+@pytest.mark.parametrize("entry,standard", [
+  ("BUILDUTIL_CXX_STANDARD:INTERNAL=23\n", "c++23"),
+  ("BUILDUTIL_CXX_STANDARD:INTERNAL=20\n", "c++20"),
+  ("CMAKE_CXX_STANDARD:STRING=26\nBUILDUTIL_CXX_STANDARD:INTERNAL=26\n", "c++26"),
+])
+def test_cpp_standard_is_the_one_the_build_resolved(tmp_path, monkeypatch,
+                                                    entry, standard):
+  """The compile line says -std=c++26; the resolved entry is what counts."""
+  monkeypatch.setattr(vscode, "REPO_ROOT", tmp_path)
+  _configured(tmp_path, "x86_64-linux-gcc-debug", entry)
+  config = vscode._cpp_configuration("x86_64-linux-gcc-debug")
+  assert config["cppStandard"] == standard
+
+
+@pytest.mark.parametrize("cache", [None, "BUILDUTIL_CXX_STANDARD:INTERNAL=\n",
+                                   "CMAKE_CXX_STANDARD:STRING=26\n"])
+def test_cpp_standard_is_omitted_when_the_build_resolved_none(
+    tmp_path, monkeypatch, cache):
+  monkeypatch.setattr(vscode, "REPO_ROOT", tmp_path)
+  _configured(tmp_path, "x86_64-linux-gcc-debug", cache)
+  assert "cppStandard" not in vscode._cpp_configuration("x86_64-linux-gcc-debug")
+
+
+@pytest.mark.parametrize("profile,driver,mode", [
+  ("x86_64-linux-gcc-debug", "g++", "linux-gcc-x64"),
+  ("armv8-macos-apple-clang-debug", "clang++", "macos-clang-arm64"),
+  ("x86_64-linux-gcc-debug", "clang++", "linux-clang-x64"),
+])
+def test_cpp_only_emits_profiles_with_databases(tmp_path, monkeypatch,
+                                               profile, driver, mode):
+  monkeypatch.setattr(vscode, "REPO_ROOT", tmp_path)
+  database = tmp_path / "_build" / profile / "compile_commands.json"
+  database.parent.mkdir(parents=True)
+  database.write_text(json.dumps([{"arguments": [driver, "-c", "main.cpp"]}]))
+  missing = "x86_64-linux-gcc-release"
+  (tmp_path / "_build" / missing).mkdir()
+  doc = vscode._cpp_document("x86_64-linux-gcc", missing)
+  assert len(doc["configurations"]) == 1
+  assert doc["configurations"][0]["name"] == profile
+  assert doc["configurations"][0]["intelliSenseMode"] == mode
+  assert vscode._cpp_configuration(missing) is None
+
+
+@pytest.mark.parametrize("external", [
+  "${workspaceFolder}/custom/compile_commands.json",
+  "/opt/cross/compile_commands.json",
+])
+def test_cpp_prunes_stale_databases_and_keeps_custom_entries(
+    tmp_path, monkeypatch, external):
+  monkeypatch.setattr(vscode, "REPO_ROOT", tmp_path)
+  vsdir = tmp_path / ".vscode"
+  vsdir.mkdir()
+  stale = {"name": "x86_64-linux-gcc-debug", "compileCommands":
+           "${workspaceFolder}/_build/x86_64-linux-gcc-debug/compile_commands.json"}
+  custom = {"name": "my-cross", "compileCommands": external}
+  manual = {"name": "manual", "cppStandard": "c++20"}
+  database = tmp_path / "_build" / "my-cross" / "compile_commands.json"
+  database.parent.mkdir(parents=True)
+  database.write_text(json.dumps([{"arguments": ["g++"]}]))
+  (vsdir / "c_cpp_properties.json").write_text(json.dumps(
+    {"version": 4, "configurations": [stale, custom, manual]}))
+  doc = vscode._cpp_document("x86_64-linux-gcc", stale["name"])
+  assert doc["configurations"] == [manual, custom]
+
+
+@pytest.mark.parametrize("profile,mode", [
+  ("armv8-macos-apple-clang-debug", "macos-clang-arm64"),
+  ("x86_64-windows-msvc-release", "windows-msvc-x64"),
+  ("x86_64-linux-gcc-debug", "linux-gcc-x64"),
+  ("aarch64-linux-clang-shared-relwithdebinfo", "linux-clang-arm64"),
+  ("my-cross", None),
+])
+def test_intellisense_mode_from_profile(profile, mode):
+  assert vscode._intellisense_mode(profile) == mode
 
 
 def test_record_roundtrip_including_empty(store):
@@ -236,7 +324,7 @@ def test_every_task_disarms_the_watchdog(store):
                      if "buildutil" in str(t.get("command", ""))]
   assert buildutil_tasks
   for t in buildutil_tasks:
-    assert "--no-watchdog" in t["args"], t["label"]
+    assert "--i-am-willingly-circumventing-build-and-test-time-safeguards" in t["args"], t["label"]
 
 
 def test_logging_tasks_clear_logs_themselves_with_no_shell_step(store):
@@ -397,3 +485,13 @@ def test_python_launch_falls_back_to_an_absolute_relocated_venv(store,
   monkeypatch.setattr(vscode, "VENV_PY", PurePosixPath("/opt/venv/bin/python"))
   doc = vscode._launch_document(MODS, "x86_64-linux-gcc")
   assert _python_config(doc)["python"] == "/opt/venv/bin/python"
+
+
+def test_relwithdebinfo_tasks_use_the_explicit_flag(store):
+  tasks = vscode._tasks_document(MODS, has_pytests=False)["tasks"]
+  selected = [task for task in tasks if "(relwithdebinfo)" in task["label"]]
+  assert selected
+  for task in selected:
+    assert "--relwithdebinfo" in task["args"]
+    assert "--release" not in task["args"]
+    assert "--debug" not in task["args"]

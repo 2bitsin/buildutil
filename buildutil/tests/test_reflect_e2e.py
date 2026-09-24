@@ -7,7 +7,9 @@ and per-parameter comments inside operator()'s argument list.
 """
 from __future__ import annotations
 
+import itertools
 import json
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -354,6 +356,32 @@ def _command_for(entries: list[dict], stem: str) -> str:
 
 
 # --- the whole point: a tagged type becomes a usable scheme -----------------
+
+def test_project_options_reach_the_reflect_parse(tmp_path):
+  root = _tree(tmp_path, reflect_cfg={"name": "reflectdemo",
+                                     "options": {"contracts": True}})
+  module = root / "sources" / "demo" / "thing"
+  (module / "thing.hpp").write_text("""\
+#pragma once
+#if ACME_CONTRACTS
+struct Options {
+  friend constexpr auto reflect_scheme(Options*);
+  int enabled;
+};
+#endif
+""")
+  (module / "thing.cpp").write_text("""\
+#include <demo/thing/thing.hpp>
+static_assert(ACME_CONTRACTS == 1);
+static_assert(reflect::scheme_size(reflect::scheme_of<Options>()) == 1);
+""")
+  done = _build(root)
+  assert done.returncode == 0, done.stdout + done.stderr
+  ninja = (root / "b" / "build.ninja").read_text()
+  rule = next(line for line in ninja.splitlines()
+              if line.startswith("build generated/demo/thing/thing.reflect.hpp "))
+  assert "generated/reflectdemo/options.hpp" in rule
+
 
 def test_a_tagged_header_produces_a_reflect_header(tmp_path):
   root = _tree(tmp_path)
@@ -1068,15 +1096,18 @@ def test_the_detour_wraps_the_real_header_and_takes_its_spelling(tmp_path):
   assert "#include <demo/base/options.hpp>" not in schemes
 
 
-def test_the_generated_root_comes_first_and_nothing_is_force_included(
-    tmp_path):
+def test_the_generated_root_comes_first_and_only_public_h_is_forced(tmp_path):
   root = _inherited(tmp_path)
   command = _command_for(_compile_commands(root), "command.cpp")
-  generated = str(root / "b" / "generated")
+  generated = root / "b" / "generated"
   sources = str(root / "sources")
-  assert command.index("-I" + generated) < command.index("-I" + sources), \
+  assert command.index(f"-I{generated}") < command.index("-I" + sources), \
     "sources/ answers before the generated root, so the detour never runs"
-  assert "-include" not in command and "/FI" not in command
+  words = shlex.split(command)
+  forced = [after for flag, after in itertools.pairwise(words)
+            if flag == "-include"]
+  assert forced == [str(generated / "_buildutil" / "public.h")]
+  assert not any(word.startswith("/FI") for word in words)
 
 
 def test_a_sibling_relative_include_is_refused_at_configure(tmp_path):

@@ -1493,7 +1493,8 @@ def parse_args(std: str, includes: list[str],
                resource: str | None, sdk: str | None = None,
                msvc: list[str] | None = None,
                defines: "list[str] | None" = None,
-               undefines: "list[str] | None" = None) -> list[str]:
+               undefines: "list[str] | None" = None,
+               force_includes: "list[str] | None" = None) -> list[str]:
   # -Wno-unknown-attributes: the buildutil:: attributes are unknown to clang
   # BY DESIGN, so warning about them here is guaranteed noise -- and this
   # parse's diagnostics exist to explain a shortfall, where that noise would
@@ -1514,6 +1515,8 @@ def parse_args(std: str, includes: list[str],
   # then fails a build over a type the parse was never shown.
   args += [f"-D{macro}" for macro in defines or []]
   args += [f"-U{macro}" for macro in undefines or []]
+  for path in force_includes or []:
+    args += ["-include", path]
   args += [f"-I{path}" for path in includes]
   return args
 
@@ -2918,6 +2921,30 @@ def shortfall(header: Path, entries: list, enums: list
   return promised, emitted, sorted(missing.elements())
 
 
+def stl_version_failure(ci, tu) -> str | None:
+  for diagnostic in tu.diagnostics:
+    matched = re.search(r"STL1000\b.*?expected Clang (\d+) or newer",
+                        diagnostic.spelling, re.DOTALL)
+    if not matched:
+      continue
+    required = matched.group(1)
+    library = ci.conf.lib
+    version = library.clang_getClangVersion
+    version.argtypes = []
+    version.restype = ci._CXString
+    banner = ci._CXString.from_result(version())
+    major = re.search(r"clang version (\d+)", banner)
+    path = diagnostic.location.file
+    return (
+      "buildutil reflect: the MSVC STL in {} requires Clang {} or newer; "
+      "the scan parses with libclang {} from {} (system libclang first, "
+      "then the bundled wheel). Install clang-{} or newer or point "
+      "BUILDUTIL_LIBCLANG at one.\n".format(
+        path.name if path else "<none>", required,
+        major.group(1) if major else "unknown", library._name, required))
+  return None
+
+
 def diagnostics(tu, limit: int = 25) -> list[str]:
   """Everything clang said at warning and above. They exist -- KeepGoing
   collects them -- and until now nothing ever printed them, which is exactly
@@ -3016,18 +3043,37 @@ def shortfall_message(header: Path, promised: list[str], emitted: list[str],
   return "\n".join(lines) + "\n"
 
 
+FALLBACK_STD = "c++23"
+
+
+def build_tree_std(output: Path) -> str:
+  """The standard of the build tree in the repo holding `output`, else FALLBACK_STD."""
+  from .config import REPO_ROOT, cmake_cache_entry  # config loads buildutil.toml
+  inside = (folder for folder in output.parents if folder.is_relative_to(REPO_ROOT))
+  caches = (folder / "CMakeCache.txt" for folder in inside)
+  entries = (cmake_cache_entry(cache, "BUILDUTIL_CXX_STANDARD")
+             for cache in caches if cache.is_file())
+  standard = next((entry for entry in entries if entry is not None), None)
+  return f"c++{standard}" if standard else FALLBACK_STD
+
+
 def _cmd_generate(opts) -> int:
   header = Path(opts.header).resolve()
-  output = Path(opts.output)
   includes = opts.include_dir or []
   try:
     ci, resource = load_clang()
   except ClangUnavailable as missing:
     sys.stderr.write("buildutil reflect: {}\n".format(missing))
     return 1
-  args = parse_args(opts.std, includes, resource, sdk_path(), msvc_args(),
-                    opts.define, opts.undefine)
+  std = opts.std or build_tree_std(Path(opts.output).resolve())
+  args = parse_args(std, includes, resource,
+                    sdk_path(), msvc_args(), opts.define, opts.undefine,
+                    opts.force_include)
   tu = parse(ci, header, args)
+  failure = stl_version_failure(ci, tu)
+  if failure:
+    sys.stderr.write(failure)
+    return 1
 
   try:
     macros = macro_spellings(macro_source(opts.macros))
@@ -3049,6 +3095,12 @@ def _cmd_generate(opts) -> int:
                                        diagnostics(tu)))
     return 1
 
+  return _write_generated(opts, header, tu, entries, enums)
+
+
+def _write_generated(opts, header, tu, entries, enums) -> int:
+  """Write the schemes, wrappers and dependency file from one parse."""
+  output = Path(opts.output)
   include_spelling = opts.include_spelling or header.name
   # A detoured reflect header is included one line below its own header and
   # must not name it again; a force-included one is the top of the TU and
@@ -3105,7 +3157,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="BUILD_BENCHMARKING, likewise for *.bench/")
   scan.set_defaults(func=_cmd_scan)
 
-  gen = sub.add_parser("generate", help="parse one header (build time)")
+  _generate_parser(sub)
+  opts = parser.parse_args(argv)
+  return opts.func(opts)
+
+
+def _generate_parser(sub) -> None:
+  """Register the build-time generation arguments."""
+  gen = sub.add_parser(
+    "generate", help="parse one header (build time)",
+    description="Parse one header; an MSVC STL version rejection names the "
+    "required Clang and selected libclang. Install the required clang or "
+    "set BUILDUTIL_LIBCLANG to a compatible library.")
   gen.add_argument("--header", required=True)
   gen.add_argument("--output", required=True)
   gen.add_argument("--detour", default="",
@@ -3118,15 +3181,15 @@ def main(argv: list[str] | None = None) -> int:
   gen.add_argument("--namespace", default="reflect")
   gen.add_argument("--macros", default=Macros.BUILTIN.value,
                    help="auto | none | path to the project's own macro file")
-  gen.add_argument("--std", default="c++23")
+  gen.add_argument("--std", default="",
+                   help="default: the output's build tree, else "
+                   + FALLBACK_STD)
   gen.add_argument("--include-dir", action="append")
   gen.add_argument("--define", action="append")
   gen.add_argument("--undefine", action="append")
+  gen.add_argument("--force-include", action="append")
   gen.add_argument("--include-spelling", default="")
   gen.set_defaults(func=_cmd_generate)
-
-  opts = parser.parse_args(argv)
-  return opts.func(opts)
 
 
 if __name__ == "__main__":                                  # pragma: no cover

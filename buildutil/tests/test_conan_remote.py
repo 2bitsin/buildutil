@@ -400,6 +400,85 @@ def test_the_build_upload_obeys_the_gate(clean_env, monkeypatch, capsys):
   monkeypatch.setattr(engine.subprocess, "check_call", lambda *a, **k: ran.append(a))
   monkeypatch.setattr(engine.subprocess, "run", lambda *a, **k: ran.append(a))
   monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
-  engine._upload_to_remote()
+  engine._upload_to_remote([])
   assert ran == []
   assert "skipping upload" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_dependency_upload_filters_and_merges_graphs(monkeypatch, tmp_path,
+                                                     configured):
+  from pathlib import Path
+  from types import SimpleNamespace
+  from buildutil import engine, packaging
+  uploaded = []
+  graphs = [tmp_path / "release.json", tmp_path / "debug.json"]
+  monkeypatch.setattr(bootstrap, "upload_target", lambda: ("site", ""))
+  monkeypatch.setattr(packaging, "configured", lambda: configured)
+  monkeypatch.setattr(packaging, "package_name", lambda: "own")
+  monkeypatch.setattr(engine.subprocess, "run",
+                      lambda *a, **k: SimpleNamespace(stdout="site:"))
+
+  def invoke(argv, **kwargs):
+    if argv[1] == "list":
+      assert "--graph-binaries=build" in argv
+      assert "--graph-binaries=cache" in argv
+      graph = next(a.split("=", 1)[1] for a in argv if a.startswith("--graph="))
+      output = next(a.split("=", 1)[1] for a in argv if a.startswith("--out-file="))
+      data = {"dep/1": {"revisions": {"r": {"packages": {
+        Path(graph).stem: {"revisions": {"p": {}}}}}}},
+        "own/1": {}, "own/2@buildutil/smoke": {}, "own-extra/1": {}}
+      Path(output).write_text(json.dumps({"Local Cache": data}))
+    else:
+      assert argv[:3] == ["conan", "upload", "--list"]
+      assert "*" not in argv
+      uploaded.append(json.loads(Path(argv[3]).read_text())["Local Cache"])
+
+  monkeypatch.setattr(engine.subprocess, "check_call", invoke)
+  engine._upload_to_remote(graphs)
+  assert set(uploaded[0]) == ({"dep/1", "own-extra/1"} if configured else
+                             {"dep/1", "own-extra/1", "own/1", "own/2@buildutil/smoke"})
+  assert set(uploaded[0]["dep/1"]["revisions"]["r"]["packages"]) == {"release", "debug"}
+
+
+def test_empty_dependency_list_skips_upload(monkeypatch, tmp_path, capsys):
+  from pathlib import Path
+  from buildutil import engine, packaging
+  monkeypatch.setattr(bootstrap, "upload_target", lambda: ("site", ""))
+  monkeypatch.setattr(packaging, "configured", lambda: True)
+  monkeypatch.setattr(packaging, "package_name", lambda: "own")
+
+  def invoke(argv, **kwargs):
+    assert argv[1] == "list"
+    output = next(a.split("=", 1)[1] for a in argv if a.startswith("--out-file="))
+    Path(output).write_text(json.dumps({"Local Cache": {"own/1": {}}}))
+
+  monkeypatch.setattr(engine.subprocess, "check_call", invoke)
+  engine._upload_to_remote([tmp_path / "graph.json"])
+  assert capsys.readouterr().out == "no dependency binaries to upload\n"
+
+
+def test_dependency_upload_self_heals_missing_remote(monkeypatch, tmp_path):
+  from pathlib import Path
+  from types import SimpleNamespace
+  from buildutil import engine, packaging
+  healed, uploaded = [], []
+  monkeypatch.setattr(bootstrap, "upload_target", lambda: ("site", ""))
+  monkeypatch.setattr(packaging, "configured", lambda: False)
+  monkeypatch.setattr(bootstrap, "ensure_conan_remote",
+                      lambda **k: healed.append(k))
+  monkeypatch.setattr(engine.subprocess, "run",
+                      lambda *a, **k: SimpleNamespace(stdout=""))
+
+  def invoke(argv):
+    if argv[1] == "list":
+      output = next(a.split("=", 1)[1] for a in argv if a.startswith("--out-file="))
+      Path(output).write_text(json.dumps({"Local Cache": {"dep/1": {}}}))
+    else:
+      assert healed == [{"force": True}]
+      uploaded.append(argv)
+
+  monkeypatch.setattr(engine.subprocess, "check_call", invoke)
+  engine._upload_to_remote([tmp_path / "graph.json"])
+  assert len(uploaded) == 1
+  assert uploaded[0][-3:] == ["-r", "site", "--confirm"]

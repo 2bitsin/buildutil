@@ -98,7 +98,7 @@ def test_emscripten_smoke(tmp_path):
              BUILDUTIL_SYSTEM="1", CONAN_HOME=str(tmp_path / "conan"),
              EM_CACHE=str(tmp_path / "em-cache"),
              CCACHE_DISABLE="1", EMCC_CORES="1")
-  command = [sys.executable, "-m", "buildutil", "--no-watchdog"]
+  command = [sys.executable, "-m", "buildutil", "--i-am-willingly-circumventing-build-and-test-time-safeguards"]
   subprocess.run(command + ["init", "--name", "wasmhello", "--no-package",
                             "--no-agents"], cwd=tmp_path, env=env,
                  stdin=subprocess.DEVNULL, check=True)

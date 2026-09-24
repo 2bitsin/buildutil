@@ -46,11 +46,11 @@ subcommand:
     buildutil [--jobs N] [--watchdog-budget SECONDS] <command> ...
 
 Keep the watchdog armed — it exists so an agent never hangs on a wedged
-build. (`--no-watchdog` is for interactive human use.)
+build. (`--i-am-willingly-circumventing-build-and-test-time-safeguards` is for interactive human use.)
 
 ## Commands
 
-    buildutil build [--release|--debug] [--target MODULE] [--no-tests]
+    buildutil build [--debug|--relwithdebinfo] [--target MODULE] [--no-tests]  # Release by default
     buildutil test  [--target MODULE] [-f FILTER]     # ctest/gtest filter
     buildutil bench [--target MODULE]                 # release, --include-bench builds
     buildutil run   --target NAME --args "..."        # build + install + exec
@@ -134,7 +134,7 @@ Structure is declared by directory shape, not by build-script logic:
 
 ## Declarations inside a module's CMakeLists
 
-- `Require(pkg VERSION "x.y" [TEST|BENCH|TOOL|SYSTEM|PUBLIC|CONAN name|
+- `Require(pkg VERSION "x.y" [TEST|BENCH|TOOL|SYSTEM [FORCE]|PUBLIC|CONAN name|
   COMPONENTS ...|PLATFORM ...|OPTIONS key=value ...])` in
   `sources/CMakeLists.txt` — the single source of truth for external
   deps; the conanfile parses the same calls. `OPTIONS` are conan
@@ -154,8 +154,25 @@ Structure is declared by directory shape, not by build-script logic:
   is no separate dependency declaration). Module names resolve to the
   right library targets; external targets (`GTest::gtest`) pass
   through. TEST/BENCH lists link only the test/bench executables.
+  RUNTIME lists sibling shared modules this one `dlopen`s: they go on
+  its install and build rpaths and build before its executables, never
+  on its link line.
 - `Init_submodule(PUBLISH_SYMBOLS)` — keep the app's symbols in the
   dynamic table (for hosts whose plugins resolve back into them).
+- The C++ standard is `[project] cxx_standard = 20|23|26` in
+  `buildutil.toml`, `Init_submodule(STANDARD n)` for one module; never
+  `set(CMAKE_CXX_STANDARD ...)`. Past the lane's compiler it is a
+  configure error, never a downgrade.
+- A shared module exports a function by marking its definition
+  `_Public_()` (at the package's semver major) or `_Public_(n)`; on ELF
+  the marks become one version node `<OUTPUT_NAME>_<n>` per n with
+  everything else local; functions only, never `static`; a mark in a
+  library module folded in statically exports nothing (declare it `.obj`
+  to re-export). LTO objects are built fat. The soname is the package major
+  unless `configure.py` declares `soversion(n, version="x.y.z")`.
+- `exports.map` beside `main.so.cpp`, or emitted by the module's
+  `configure.py`, replaces the generated version script (ELF) and must
+  export every mark.
 - Every live module announces `<PREFIX>_<NAME>_ENABLED=1` to all TUs.
 
 ## Generated sources

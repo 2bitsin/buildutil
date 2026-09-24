@@ -74,3 +74,12 @@ def test_the_retired_verbs_are_refused_when_invoked(project):
   for verb in ("scratch", "bench-gate"):
     proc = _run([verb], project)
     assert proc.returncode != 0, f"{verb} still dispatches"
+
+
+def test_test_help_names_release_as_the_default_profile(project):
+  proc = _run(["test", "--help"], project)
+  assert proc.returncode == 0, proc.stdout + proc.stderr
+  help_text = " ".join(proc.stdout.replace("│", " ").split())
+  assert "--release Optimized build (default)." in help_text
+  assert "--debug Debug build." in help_text
+  assert "inherit" not in help_text and "last build" not in help_text

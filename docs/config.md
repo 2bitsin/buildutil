@@ -17,12 +17,14 @@ vocabulary is a refusal too.
 | `name` | `"project"` | editor task labels, messages, the default resource module and namespace, the default bundle module |
 | `cmake_option_prefix` | `"BUILDUTIL"` | `-D<PREFIX>_COVERAGE`, `_GC_SECTIONS`, `_MAX_ERRORS`, `_SKIP_TEST_DEPS`, and the macros `[options]` generates |
 | `module_define_prefix` | `"MOD"` | the `<PREFIX>_<NAME>_ENABLED=1` defines, the `<PREFIX>_MODULE_DEFINES` list, and the coverage bridge variable |
+| `cxx_standard` | the lane's | the C++ standard of the project's own targets on every lane: `20`, `23` or `26`, anything else refused naming the three; a module overrides it with `Init_submodule(STANDARD n)` (see [toolchains](toolchains.md#version-caps-and-the-c-standard)) |
 
 ```toml
 [project]
 name = "bossdeux"
 cmake_option_prefix = "BOSSDEUX"
 module_define_prefix = "BDX"
+cxx_standard = 23
 ```
 
 ## `[options]`
@@ -42,6 +44,23 @@ max_depth = 32
 greeting = "hello"
 ```
 
+### `[optimize]`
+
+```toml
+[optimize]
+always = ["scene", "compositor"]
+```
+
+Named modules stay optimized in every profile: Debug adds `-O2` on GCC
+and Clang, or `/O2` on MSVC, while keeping debug information; other
+profiles retain their existing optimization flags. MSVC's `/RTC1` runtime
+checks are removed from these targets because they are incompatible with
+`/O2`. This keeps CPU-heavy rendering playable while debugging the VM or
+host. The default is an empty list. Names use buildutil's module naming
+(directory tags stripped, nested paths joined with `-`); unknown names
+are configuration errors. The setting applies privately to the module's
+library, executable, and test/bench targets, without affecting consumers.
+
 ## `[venv]` and `[buildutil]` and `[update]`
 
 | key | default | what it changes |
@@ -60,11 +79,15 @@ greeting = "hello"
 | `[modules.<name>] platforms` | all | target tags the module builds on; an empty list is dormant everywhere |
 | `[modules.<name>] frameworks` | — | Apple system frameworks the module links; inert off macOS |
 | `[modules.<name>] objc_arc` | `true` | `false` compiles that module's Objective-C and Objective-C++ without ARC |
-
 ```toml
 [modules.http]
 platforms = ["native"]   # Boost.Asio has no Emscripten transport
 ```
+
+A shared library's soname is not a `buildutil.toml` key: the module's
+`configure.py` declares it with `soversion(<n>, version="x.y.z")`
+([resources.md](resources.md)), and the old `[modules.<name>] soversion`
+and `version` keys are refused with a note saying so.
 
 ## `[conan]`
 
@@ -75,6 +98,9 @@ The project's dependency policy, appended to every generated profile.
 | `options` | `[]` | lines appended to the profile's `[options]` |
 | `options_linux`, `options_windows`, `options_macos`, `options_emscripten` | — | per-target variants, which win over the plain `options` on that target |
 | `conf` | `[]` | lines appended to the profile's `[conf]` |
+
+A host package replacing a conan pin is `Require(... SYSTEM)` in
+`sources/CMakeLists.txt`, never a `[conan]` entry.
 
 ```toml
 [conan]
@@ -88,6 +114,8 @@ conf = ["tools.build:jobs=25"]
 | key | default | what it changes |
 |---|---|---|
 | `[test] python` | `[]` | directories that are **not** modules and hold a pytest suite; each gets a `<dir>-pytest` ctest entry. Repo-relative, no `..`, and a directory with no test file in it fails the configure |
+| `[test] exclude_labels` | `[]` | list of literal labels excluded by the default `test` gate, escaped and anchored as `^(a\|b)$`. Applies only with no positional targets and no `--label-exclude`; explicit targets override it, and repeatable `--label-exclude` regexes replace it |
+| `[test] discovery_timeout` | `30` | positive integer seconds allowed for each GoogleTest binary to list its cases. Discovery runs at ctest time (`PRE_TEST`), so a slow listing cannot fail the build; this is separate from test execution timeouts |
 | `[test.timeout]` | `{}` | one entry per declared suite, `"<suite>" = <seconds>`, the wall clock that suite's ctest entry gets. A key that is not in `[test] python` is refused by name, and so is a value that is not a positive number |
 | `[bench] suite` | `""` | a python bench suite run as `python -m <suite>`; unset, `buildutil bench` runs the `*-benches` executables instead |
 | `[coverage] bridge_dirs` | `[]` | build directories of python bridges; the first one that exists is exported to pytest as `<module_define_prefix>_BRIDGE_DIR` |

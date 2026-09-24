@@ -45,6 +45,8 @@ def analyze(
   ),
   release: bool = typer.Option(False, "--release", help="Optimized build."),
   debug: bool = typer.Option(False, "--debug", help="Debug build (default)."),
+  relwithdebinfo: bool = typer.Option(
+    False, "--relwithdebinfo", help="Optimized build with debug info."),
   jobs: int = typer.Option(
     0, "--jobs", "-j",
     help="Parallel clang-tidy workers. 0 picks os.cpu_count().",
@@ -66,6 +68,8 @@ def analyze(
     typer.echo("buildutil analyze: Linux only.", err=True)
     raise typer.Exit(code=2)
 
+  build_type = _resolve_build_type(release, debug, relwithdebinfo,
+                                   default="Debug")
   _enter(conan_home)
 
   # clang-tidy is a clang frontend, so it must read a clang-built
@@ -76,7 +80,6 @@ def analyze(
   # tree. `--compiler` can still override it.
   _select_compiler(compiler, "clang")
 
-  build_type = _resolve_build_type(release, debug)
   settings = _detect_settings(build_type)
   build_dir = Path("_build") / _profile_name(settings)
   compdb = build_dir / "compile_commands.json"
@@ -85,7 +88,8 @@ def analyze(
   # generated headers on disk and every TU present in
   # compile_commands.json. A no-op ninja rebuild is cheap. install=False
   # leaves _install/ as the gcc build's.
-  _full_build(build_type, tests=True, upload=False, install=False)
+  _full_build(build_type, _profile_origin(release, debug, relwithdebinfo),
+              tests=True, upload=False, install=False)
 
   # Only run clang-tidy on TUs that are actually in compile_commands.json
   # — anything else (headers, platform-gated .cpp files, vendored code)

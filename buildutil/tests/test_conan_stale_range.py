@@ -30,17 +30,19 @@ def _record_install(monkeypatch):
 
 def test_install_passes_update_by_default(monkeypatch, tmp_path):
   calls = _record_install(monkeypatch)
-  engine._conan_install(tmp_path / "profile")
+  engine._conan_install(tmp_path / "profile", tmp_path / "build")
   assert len(calls) == 1
   assert "--update" in calls[0]
   assert "--build=missing" in calls[0]
+  assert "--format=json" in calls[0]
+  assert f"--out-file={tmp_path / 'build/conan-graph.json'}" in calls[0]
 
 
 def test_the_escape_hatch_env_keeps_the_resolve_local(monkeypatch,
                                                       tmp_path):
   calls = _record_install(monkeypatch)
   monkeypatch.setenv("BUILDUTIL_NO_CONAN_UPDATE", "1")
-  engine._conan_install(tmp_path / "profile")
+  engine._conan_install(tmp_path / "profile", tmp_path / "build")
   assert len(calls) == 1
   assert "--update" not in calls[0]
 

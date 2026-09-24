@@ -16,11 +16,9 @@ from buildutil import packaging
 
 @pytest.fixture
 def record(monkeypatch, tmp_path):
-  """Every configuration-shaped step publish takes, in order, with the
-  heavy seams silenced."""
   from buildutil.commands import publish as pub
-  seen = {"configured": [], "built": [], "exported": [], "tested": [],
-          "uploaded": [], "committed": 0}
+  seen = {"configured": [], "packaged_as": [], "built": [], "exported": [], "tested": [],
+          "uploaded": [], "graphs": [], "committed": 0}
 
   def commit():
     seen["committed"] += 1
@@ -28,15 +26,24 @@ def record(monkeypatch, tmp_path):
   for name in ("_enter", "_select_compiler", "_conan_install",
                "_upload_to_remote", "_status"):
     monkeypatch.setattr(pub, name, lambda *a, **k: None)
+  monkeypatch.setattr(pub, "_upload_to_remote",
+                      lambda graphs: seen["graphs"].extend(graphs))
   monkeypatch.setattr(pub, "_detect_settings", lambda bt: {"bt": bt})
   monkeypatch.setattr(pub, "_ensure_profile", lambda s: Path(s["bt"]))
   monkeypatch.setattr(pub, "_profile_name", lambda s: f"x-{s['bt']}".lower())
   monkeypatch.setattr(pub, "_host_build_profiles", lambda p: (p, p))
   monkeypatch.setattr(pub, "_cmake_configure",
-                      lambda d, bt, **k: seen["configured"].append(bt))
+                      lambda d, bt, **k: (seen["configured"].append(bt),
+                                          seen["packaged_as"].append(k["package"])))
   monkeypatch.setattr(pub, "_cmake_build",
                       lambda d, *a, **k: seen["built"].append(d.name))
   monkeypatch.setattr(pub, "REPO_ROOT", tmp_path)
+  _record_packaging(monkeypatch, seen, commit)
+  return seen
+
+
+def _record_packaging(monkeypatch, seen, commit):
+  seen["upload"] = packaging.upload
   monkeypatch.setattr(packaging, "configured", lambda: True)
   monkeypatch.setattr(packaging, "ranged_runtime_requires", lambda: [])
   monkeypatch.setattr(packaging, "resolve_version",
@@ -50,10 +57,9 @@ def record(monkeypatch, tmp_path):
                       lambda v, p, b, shared=False:
                       seen["tested"].append(str(p)))
   monkeypatch.setattr(packaging, "upload",
-                      lambda v: seen["uploaded"].append(v))
+                      lambda v, target_os: seen["uploaded"].append(v))
   monkeypatch.setattr(packaging, "ref", lambda v: f"s/{v}")
   monkeypatch.setenv("CONAN_REMOTE_URL", "https://repo.example/conan")
-  return seen
 
 
 def _publish(**overrides):
@@ -72,6 +78,12 @@ def test_both_configurations_are_published_by_default(record):
   assert record["exported"] == ["Release", "Debug"]
 
 
+def test_each_configuration_is_built_as_the_published_version(record):
+  """_Public_() exports at the major of the version the package ships as."""
+  _publish()
+  assert record["packaged_as"] == ["1.2.3.4", "1.2.3.4"]
+
+
 def test_the_package_test_runs_against_each_configuration(record):
   _publish()
   assert record["tested"] == ["Release", "Debug"]
@@ -81,6 +93,8 @@ def test_one_version_and_one_build_number_cover_both(record):
   _publish()
   assert record["uploaded"] == ["1.2.3.4"]
   assert record["committed"] == 1
+  assert record["graphs"] == [Path("_build") / f"x-{bt}" / "conan-graph.json"
+                              for bt in ("release", "debug")]
 
 
 def test_release_alone_when_asked(record, capsys):
@@ -105,3 +119,59 @@ def test_a_dry_run_covers_both_and_consumes_nothing(record):
   _publish(no_upload=True)
   assert record["exported"] == ["Release", "Debug"]
   assert record["uploaded"] == [] and record["committed"] == 0
+
+
+def test_publish_uploads_only_current_reference_and_dependencies(record,
+                                                                monkeypatch):
+  import json
+  from types import SimpleNamespace
+  from buildutil import bootstrap, engine
+  from buildutil.commands import publish as pub
+  uploads = []
+  monkeypatch.setattr(pub, "_upload_to_remote", engine._upload_to_remote)
+  monkeypatch.setattr(packaging, "package_name", lambda: "s")
+  monkeypatch.setattr(bootstrap, "upload_target", lambda: ("site", ""))
+  monkeypatch.setattr(engine.subprocess, "run",
+                      lambda *a, **k: SimpleNamespace(stdout="site:"))
+
+  def invoke(argv):
+    if argv[1] == "list":
+      output = next(a.split("=", 1)[1] for a in argv if a.startswith("--out-file="))
+      graph = next(a for a in argv if a.startswith("--graph="))
+      package_id = "debug" if "x-debug" in graph else "release"
+      data = {"s/1.2.3.3": {}, "s/1.2.3.4": {}, "dep/1": {
+        "revisions": {"r": {"packages": {package_id: {}}}}}}
+      Path(output).write_text(json.dumps({"Local Cache": data}))
+    elif argv[2] == "--list":
+      uploads.append(json.loads(Path(argv[3]).read_text())["Local Cache"])
+    else:
+      uploads.append(argv[2])
+
+  monkeypatch.setattr(engine.subprocess, "check_call", invoke)
+  monkeypatch.setattr(packaging, "upload",
+                      lambda v, target_os: record["upload"](v, target_os,
+                                                            run=invoke))
+  _publish()
+  assert uploads[0] == "s/1.2.3.4"
+  assert set(uploads[1]) == {"dep/1"}
+  assert set(uploads[1]["dep/1"]["revisions"]["r"]["packages"]) == {"release", "debug"}
+
+
+@pytest.mark.parametrize("flags", [["--relwithdebinfo"], ["--release", "--debug"]])
+def test_publish_relwithdebinfo_cli(record, flags):
+  from typer.testing import CliRunner
+  from buildutil.app import app
+  result = CliRunner().invoke(app, ["publish", *flags, "--no-upload"])
+  assert result.exit_code == 0, result.output
+  assert record["configured"] == ["RelWithDebInfo"]
+  assert record["built"] == ["x-relwithdebinfo"]
+
+
+@pytest.mark.parametrize("flag", ["--release", "--debug"])
+def test_publish_conflicting_profiles_are_usage_errors(record, flag):
+  from typer.testing import CliRunner
+  from buildutil.app import app
+  result = CliRunner().invoke(app, ["publish", "--relwithdebinfo", flag])
+  assert result.exit_code == 2, result.output
+  assert "cannot be combined" in result.output
+  assert not record["configured"]

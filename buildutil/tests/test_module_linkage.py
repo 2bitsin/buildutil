@@ -65,29 +65,41 @@ def test_profile_name_grows_the_axis_only_when_shared():
     "x86_64-linux-gcc-shared-release"
 
 
-def test_recipe_layout_agrees_with_the_driver(tmp_path, monkeypatch):
-  """The two-parsers gate: the scaffolded conanfile's _profile_name and
-  the engine's must produce the same directory for both linkages —
-  disagreement means export-pkg packages a tree nobody built."""
+def _recipe(tmp_path, monkeypatch):
+  """The scaffolded conanfile.py loaded over stub conan modules, which leave with the test."""
   import importlib.util
   import types
   for name, attrs in (("conan", {"ConanFile": object}),
                       ("conan.tools", {}),
+                      ("conan.errors", {
+                        "ConanException": type("ConanException", (Exception,), {}),
+                        "ConanInvalidConfiguration":
+                          type("ConanInvalidConfiguration", (Exception,), {})}),
+                      ("conan.tools.build", {"cross_building": lambda conanfile: False}),
+                      ("conan.tools.scm", {"Version": object}),
                       ("conan.tools.cmake", {"CMakeDeps": object,
                                              "CMakeToolchain": object,
                                              "cmake_layout": lambda *a: None})):
     mod = types.ModuleType(name)
     for k, v in attrs.items():
       setattr(mod, k, v)
-    sys.modules.setdefault(name, mod)
+    monkeypatch.setitem(sys.modules, name, mod)
   src = (Path(packaging.__file__).parent / "templates" / "project" /
          "conanfile.py").read_text().replace("@CONAN_NAME@", "x").replace(
            "@CMAKE_OPTION_PREFIX@", "X")
   cf = tmp_path / "conanfile.py"
   cf.write_text(src)
-  spec = importlib.util.spec_from_file_location("cf_linkage", cf)
+  spec = importlib.util.spec_from_file_location("cf_recipe", cf)
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
+  return mod
+
+
+def test_recipe_layout_agrees_with_the_driver(tmp_path, monkeypatch):
+  """The two-parsers gate: the scaffolded conanfile's _profile_name and
+  the engine's must produce the same directory for both linkages —
+  disagreement means export-pkg packages a tree nobody built."""
+  mod = _recipe(tmp_path, monkeypatch)
   from buildutil import engine
   settings = SimpleNamespace(arch="x86_64", os="Linux", compiler="gcc",
                              build_type="Release")
@@ -100,39 +112,15 @@ def test_recipe_layout_agrees_with_the_driver(tmp_path, monkeypatch):
 def test_recipe_reads_the_ini_when_no_env(tmp_path, monkeypatch):
   monkeypatch.delenv("BUILDUTIL_OPT_MODULE_LINKAGE", raising=False)
   configopts.save({"module_linkage": "shared"}, root=tmp_path)
-  # the recipe helper parses the same file
-  import importlib.util
-  import types
-  sys.modules.setdefault("conan", types.ModuleType("conan"))
-  setattr(sys.modules["conan"], "ConanFile", object)
-  src = (Path(packaging.__file__).parent / "templates" / "project" /
-         "conanfile.py").read_text().replace("@CONAN_NAME@", "x").replace(
-           "@CMAKE_OPTION_PREFIX@", "X")
-  cf = tmp_path / "conanfile.py"
-  cf.write_text(src)
-  spec = importlib.util.spec_from_file_location("cf_ini", cf)
-  mod = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(mod)
-  assert mod._module_linkage() == "shared"
+  assert _recipe(tmp_path, monkeypatch)._module_linkage() == "shared"
 
 
 # ------------------------------------- conan shared-option linkage --
 
-def test_library_recipe_declares_the_standard_shared_option(tmp_path):
-  import importlib.util
-  import types
-  sys.modules.setdefault("conan", types.ModuleType("conan"))
-  setattr(sys.modules["conan"], "ConanFile", object)
-  src = (Path(packaging.__file__).parent / "templates" / "project" /
-         "conanfile.py").read_text().replace("@CONAN_NAME@", "x").replace(
-           "@CMAKE_OPTION_PREFIX@", "X")
+def test_library_recipe_declares_the_standard_shared_option(tmp_path, monkeypatch):
   (tmp_path / "buildutil.toml").write_text(
     '[package]\nkind = "library"\nname = "s"\n')
-  cf = tmp_path / "conanfile.py"
-  cf.write_text(src)
-  spec = importlib.util.spec_from_file_location("cf_opt", cf)
-  mod = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(mod)
+  mod = _recipe(tmp_path, monkeypatch)
   assert mod.ProjectRecipe.options == {"shared": [True, False]}
   assert mod.ProjectRecipe.default_options == {"shared": False}
   assert mod.ProjectRecipe.package_type == "library"

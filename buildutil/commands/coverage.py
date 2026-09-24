@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 
 from ..app import (app, _compiler_option, _option_option,
+                   _no_parallel_option, _retired_parallel_option,
                    pytest_args_from_options)
 from ..config import MODULE_DEFINE_PREFIX, PROJECT
 from ..engine import *
@@ -26,14 +27,12 @@ def coverage(
     60.0, "--timeout",
     help="Per-test timeout (seconds).",
   ),
-  parallel: bool = typer.Option(
-    False, "--parallel",
-    help="Run ctest across multiple cores. OFF by default — serial is the "
-       "safety floor; the per-test --timeout still bounds a single hang.",
-  ),
+  no_parallel: bool = _no_parallel_option(),
+  retired_parallel: bool = _retired_parallel_option(),
   jobs: int = typer.Option(
     0, "--jobs", "-j",
-    help="Parallel job count when --parallel is set. 0 (default) = all cores.",
+    help="Parallel ctest workers. 0 (default) = 0.7 x the core count, at "
+         "least 1.",
   ),
   fail_under: float = typer.Option(
     0.0, "--fail-under",
@@ -107,7 +106,7 @@ def coverage(
   artifacts_dir = (Path("_build") / "coverage-artifacts").resolve()
   artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-  _conan_install(profile)
+  _conan_install(profile, build_dir)
   _cmake_configure(build_dir, "Debug", tests=True, bench=False,
                    coverage=True)
   _cmake_build(build_dir)
@@ -133,7 +132,7 @@ def coverage(
     ctest_cmd += ["-R", filter]
   if label:
     ctest_cmd += ["-L", label]
-  ctest_cmd += parallel_args(parallel, jobs)
+  ctest_cmd += parallel_args(no_parallel, jobs)
   subprocess.check_call(ctest_cmd)
 
   # A project's pytest suites may drive native code through a pybind

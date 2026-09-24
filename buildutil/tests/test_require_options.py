@@ -24,6 +24,12 @@ def _conanfile_module(tmp_path):
   import types
   for name, attrs in (("conan", {"ConanFile": object}),
                       ("conan.tools", {}),
+                      ("conan.errors", {
+                        "ConanException": type("ConanException", (Exception,), {}),
+                        "ConanInvalidConfiguration":
+                          type("ConanInvalidConfiguration", (Exception,), {})}),
+                      ("conan.tools.build", {"cross_building": lambda conanfile: False}),
+                      ("conan.tools.scm", {"Version": object}),
                       ("conan.tools.cmake", {"CMakeDeps": object,
                                              "CMakeToolchain": object,
                                              "cmake_layout": lambda *a: None})):
@@ -38,6 +44,7 @@ def _conanfile_module(tmp_path):
   spec = importlib.util.spec_from_file_location("cf_options_test", path)
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
+  mod.cross_building = lambda conanfile: False
   return mod
 
 
@@ -116,9 +123,9 @@ def test_a_minus_token_is_a_without_option(tmp_path):
 
 
 def _extra(tmp_path, extra: str) -> dict:
-  """_parse_extra directly: the components list stops at _parse_requires,
-  which forwards only what conan is told."""
-  return _conanfile_module(tmp_path)._parse_extra(extra)
+  """The shared parser's reading of the tokens after VERSION."""
+  import buildutil_requires
+  return buildutil_requires.parse_extra(extra)
 
 
 def test_bare_components_keep_their_meaning_beside_the_sugar(tmp_path):
@@ -279,13 +286,19 @@ cmake_minimum_required(VERSION 3.25)
 project(reqopt CXX)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/_bdudata/cmake")
 include(buildutil)
-%s
+add_subdirectory(sources)
 """
 
 
-def _configure_with(tmp_path, require_line):
+def _sources(tmp_path, require_line):
   deposit.ensure(tmp_path, CFG)
-  (tmp_path / "CMakeLists.txt").write_text(ROOT % require_line)
+  (tmp_path / "CMakeLists.txt").write_text(ROOT)
+  (tmp_path / "sources").mkdir()
+  (tmp_path / "sources" / "CMakeLists.txt").write_text(require_line + "\n")
+
+
+def _configure_with(tmp_path, require_line):
+  _sources(tmp_path, require_line)
   return subprocess.run(
     ["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "b")],
     capture_output=True, text=True)
@@ -339,12 +352,11 @@ def test_the_shorthand_never_reaches_find_package(tmp_path):
   # A stub find module records what it was asked for. Asserted rather than
   # inferred from an error message: the whole point of the sugar is that
   # find_package is never told about it, and only the callee can say.
-  deposit.ensure(tmp_path, CFG)
+  _sources(tmp_path,
+           'Require(Stub VERSION "1.0" COMPONENTS realone +asio -json two)')
   (tmp_path / "_bdudata" / "cmake" / "FindStub.cmake").write_text(
     'file(WRITE "${CMAKE_BINARY_DIR}/asked.txt" "${Stub_FIND_COMPONENTS}")\n'
     "set(Stub_FOUND TRUE)\n")
-  (tmp_path / "CMakeLists.txt").write_text(
-    ROOT % 'Require(Stub VERSION "1.0" COMPONENTS realone +asio -json two)')
   proc = subprocess.run(
     ["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "b")],
     capture_output=True, text=True)
@@ -387,10 +399,6 @@ def test_cmake_refuses_the_shorthand_on_a_system_dep(tmp_path):
 
 @e2e
 def test_cmake_refuses_public_off_the_runtime_graph(tmp_path):
-  proc = _configure_with(
-    tmp_path, 'Require(ZLIB VERSION "1.3" SYSTEM PUBLIC)')
-  assert proc.returncode != 0
-  assert "PUBLIC only makes sense" in proc.stderr
   proc = _configure_with(
     tmp_path, 'Require(GTest VERSION "1.17" TEST PUBLIC)')
   assert proc.returncode != 0

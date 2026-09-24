@@ -3,24 +3,27 @@ generation, the conan + cmake orchestration, IDE-config regen, and the shared
 run helpers. Pure build logic — no typer commands (those live in commands/)."""
 from __future__ import annotations
 
+import datetime
 import json
+import math
 import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
 import typer
 
-from . import config, modules
+from . import buildinfo, config, modules
 from . import options as _project_options
 from .config import (BDUDATA_DIR, BUILD_PID_FILE, CMAKE_PREFIX,
                      DEFAULT_CONAN_HOME, INSTALL_PREFIX,
                      MODULE_DEFINE_PREFIX, MODULES_INI, REPO_ROOT, VENV_PY,
-                     cmake_path)
+                     cmake_cache_entry, cmake_path)
 
 
 def _deposit_dir():
@@ -52,13 +55,18 @@ def _target_system() -> str:
 HERE = REPO_ROOT          # the name helper/command bodies use for the repo root
 
 
-def parallel_args(parallel: bool, jobs: int) -> list[str]:
-  """ctest --parallel args when opted in, else empty. Serial is the default
-  safety floor — a runaway test then stays isolated for the per-test --timeout
-  to kill, instead of an N-way storm pegging the box. jobs<=0 means all cores."""
-  if not parallel:
+CTEST_CORE_SHARE = 0.7          # user, 2026-09-24: the default parallel ctest
+
+
+def default_ctest_jobs() -> int:
+  return max(1, math.floor(CTEST_CORE_SHARE * (os.cpu_count() or 1)))
+
+
+def parallel_args(serial: bool, jobs: int) -> list[str]:
+  """ctest --parallel over `jobs` workers, the core share when <= 0; none if serial."""
+  if serial:
     return []
-  return ["--parallel", str(jobs if jobs > 0 else (os.cpu_count() or 1))]
+  return ["--parallel", str(jobs if jobs > 0 else default_ctest_jobs())]
 
 
 
@@ -582,13 +590,28 @@ def _osxcross_clang_version() -> str:
   return str(min(int(raw), _CONAN_KNOWN_MAX_VERSION["apple-clang"]))
 
 
+# The first major conan's cppstd table accepts 26 for (conan cppstd.py).
+_CPPSTD_26_FROM = {"gcc": 14, "clang": 17, "apple-clang": 16}
+
+
+def _lane_cppstd(compiler: str, version: str) -> str:
+  """The dependencies' standard; conan 2.x caps msvc at 23."""
+  if compiler == "msvc":
+    return "23"
+  if compiler not in _CPPSTD_26_FROM:
+    sys.exit(f"buildutil: no compiler.cppstd rule for compiler {compiler!r} "
+             f"(known: msvc, {', '.join(_CPPSTD_26_FROM)})")
+  return "26" if int(version) >= _CPPSTD_26_FROM[compiler] else "23"
+
+
 def _detect_settings(build_type: str) -> dict[str, str]:
   if _emscripten_live():
+    version = _emscripten_clang_version()
     return {
       "arch": "wasm", "os": "Emscripten", "compiler": "clang",
-      "compiler.version": _emscripten_clang_version(),
-      "compiler.cppstd": "26", "compiler.libcxx": "libc++",
-      "build_type": build_type,
+      "compiler.version": version,
+      "compiler.cppstd": _lane_cppstd("clang", version),
+      "compiler.libcxx": "libc++", "build_type": build_type,
     }
   arch_map = {"x86_64": "x86_64", "AMD64": "x86_64", "aarch64": "armv8",
               "arm64": "armv8"}   # macOS reports Apple Silicon as 'arm64'
@@ -596,12 +619,13 @@ def _detect_settings(build_type: str) -> dict[str, str]:
   if _wine_msvc_live():
     # the cross build: host settings say Windows/msvc exactly like the
     # real runner; the wrapped cl compiles, wine executes
+    version = _wine_msvc_version()
     return {
       "arch": "x86_64",
       "os": "Windows",
       "compiler": "msvc",
-      "compiler.version": _wine_msvc_version(),
-      "compiler.cppstd": "23",
+      "compiler.version": version,
+      "compiler.cppstd": _lane_cppstd("msvc", version),
       "compiler.runtime": "dynamic",
       "compiler.runtime_type": "Debug" if build_type == "Debug" else "Release",
       "build_type": build_type,
@@ -611,12 +635,13 @@ def _detect_settings(build_type: str) -> dict[str, str]:
     # like the M2, but the oa64-clang wrappers compile a real arm64 Mach-O on
     # Linux. No emulator exists to run mac binaries here, so this is a
     # release-BUILD lane only — the test suite stays on the Linux runner.
+    version = _osxcross_clang_version()
     return {
       "arch": "armv8",
       "os": "Macos",
       "compiler": "apple-clang",
-      "compiler.version": _osxcross_clang_version(),
-      "compiler.cppstd": "26",
+      "compiler.version": version,
+      "compiler.cppstd": _lane_cppstd("apple-clang", version),
       "compiler.libcxx": "libc++",
       "build_type": build_type,
     }
@@ -628,19 +653,7 @@ def _detect_settings(build_type: str) -> dict[str, str]:
   # is what makes platform.machine() report 'arm64' on Apple Silicon.
   arch = arch_map.get(platform.machine(), platform.machine())
 
-  # cppstd selection: we want 26 (so the project compiles at
-  # -std=c++2c). gcc/clang versions below 14 don't accept cppstd=26
-  # in conan's profile plugin yet, so fall back to 23 there — the
-  # cmake side promotes the project's own targets to /std:c++latest
-  # / -std=c++2c through buildutil.cmake either way, so the C++26
-  # features still light up where the actual compiler supports them.
-  # MSVC also stays at 23 (conan 2.x caps it there).
-  if compiler == "msvc":
-    cppstd = "23"
-  elif compiler in ("gcc", "clang") and int(compiler_version) < 14:
-    cppstd = "23"
-  else:
-    cppstd = "26"
+  cppstd = _lane_cppstd(compiler, compiler_version)
 
   settings = {
     "arch": arch,
@@ -873,12 +886,32 @@ def _ensure_profile(settings: dict[str, str]) -> Path:
 
 
 
-def _resolve_build_type(release: bool, debug: bool) -> str:
-  if release and debug:
+def _resolve_build_type(release: bool, debug: bool,
+                        relwithdebinfo: bool = False,
+                        default: str = "Release") -> str:
+  """The configuration the profile flags ask for, `default` when none is given."""
+  if relwithdebinfo and (release or debug):
+    raise typer.BadParameter("--relwithdebinfo cannot be combined with "
+                             "--release or --debug")
+  if relwithdebinfo or (release and debug):
     return "RelWithDebInfo"
   if release:
     return "Release"
-  return "Debug"
+  if debug:
+    return "Debug"
+  return default
+
+
+def _profile_origin(release: bool, debug: bool,
+                    relwithdebinfo: bool = False) -> str:
+  """What the profile line names as its source: the flags given, or `default`."""
+  flags = ("--release", "--debug", "--relwithdebinfo")
+  given = (release, debug, relwithdebinfo)
+  return " ".join(flag for flag, on in zip(flags, given) if on) or "default"
+
+
+def _profile_line(profile_name: str, origin: str) -> str:
+  return f"profile: {profile_name} ({origin}){_project_options.profile_note()}"
 
 
 
@@ -949,7 +982,7 @@ def _ensure_cross_build_profile() -> Path:
     [gcc, "-dumpfullversion", "-dumpversion"], text=True
   ).strip().split(".")[0]
   version = str(min(int(major), _CONAN_KNOWN_MAX_VERSION["gcc"]))
-  cppstd = "26" if int(version) >= 14 else "23"
+  cppstd = _lane_cppstd("gcc", version)
   profile.write_text(
     "[settings]\n"
     "os=Linux\narch=x86_64\nbuild_type=Release\n"
@@ -974,24 +1007,72 @@ def _host_build_profiles(profile: Path) -> tuple[Path, Path]:
   return profile, build_profile
 
 
-def _conan_install(profile: Path, tests: bool = True) -> None:
-  """Resolve dependencies for `profile` — WITH `--update` by default.
+def _conan_target_os() -> str:
+  """The target system as conan's os setting, which PLATFORM names."""
+  return {"Darwin": "Macos"}.get(_target_system(), _target_system())
 
-  Without --update, conan resolves version ranges against the local
-  cache first and never re-checks the remote for a range something
-  cached already satisfies. That served stale versions three times in
-  one night: a dependency published 0.3.0.1 Release-only, a cached copy
-  satisfied `>=0.3`, and Debug builds kept failing long after 0.3.0.2
-  shipped the fix — the miss looked like the fix not working.
 
-  Owner ruling (2026-08-19): the common situation is the default —
-  ranges always resolve against the remote, so "fixed in X.Y.Z, floor
-  covers it" just works. The site registry is a network-local caching
-  proxy, so reachability is not a real cost. The EXCEPTION gets the
-  switch: the global `--no-conan-update` (env BUILDUTIL_NO_CONAN_UPDATE,
-  set by the root callback) skips --update for offline / frozen-cache
-  work.
-  """
+def _refuse_pre_host_conanfile(root: Path) -> None:
+  from . import packaging
+  recipe = root / "conanfile.py"
+  if recipe.is_file() and not packaging.knows_host_requires(recipe.read_text()):
+    raise SystemExit(
+      "buildutil: sources/CMakeLists.txt has a Require(... SYSTEM), and this "
+      "project's conanfile.py predates host packages: it would leave conan's "
+      "copy of that package in the graph beside the host's. Run `buildutil "
+      "init` to regenerate it (the old recipe is kept as conanfile.py.bak).")
+
+
+def _refresh_requires_parser(root: Path) -> None:
+  """Keep the Require() parser beside conanfile.py this driver's own."""
+  from . import packaging
+  recipe, copy = root / "conanfile.py", root / packaging.REQUIRES_PARSER.name
+  if not recipe.is_file() or not packaging.knows_host_requires(
+      recipe.read_text()):
+    return
+  text = packaging.REQUIRES_PARSER.read_text(encoding="utf-8")
+  if copy.is_file() and copy.read_text(encoding="utf-8") == text:
+    return
+  copy.write_text(text, encoding="utf-8")
+  print(f"buildutil: wrote {copy.name}, the Require() parser conanfile.py "
+        "imports; commit it", flush=True)
+
+
+def _cached_wrapper_revisions() -> set[str]:
+  """Every <ref>#<rrev> of a system@host recipe in CONAN_HOME."""
+  listed = subprocess.run(["conan", "list", "*/system@host#*", "--format=json"],
+                          capture_output=True, text=True, check=True)
+  cache = json.loads(listed.stdout).get("Local Cache", {})
+  return {f"{ref}#{revision}" for ref, entry in cache.items()
+          for revision in entry.get("revisions", {})}
+
+
+def _export_host_wrappers() -> None:
+  """Export each SYSTEM Require's system@host recipe the cache lacks."""
+  from . import deposit, packaging
+  hosts = packaging.host_requires(target_os=_conan_target_os())
+  if not hosts:
+    return
+  root = config.REPO_ROOT
+  _refuse_pre_host_conanfile(root)
+  parser = packaging.requires_parser()
+  cached = _cached_wrapper_revisions()
+  for host in {host["conan_name"]: host for host in hosts}.values():
+    recipe = parser.wrapper_recipe(root, host["conan_name"])
+    deposit.render_host_wrapper(recipe.parent, host["cmake_name"])
+    revision = parser.recipe_revision(recipe.read_bytes())
+    if f"{host['ref']}#{revision}" not in cached:
+      subprocess.check_call(["conan", "export", str(recipe.parent), "--name",
+                             host["conan_name"], "--version", "system",
+                             "--user", "host"])
+
+
+def _conan_install(profile: Path, build_dir: Path, tests: bool = True) -> None:
+  """--update avoids stale ranges: a cached copy satisfied a range long after
+  the fix shipped, leaving Debug builds failing. Owner ruling (2026-08-19):
+  ranges resolve against the remote by default; --no-conan-update /
+  BUILDUTIL_NO_CONAN_UPDATE is the exception for offline / frozen-cache work."""
+  build_dir.mkdir(parents=True, exist_ok=True)
   _, build_profile = _host_build_profiles(profile)
   env = dict(os.environ)
   if not tests:
@@ -1001,10 +1082,13 @@ def _conan_install(profile: Path, tests: bool = True) -> None:
     "conan", "install", ".",
     f"--profile:host={profile}",
     f"--profile:build={build_profile}",
-    "--build=missing",
+    "--build=missing", "--format=json",
+    f"--out-file={build_dir / 'conan-graph.json'}",
   ]
   if not os.environ.get("BUILDUTIL_NO_CONAN_UPDATE"):
     argv.append("--update")
+  _refresh_requires_parser(config.REPO_ROOT)
+  _export_host_wrappers()
   subprocess.check_call(argv, env=env)
 
 
@@ -1077,14 +1161,6 @@ def _ccache_launcher_args() -> list[str]:
           for lang in languages]
 
 
-_CACHED_TOOLCHAIN = re.compile(r"(?m)^CMAKE_TOOLCHAIN_FILE:[^=]*=(.*)$")
-
-
-def _cached_toolchain(cmake_cache: Path) -> str | None:
-  match = _CACHED_TOOLCHAIN.search(cmake_cache.read_text(errors="replace"))
-  return match.group(1).strip() if match else None
-
-
 def _drop_unusable_cache(build_dir: Path, toolchain: Path,
                          toolchain_text: str) -> bool:
   """Whether cmake will see this as a FIRST configure, dropping what it
@@ -1101,7 +1177,8 @@ def _drop_unusable_cache(build_dir: Path, toolchain: Path,
   cmake_cache = build_dir / "CMakeCache.txt"
   if not cmake_cache.exists():
     return True
-  if _cached_toolchain(cmake_cache) != cmake_path(toolchain):
+  cached = cmake_cache_entry(cmake_cache, "CMAKE_TOOLCHAIN_FILE")
+  if cached != cmake_path(toolchain):
     cmake_cache.unlink()
     shutil.rmtree(build_dir / "CMakeFiles", ignore_errors=True)
     return True
@@ -1145,7 +1222,8 @@ def _osxcross_configure_args() -> list[str]:
 
 def _cmake_configure(build_dir: Path, build_type: str, *,
                      tests: bool, bench: bool,
-                     coverage: bool = False, gc_sections: bool = False) -> None:
+                     coverage: bool = False, gc_sections: bool = False,
+                     package: str = "") -> None:
   """Configure build_dir directly against the conan toolchain.
 
   Not `cmake --preset`: conan names every preset `conan-<build_type>`,
@@ -1157,7 +1235,7 @@ def _cmake_configure(build_dir: Path, build_type: str, *,
   Every build-shaping option is passed explicitly so a re-configure
   of a shared dir (coverage vs plain build, say) can't inherit a
   stale cached value."""
-  _stamp_build_info()
+  _stamp_build_info(package)
   toolchain = (build_dir / "generators" / "conan_toolchain.cmake").resolve()
   stamp = build_dir / ".buildutil-toolchain.stamp"
   toolchain_text = toolchain.read_text() if toolchain.exists() else ""
@@ -1217,6 +1295,7 @@ def _cmake_configure(build_dir: Path, build_type: str, *,
     # gitignored runtime dir, cmake finds them via MODULE_PATH, and
     # the python halves are called out of THIS interpreter's package
     f"-DCMAKE_MODULE_PATH={cmake_path(_deposit_dir())}",
+    f"-DBUILDUTIL_PROFILE={build_dir.name}",
     f"-DBUILDUTIL_PY={cmake_path(sys.executable)}",
     f"-DBUILDUTIL_PYSUPPORT="
     f"{cmake_path(Path(__file__).resolve().parent / 'pysupport')}",
@@ -1395,28 +1474,6 @@ def _cmake_build(build_dir: Path, targets: list[str] | None = None,
 
 
 
-LAST_BUILD_TYPE_FILE = Path("_build") / ".last-build-type"
-
-
-def _record_last_build_type(build_type: str) -> None:
-  """Remember which configuration was last built, so `test` can follow it
-  instead of silently choosing its own."""
-  try:
-    LAST_BUILD_TYPE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LAST_BUILD_TYPE_FILE.write_text(build_type + "\n", encoding="utf-8")
-  except OSError:
-    pass          # a stamp we cannot write is not worth failing a build over
-
-
-def last_build_type() -> str | None:
-  """The configuration `build` last acted on, or None if it never has."""
-  try:
-    value = LAST_BUILD_TYPE_FILE.read_text(encoding="utf-8").strip()
-  except OSError:
-    return None
-  return value if value in ("Debug", "Release", "RelWithDebInfo") else None
-
-
 def _warn_dependency_upload_skipped(skipped: bool) -> None:
   if skipped:
     print(
@@ -1429,46 +1486,57 @@ def _warn_dependency_upload_skipped(skipped: bool) -> None:
       file=sys.stderr)
 
 
-def _stamp_build_info() -> None:
-  """Autoincrement the local build number and record the commit alongside.
-  _bdudata/buildinfo.json is there for a project's version codegen to
-  declare as an input — writing it re-runs that codegen next configure."""
+def _git_says(*args: str) -> str | None:
+  """git's answer about this tree, stripped, or None when it cannot say."""
+  try:
+    asked = subprocess.run(["git", *args], capture_output=True, text=True,
+                           cwd=REPO_ROOT)
+  except OSError:
+    return None                                            # no git at all
+  return asked.stdout.strip() if asked.returncode == 0 else None
+
+
+def _build_identity() -> dict:
+  """The commit this build is of, however much of it git will say."""
+  commit = _git_says("rev-parse", "--short", "HEAD")
+  if commit is None:
+    return {field: buildinfo.NEUTRAL[field]
+            for field in ("commit", "dirty", "version", "tag")}
+  return {"commit": commit,
+          "dirty": bool(_git_says("status", "--porcelain", "-uno")),
+          # an exact tag gives v1.2.3, a later commit v1.2.3-5-gabcdef,
+          # no tag the short hash, and a dirty tree the -dirty suffix
+          "version": _git_says("describe", "--tags", "--always",
+                               "--dirty") or commit,
+          "tag": _git_says("describe", "--tags", "--exact-match") or ""}
+
+
+def _stamp_build_info(package: str = "") -> None:
+  """Autoincrement the local build number and record the identity alongside.
+  _bdudata/buildinfo.json is what the rendered cmake reads for the build
+  identity, and what a project's version codegen may declare as an input.
+  package is the version publish builds as; a plain build takes the tag."""
   BDUDATA_DIR.mkdir(exist_ok=True)
   counter = BDUDATA_DIR / "buildnum"
   number = (int(counter.read_text().strip() or "0") + 1
             if counter.exists() else 1)
   counter.write_text(f"{number}\n")
-  commit, dirty = "unknown", False
-  try:
-    described = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                               capture_output=True, text=True, cwd=REPO_ROOT)
-    if described.returncode == 0:
-      commit = described.stdout.strip()
-      status = subprocess.run(["git", "status", "--porcelain", "-uno"],
-                              capture_output=True, text=True, cwd=REPO_ROOT)
-      dirty = status.returncode == 0 and status.stdout.strip() != ""
-  except OSError:
-    pass                                       # no git: stays "unknown"
+  stamped = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%MZ")
+  from . import packaging
   (BDUDATA_DIR / "buildinfo.json").write_text(json.dumps(
-    {"number": number, "commit": commit, "dirty": dirty}) + "\n")
+    {"number": number, **_build_identity(), "time": stamped,
+     "package": package or packaging.tag_version(REPO_ROOT)}) + "\n")
 
 
-def _full_build(build_type: str, tests: bool = True, upload: bool = True,
-                bench: bool = False, install: bool = True,
+def _full_build(build_type: str, origin: str, tests: bool = True,
+                upload: bool = True, bench: bool = False, install: bool = True,
                 targets: list[str] | None = None,
                 gc_sections: bool = False) -> None:
   settings = _detect_settings(build_type)
   profile = _ensure_profile(settings)
   build_dir = Path("_build") / _profile_name(settings)
-  # Say which tree this is acting on, and record it for `test`. The two
-  # commands are used as a pair (`build && test`) but defaulted
-  # differently -- build to Debug, test to Release -- and neither said
-  # so, so a fix could land in one tree while the suite ran the other.
-  # Recorded BEFORE the build, not after: if the build fails, a `test`
-  # run next should still be looking at the tree you were working in.
-  _record_last_build_type(build_type)
-  print(f"profile: {_profile_name(settings)}{_project_options.profile_note()}")
-  _conan_install(profile, tests=tests)
+  print(_profile_line(build_dir.name, origin))
+  _conan_install(profile, build_dir, tests=tests)
   _cmake_configure(build_dir, build_type, tests=tests, bench=bench,
                    gc_sections=gc_sections)
   _cmake_build(build_dir, targets, gc_sections=gc_sections)
@@ -1477,7 +1545,7 @@ def _full_build(build_type: str, tests: bool = True, upload: bool = True,
   if install and not targets:
     _install_tree(build_dir, tests=tests, bench=bench)
   if upload and not targets:
-    _upload_to_remote()
+    _upload_to_remote([build_dir / "conan-graph.json"])
 
 
 
@@ -1496,31 +1564,55 @@ def _install_tree(build_dir: Path, *, tests: bool, bench: bool) -> None:
     subprocess.check_call(install + ["--component", component])
 
 
-def _upload_to_remote() -> None:
-  """Push every package in the local conan cache to the project remote.
+def _merge_package_lists(target: dict, source: dict) -> None:
+  for key, value in source.items():
+    if isinstance(value, dict):
+      _merge_package_lists(target.setdefault(key, {}), value)
+    else:
+      target[key] = value
 
-  Default behaviour for every build-triggering subcommand, gated by
-  what the remote seam can actually do (bootstrap.upload_target):
-  no URL, an anonymous remote or a login the server refused all skip
-  with a one-line note rather than failing the build at the server.
-  """
+
+def _dependency_package_list(graphs: list[Path], scratch: Path) -> dict:
+  from . import packaging
+  packages = {}
+  for graph in graphs:
+    output = scratch / "graph-packages.json"
+    subprocess.check_call([
+      "conan", "list", f"--graph={graph}", "--graph-binaries=build",
+      "--graph-binaries=cache", "--format=json", f"--out-file={output}"])
+    _merge_package_lists(packages, json.loads(output.read_text())["Local Cache"])
+  if packaging.configured():
+    own_name = packaging.package_name()
+    packages = {ref: data for ref, data in packages.items()
+                if ref.split("/", 1)[0] != own_name}
+  return packages
+
+
+def _upload_to_remote(graphs: list[Path]) -> None:
+  """Upload resolved dependency binaries, excluding the project's package."""
   from . import bootstrap
   name, note = bootstrap.upload_target()
   if not name:
     print(note, flush=True)
     return
-  # self-heal a vanished remote: the registration lives in CONAN_HOME,
-  # and a retried CI job can start on a cache the pipeline's cleanup
-  # already dropped — 'Remote doesn't exist' killed exactly such a
-  # retry. Registration is idempotent and reads the same env.
-  probe = subprocess.run(
-    ["conan", "remote", "list"], capture_output=True, text=True)
-  if f"{name}:" not in probe.stdout:
-    print(f"conan remote {name!r} not registered — re-registering",
-          flush=True)
-    bootstrap.ensure_conan_remote(force=True)
-  subprocess.check_call(
-    ["conan", "upload", "*", "-r", name, "--confirm"])
+  with tempfile.TemporaryDirectory() as directory:
+    scratch = Path(directory)
+    packages = _dependency_package_list(graphs, scratch)
+    if not packages:
+      print("no dependency binaries to upload", flush=True)
+      return
+    output = scratch / "dependency-packages.json"
+    output.write_text(json.dumps({"Local Cache": packages}))
+    # A retried CI job can inherit a cache whose remote registration the
+    # pipeline cleanup dropped; re-register it to avoid "Remote doesn't exist".
+    probe = subprocess.run(
+      ["conan", "remote", "list"], capture_output=True, text=True)
+    if f"{name}:" not in probe.stdout:
+      print(f"conan remote {name!r} not registered — re-registering",
+            flush=True)
+      bootstrap.ensure_conan_remote(force=True)
+    subprocess.check_call(
+      ["conan", "upload", "--list", str(output), "-r", name, "--confirm"])
 
 
 

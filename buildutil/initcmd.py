@@ -156,7 +156,9 @@ def _upgrade_conanfile(root: Path, name: str, cmake_prefix: str) -> None:
   recipe = root / "conanfile.py"
   if not recipe.is_file():
     return
-  if "_package_section" in recipe.read_text(encoding="utf-8"):
+  text = recipe.read_text(encoding="utf-8")
+  from . import packaging
+  if "_package_section" in text and packaging.knows_host_requires(text):
     return                                    # already the aware template
   backup = root / "conanfile.py.bak"
   recipe.rename(backup)
@@ -166,7 +168,7 @@ def _upgrade_conanfile(root: Path, name: str, cmake_prefix: str) -> None:
                     .replace("@CONAN_NAME@", _conan_name(name))
                     .replace("@CMAKE_OPTION_PREFIX@", cmake_prefix),
                     encoding="utf-8")
-  print(f"  conanfile.py predates packaging — regenerated "
+  print(f"  conanfile.py predates packaging or host packages — regenerated "
         f"(old recipe kept at {backup.name}; port any hand edits, "
         f"then delete it)")
 
@@ -362,8 +364,10 @@ def main(argv: list[str]) -> None:
         f.write(_package_toml_section(kind, pkg_name))
       print(f"[package] kind = {kind} recorded in {toml.name}")
       recorded_kind = kind
-  if recorded_kind in ("library", "application"):
+  from .packaging import host_requires
+  if recorded_kind in ("library", "application") or host_requires(root):
     _upgrade_conanfile(root, a.name, cmake_prefix)
+  if recorded_kind in ("library", "application"):
     section = _tomllib.loads(toml.read_text()).get("package", {})
     _scaffold_package(root, recorded_kind,
                       section.get("name") or _conan_name(a.name))

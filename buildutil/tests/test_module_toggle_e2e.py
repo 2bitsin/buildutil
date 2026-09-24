@@ -57,6 +57,22 @@ def _targets(root) -> str:
   return helpstr.stdout
 
 
+@pytest.mark.skipif(shutil.which("g++") is None, reason="needs GCC's g++ on PATH")
+def test_gcc_rejects_nonconstant_brace_narrowing(tmp_path):
+  _tree(tmp_path, ["narrowing"])
+  (tmp_path / "sources" / "narrowing" / "unit.cpp").write_text(
+    "#include <cstddef>\nint narrow(std::size_t value) { return int{value}; }\n")
+  configured = subprocess.run(
+    ["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "b"),
+     f"-DCMAKE_CXX_COMPILER={shutil.which('g++')}"],
+    capture_output=True, text=True)
+  assert configured.returncode == 0, configured.stdout + configured.stderr
+  built = subprocess.run(
+    ["cmake", "--build", str(tmp_path / "b")], capture_output=True, text=True)
+  assert built.returncode != 0, built.stdout + built.stderr
+  assert "[-Werror=narrowing]" in built.stdout + built.stderr
+
+
 def test_disabling_a_hyphenated_module_drops_that_module(tmp_path):
   """...and not its unhyphenated sibling, which is what used to happen."""
   _tree(tmp_path, ["foo", "foo-bar"])

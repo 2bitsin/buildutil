@@ -3,21 +3,22 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
 from ..app import app, _compiler_option
 from ..engine import *
+from ..engine import _conan_target_os
 from .. import packaging
 
 
 @app.command()
 def publish(
-  release: bool = typer.Option(None, "--release/--debug",
-                               help="Publish ONLY this configuration. "
-                                    "The default is both, because a "
-                                    "consumer on the other one resolves "
-                                    "no binary at all."),
+  release: bool = typer.Option(None, "--release", help="Publish only Release."),
+  debug: Annotated[bool, typer.Option("--debug", help="Publish only Debug.")] = False,
+  relwithdebinfo: Annotated[bool, typer.Option(
+    "--relwithdebinfo", help="Optimized build with debug info.")] = False,
   version: str = typer.Option(
     "", "--version",
     help="Publish exactly this version, overriding the derivation "
@@ -52,59 +53,51 @@ def publish(
     help="Override the CONAN_HOME path."),
   compiler: str = _compiler_option(),
 ):
-  """Publish this project's conan package: build, package the built
-  tree into the cache (export-pkg), run test_package/ against it, then
-  upload recipe + binaries to the project remote.
-
-  BOTH configurations are published under one version and one build
-  number: a Debug consumer of a Release-only package computes a
-  different package_id, finds no binary and ends in the recipe's
-  source-build refusal. --release or --debug narrows the run to that
-  one configuration and says which consumers it leaves uncovered.
-
-  The version is DERIVED, never committed: base = the last git tag
-  that is a valid semver, plus a build number bumped on every publish
-  (--no-version-autoincrement holds it; --version overrides outright;
-  no tag and no terminal to ask at is an error).
-
-  Needs [package] in buildutil.toml (run `buildutil init` for the
-  wizard) and — unless --no-upload — a configured conan remote; with
-  neither there is nothing to publish, and that is an error, not a
-  skip."""
+  """Publish both configurations under one version: a Debug consumer of a
+  Release-only package computes another package_id and finds no binary.
+  The version is derived from the last semver tag plus a build number,
+  never committed."""
+  selected = _resolve_build_type(release is True, debug or release is False,
+                                 relwithdebinfo)
   _enter(conan_home)
   _refuse_unpackaged_project()
   _refuse_version_ranges(allow_version_ranges)
   pkg_version, commit_version = packaging.resolve_version(
     bump=not no_autoincrement, override=version)
   reference = packaging.ref(pkg_version)
-  build_types = (["Release", "Debug"] if release is None
-                 else ["Release"] if release else ["Debug"])
+  build_types = ([selected] if release is not None or debug or relwithdebinfo
+                 else ["Release", "Debug"])
   if not no_upload:
     _require_remote(reference)
 
   _select_compiler(compiler, "auto")
-  tested = packaging.has_package_test()
-  if not tested:
-    typer.echo("no test_package/ — packaging UNTESTED (run `buildutil "
-               "init` to scaffold the package test)")
-  staged = _stage_bake(bake_buildutil)
-  try:
-    for build_type in build_types:
-      _publish_one(pkg_version, build_type, tested=tested)
-  finally:
-    _discard_bake(staged)
+  graphs = _publish_configurations(pkg_version, build_types, bake_buildutil)
   if no_upload:
     typer.echo(f"--no-upload: {reference} packaged and tested in the "
                "local cache, nothing pushed (no build number consumed)")
     _status(f"OK — {reference} (not uploaded)")
     return
-  packaging.upload(pkg_version)
+  packaging.upload(pkg_version, _conan_target_os())
   _note_uncovered_configuration(build_types, reference)
   # the build number is consumed by a SUCCESSFUL publish, nothing else
   commit_version()
-  # dependency binaries ride along, same cache-warming default as build
-  _upload_to_remote()
+  _upload_to_remote(graphs)
   _status(f"PUBLISHED — {reference}")
+
+
+def _publish_configurations(pkg_version, build_types, bake_buildutil):
+  tested = packaging.has_package_test()
+  if not tested:
+    typer.echo("no test_package/ — packaging UNTESTED (run `buildutil "
+               "init` to scaffold the package test)")
+  graphs = []
+  staged = _stage_bake(bake_buildutil)
+  try:
+    for build_type in build_types:
+      graphs.append(_publish_one(pkg_version, build_type, tested=tested))
+  finally:
+    _discard_bake(staged)
+  return graphs
 
 
 def _refuse_unpackaged_project() -> None:
@@ -175,24 +168,22 @@ def _discard_bake(staged) -> None:
   installcmd.discard_staged(staged)
 
 
-def _publish_one(pkg_version: str, build_type: str, *, tested: bool) -> None:
-  """One configuration into the cache: build it, export the built tree
-  as this version's binary for that configuration, and consume it the
-  way a consumer would. Both trees carry the SAME version — they differ
-  in package_id, which is what a consumer resolves on."""
+def _publish_one(pkg_version: str, build_type: str, *, tested: bool) -> Path:
   settings = _detect_settings(build_type)
   profile = _ensure_profile(settings)
   build_dir = Path("_build") / _profile_name(settings)
   typer.echo(f"publishing {packaging.ref(pkg_version)} "
              f"({_profile_name(settings)})")
-  _conan_install(profile)
-  _cmake_configure(build_dir, build_type, tests=True, bench=False)
+  _conan_install(profile, build_dir)
+  _cmake_configure(build_dir, build_type, tests=True, bench=False,
+                   package=pkg_version)
   _cmake_build(build_dir)
   host, build_prof = _host_build_profiles(profile)
   shared = packaging.shared_requested()
   packaging.export_pkg(pkg_version, host, build_prof, shared=shared)
   if tested:
     packaging.run_package_test(pkg_version, host, build_prof, shared=shared)
+  return build_dir / "conan-graph.json"
 
 
 def _note_uncovered_configuration(build_types: list[str],
@@ -204,7 +195,10 @@ def _note_uncovered_configuration(build_types: list[str],
     return
   published = build_types[0]
   other = "Debug" if published == "Release" else "Release"
+  flag = f"--{other.lower()} "
+  if published == "RelWithDebInfo":
+    other, flag = "Release and Debug", ""
   typer.echo(
     f"note: only build_type={published} binaries were uploaded — "
     f"{other} consumers of {reference} have no binary. To cover them: "
-    f"buildutil publish --{other.lower()} --no-version-autoincrement")
+    f"buildutil publish {flag}--no-version-autoincrement")

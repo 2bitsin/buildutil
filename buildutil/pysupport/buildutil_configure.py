@@ -18,10 +18,13 @@ all. The actual contract is three environment variables:
 
 A script that ignores this module just reads those and writes the
 manifest itself (lines: 'G <abspath>' generated file, 'D <abspath>'
-input dependency). These helpers are the convenient way to do the same:
-pick a root with output_dir(), emit() files (content-diffed so an
-unchanged input never churns a rebuild), and depends() to declare
-inputs whose change re-runs configure. CMake adds both roots to the
+input dependency, 'O <abspath>\t<option>' and 'M <abspath>\t<define>'
+one compile option or definition of a declared source, 'S <number>' and
+'V <version>' the shared library's soversion and full version). These
+helpers are the convenient way to do the same: pick a root with
+output_dir(), emit() files (content-diffed so an unchanged input never
+churns a rebuild), and depends() to declare inputs whose change re-runs
+configure. CMake adds both roots to the
 module include path, compiles/links generated sources, and re-runs on
 a changed script or declared input.
 
@@ -46,6 +49,7 @@ external tool fails readably (tool, run)."""
 
 import atexit
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -67,6 +71,9 @@ _PROGRAMS = tuple(Path(p) for p in
 # knows the same list.
 _EXE_SUFFIXES = ('', '.exe', '.cmd', '.bat') if os.name == 'nt' else ('',)
 _generated: list[Path] = []
+_options: dict[Path, list[str]] = {}
+_defines: dict[Path, list[str]] = {}
+_soversion: list[str] = []
 _inputs: list[Path] = []
 # data directory -> what was in it before this run touched it
 _swept: dict[Path, dict[Path, tuple[int, int]]] = {}
@@ -293,12 +300,60 @@ def emit(relative_path, content:str, *, shared:bool = False,
   declare(path)
   return path
 
-def declare(path) -> None:
-  """Register an already-written file as generated (compiled/linked if a
-  C/C++ source, else reachable via the include roots)."""
+def declare(path, *, options=None, defines=None) -> None:
+  """Register a file as generated, and a source's own compile options and definitions."""
   resolved = Path(path).resolve()
   if resolved not in _generated:
     _generated.append(resolved)
+  if options is not None:
+    _options[resolved] = [_option(path, o) for o in options]
+  if defines is not None:
+    _defines[resolved] = [_define(path, d) for d in defines]
+
+
+def _manifest_value(path, what:str, value) -> str:
+  text = str(value)
+  if not text or any(c in text for c in ';\t\n\r'):
+    raise SystemExit(
+      f"buildutil configure ({_MODULE}): declare({str(path)!r}) {what} "
+      f"{text!r} is empty or holds ';', a tab or a newline, which cmake "
+      "would split into several")
+  return text
+
+
+def _option(path, value) -> str:
+  text = _manifest_value(path, 'option', value)
+  if ' ' in text and not text.startswith('SHELL:'):
+    raise SystemExit(
+      f"buildutil configure ({_MODULE}): declare({str(path)!r}) option "
+      f"{text!r} holds a space and would reach the compiler as one "
+      f"argument: pass each argument as its own option, or spell the "
+      f"group 'SHELL:{text}'")
+  return text
+
+
+def _define(path, value) -> str:
+  text = _manifest_value(path, 'define', value)
+  name = text.partition('=')[0]
+  if not (name.isidentifier() and name.isascii()):
+    raise SystemExit(
+      f"buildutil configure ({_MODULE}): declare({str(path)!r}) define "
+      f"{text!r} is not NAME or NAME=value")
+  return text
+
+
+def soversion(number:int, *, version:str|None = None) -> None:
+  """The module's shared library ABI number (its soname) and, optionally, its full version."""
+  if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+    raise SystemExit(
+      f"buildutil configure ({_MODULE}): soversion({number!r}) takes a "
+      "non-negative integer")
+  if version is not None and not re.fullmatch(r'\d+(\.\d+){0,2}', str(version)):
+    raise SystemExit(
+      f"buildutil configure ({_MODULE}): soversion({number}, "
+      f"version={version!r}) takes one to three dotted numbers like '3.4.8'")
+  _soversion[:] = [f'S {number}'] + ([f'V {version}'] if version is not None else [])
+
 
 def depends(*paths) -> None:
   """Declare inputs whose change must re-run configure."""
@@ -329,5 +384,10 @@ def _sweep() -> None:
 
 def _write_manifest() -> None:
   lines = [f'G {path}' for path in _generated] + [f'D {path}' for path in _inputs]
+  lines += [f'O {path}\t{option}' for path, options in _options.items()
+            for option in options]
+  lines += [f'M {path}\t{define}' for path, defines in _defines.items()
+            for define in defines]
+  lines += _soversion
   _MANIFEST.parent.mkdir(parents=True, exist_ok=True)
   _MANIFEST.write_text('\n'.join(lines) + ('\n' if lines else ''))

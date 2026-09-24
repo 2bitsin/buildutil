@@ -9,6 +9,7 @@ dispatch stays on the stdlib lane (no venv bootstrap, no typer), the
 deposit is rendered, the buildinfo stub exists, and the configure line
 carries the driver contract (toolchain, prefixes, defines, BUILDUTIL
 env for the guard)."""
+import json
 import os
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from buildutil import initcmd
+from buildutil import buildinfo, initcmd
 
 PKG_PARENT = Path(initcmd.__file__).resolve().parents[1]
 
@@ -113,8 +114,17 @@ def test_cache_build_renders_the_machinery_and_the_buildinfo_stub(cache_tree):
   proc = _run_cache_build(root, bin_dir, gen, log)
   assert proc.returncode == 0, proc.stdout + proc.stderr
   assert (root / "_bdudata" / "cmake" / "buildutil.cmake").is_file()
-  info = (root / "_bdudata" / "buildinfo.json").read_text()
-  assert '"commit": "conan-cache"' in info
+  info = json.loads((root / "_bdudata" / "buildinfo.json").read_text())
+  assert info == dict(buildinfo.NEUTRAL, commit="conan-cache",
+                      version="conan-cache", package="")
+
+
+def test_the_version_conan_builds_as_is_the_package_version(cache_tree):
+  root, bin_dir, gen, log = cache_tree
+  proc = _run_cache_build(root, bin_dir, gen, log, extra=("--package-version", "5.1.0.2"))
+  assert proc.returncode == 0, proc.stdout + proc.stderr
+  info = json.loads((root / "_bdudata" / "buildinfo.json").read_text())
+  assert info["package"] == "5.1.0.2"
 
 
 def test_cache_build_defaults_to_static_linkage(cache_tree):

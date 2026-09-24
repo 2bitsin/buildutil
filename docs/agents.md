@@ -21,7 +21,7 @@ all three flavours, since the assembly *is* the flavour's; a launch
 configuration per executable target, application, tests and benches
 alike, in the debug-information flavours, pointing at build-tree binaries
 with matching pre-launch build tasks; and dependency tasks per
-configuration. Every generated task carries `--no-watchdog`,
+configuration. Every generated task carries `--i-am-willingly-circumventing-build-and-test-time-safeguards`,
 `--max-errors=3` and `--jump-to-error=1`, which is the shape an editor
 wants: no wall-clock budget behind a breakpoint, a short error list, and
 the first error opened.

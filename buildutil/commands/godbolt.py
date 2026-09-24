@@ -60,9 +60,10 @@ def godbolt(
        "template bodies nothing in the project references (hidden by "
        "default — they are instantiation noise).",
   ),
-  release: bool = typer.Option(False, "--release", help="Optimized build."),
-  debug: bool = typer.Option(False, "--debug", help="Debug build (default). "
-                             "Both flags: RelWithDebInfo."),
+  release: bool = typer.Option(False, "--release", help="Optimized build (default)."),
+  debug: bool = typer.Option(False, "--debug", help="Debug build."),
+  relwithdebinfo: bool = typer.Option(
+    False, "--relwithdebinfo", help="Optimized build with debug info."),
   no_build: bool = typer.Option(
     False, "--no-build",
     help="Skip conan/configure/build; reuse the existing build dir's "
@@ -87,6 +88,7 @@ def godbolt(
   that comes from inlined code in OTHER files is dimmed and carries a
   `path:line` tooltip.
   """
+  build_type = _resolve_build_type(release, debug, relwithdebinfo)
   _enter(conan_home)
   # the vscode godbolt tasks route their function prompt through -f and
   # rely on the value being REMEMBERED (next prompt default). An empty
@@ -97,7 +99,6 @@ def godbolt(
                          function[0] if function else "")
   function = [f for f in function if f]
   _select_compiler(compiler, "auto")
-  build_type = _resolve_build_type(release, debug)
   settings = _detect_settings(build_type)
   if settings.get("compiler") == "msvc":
     typer.echo("godbolt: msvc is not supported — the report is built from "
@@ -107,7 +108,7 @@ def godbolt(
   build_dir = Path("_build") / _profile_name(settings)
 
   if not no_build:
-    _conan_install(profile)
+    _conan_install(profile, build_dir)
     _cmake_configure(build_dir, build_type, tests=True, bench=False)
     _cmake_build(build_dir)
 

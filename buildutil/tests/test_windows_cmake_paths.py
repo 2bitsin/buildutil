@@ -36,7 +36,7 @@ def test_cmake_path_leaves_a_posix_path_alone():
 def test_configure_passes_no_backslash_in_any_define(monkeypatch, tmp_path):
   """The seam, not just the helper: every path the driver interpolates
   into a -D is rendered through it."""
-  monkeypatch.setattr(engine, "_stamp_build_info", lambda: None)
+  monkeypatch.setattr(engine, "_stamp_build_info", lambda package="": None)
   monkeypatch.setattr(engine, "_regen_clangd", lambda build_dir: None)
   monkeypatch.setattr(engine, "_wine_msvc_live", lambda: False)
   monkeypatch.setattr(engine, "_osxcross_live", lambda: False)

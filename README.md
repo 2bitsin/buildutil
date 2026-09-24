@@ -124,7 +124,7 @@ $ buildutil build
 [6/8] Building CXX object sources/demo/hello/CMakeFiles/demo-hello-tests.dir/hello.test.cpp.o
 [7/8] Linking CXX executable sources/demo/hello/demo-hello-tests
 ...cmake installs into _install/...
-profile: x86_64-linux-gcc-debug
+profile: x86_64-linux-gcc-release (default)
 ```
 
 ```console
@@ -271,6 +271,17 @@ options with their defaults; `--option name=value` chooses another for
 one build; the choice reaches every translation unit as a macro through
 a force-included generated header, and the profile line says what was
 asked for. → [docs/options.md](docs/options.md)
+
+**The build's identity.** Every build stamps what it *is* — the `git
+describe` version, the commit, the tag when the commit carries one,
+whether the tree was dirty, the UTC minute and a local build number — and
+hands all six to a project's own cmake as `<PREFIX>_BUILD_VERSION` and
+its five siblings, and to the code as macros of those names in a
+generated `<project>/buildinfo.hpp`. That header is the one generated
+header buildutil does **not** force-include: the time moves on every
+build, and a force include would rebuild every translation unit with it,
+so the one file that prints a version includes it and nothing else
+recompiles. → [docs/options.md](docs/options.md#build-identity)
 
 **Editors and agents.** `buildutil vscode` regenerates tasks, launch
 configurations and IntelliSense from the live module inventory, and

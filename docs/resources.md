@@ -188,7 +188,8 @@ cfg.emit_bytes('ui.embed/app.js.br', packed)
 | `output_dir(shared=False)` | the module's generated root, per profile or build-invariant |
 | `data_dir(name, tag=None, shared=False, keep=False)` | the shadow copy of a data directory — the one place that knows the tag goes after the suffix and that the vocabulary is closed |
 | `emit(path, text)` / `emit_bytes(path, data)` | write under the root, content-diffed so unchanged output never churns a rebuild, and register it |
-| `declare(path)` | register a file written some other way |
+| `declare(path, options=None, defines=None)` | register a file written some other way, and the compile options and definitions of that one source |
+| `soversion(n, version=None)` | the shared library's soname number and full version (`soversion(0, version="0.4.8")`) |
 | `depends(*paths)` / `inputs(*globs)` | inputs whose change re-runs the hook; `inputs()` declares the *directories* too, so a file **added** re-runs it as well |
 | `tool(name, install=...)` / `find_tool(name)` / `tool_dirs()` | an external program — declared `TOOL` requirements first, `PATH` second — or a refusal naming both places and how to get it |
 | `run(argv, what=...)` | run it; on failure the tool's own output is what the build shows |
@@ -206,6 +207,22 @@ skips the write must still `declare(path)` it, or the sweep reads the
 untouched file as a leftover and removes it. Nothing outside a data
 directory is ever swept: a
 generated header is reached by name, not by glob.
+
+**A source's own flags travel with it.** A hook that learns how a
+third-party build compiles its files hands them over per file:
+`declare(path, options=['-fno-strict-aliasing'], defines=['HAVE_X',
+'N=2'])` becomes that source's `COMPILE_OPTIONS` and
+`COMPILE_DEFINITIONS`, so a changed flag reconfigures and recompiles
+exactly the files it belongs to. A later `declare()` that passes
+`options` or `defines` replaces them; one that passes neither keeps
+them. A checked-in source of the module may be declared the same way:
+it stays a source, compiled once, with the declared flags. A module hook
+flags its module's own sources (not a nested module's) and the files its
+own and its groups' hooks generate; a group hook flags the files it
+generates; one file flagged by two hooks is refused naming both. A flag
+holding `;`, a tab or a newline, an option holding a space (pass each
+argument on its own, or spell the group `SHELL:-include x.h`), and a
+define that is not `NAME` or `NAME=value`, are refused.
 
 A declared tool is reachable from the hook. A `Require(<pkg> VERSION "…"
 TOOL)` package's bindir lands on cmake's program path — a cmake

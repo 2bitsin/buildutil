@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -11,10 +12,11 @@ from pathlib import Path
 import typer
 
 from ..app import (app, _compiler_option, _option_option,
+                   _no_parallel_option, _retired_parallel_option,
                    _renamed_no_upload_option,
                    pytest_args_from_options)
 from ..engine import *
-from .. import options as project_options
+from .. import config
 
 
 
@@ -41,13 +43,22 @@ def pytest_suite_lines(build_dir: Path) -> list[str]:
 def test(
   targets: list[str] = typer.Argument(
     None,
-    help="Modules to test (e.g. 'utilities'). If omitted, every module.",
+    help="Modules/labels to test (e.g. 'utilities'); overrides configured exclude_labels. "
+         "If omitted, every module subject to configured label exclusions.",
   ),
-  release: bool = typer.Option(False, "--release", help="Optimized build (default)."),
+  release: bool = typer.Option(
+    False, "--release", help="Optimized build (default)."),
   debug: bool = typer.Option(False, "--debug", help="Debug build."),
+  relwithdebinfo: bool = typer.Option(
+    False, "--relwithdebinfo", help="Optimized build with debug info."),
   filter: str = typer.Option(
     "", "--filter", "-f",
     help="Regex passed to ctest -R, matched against test names.",
+  ),
+  label_exclude: list[str] = typer.Option(
+    [], "--label-exclude",
+    help="Regex passed to ctest -LE to exclude labels. Repeatable; replaces "
+         "configured exclude_labels defaults, including with explicit targets.",
   ),
   quiet: bool = typer.Option(
     False, "--quiet", "-q",
@@ -63,15 +74,12 @@ def test(
        "longer declares it in buildutil.toml's [test.timeout] and keeps "
        "that.",
   ),
-  parallel: bool = typer.Option(
-    False, "--parallel",
-    help="Run ctest across multiple cores. OFF by default — serial is the "
-       "safety floor so a runaway test can't storm the box; the per-test "
-       "--timeout still bounds a single hang.",
-  ),
+  no_parallel: bool = _no_parallel_option(),
+  retired_parallel: bool = _retired_parallel_option(),
   jobs: int = typer.Option(
     0, "--jobs", "-j",
-    help="Parallel job count when --parallel is set. 0 (default) = all cores.",
+    help="Parallel ctest workers. 0 (default) = 0.7 x the core count, at "
+         "least 1.",
   ),
   no_upload: bool = _renamed_no_upload_option(),
   skip_dependency_upload: bool = typer.Option(
@@ -87,7 +95,8 @@ def test(
   no_native: bool = typer.Option(
     False, "--no-native",
     help="Skip the C++ build and ctest entirely — run only the python "
-         "pytest under tools/. Symmetric with --no-pytest.",
+         "pytest under tools/, without build directory/profile environment "
+         "variables. Symmetric with --no-pytest.",
   ),
   no_build: bool = typer.Option(
     False, "--no-build",
@@ -115,32 +124,23 @@ def test(
   is skipped when ctest `targets` are given or `--no-pytest` is set;
   `--no-native` flips it around — run only pytest, skip the C++ side.
   `--no-build` keeps both test steps and drops the build, running them
-  against the tree already in the build dir."""
+  against the tree already in the build dir. Python lanes get its bin
+  directory on PATH, BUILDUTIL_BUILD_DIR and BUILDUTIL_PROFILE."""
+  build_type = _resolve_build_type(release, debug, relwithdebinfo)
   pytest_extra = pytest_args_from_options(test_option)
 
   if no_native:
-    _run_pytests(extra_args=pytest_extra)
+    pytest_env = os.environ.copy()
+    pytest_env.pop("BUILDUTIL_BUILD_DIR", None)
+    pytest_env.pop("BUILDUTIL_PROFILE", None)
+    _run_pytests(env=pytest_env, extra_args=pytest_extra)
     return
   _enter(conan_home)
   _select_compiler(compiler, "auto")
-  # tests default to RELEASE (ruling 2026-07-17): the release tree is
-  # usually the warm one, and heavy suites run ~5x faster; --debug still
-  # opts into the instrumented flavor
-  # Follow whatever `build` last acted on when neither flag is given.
-  # These two commands are used as a pair and defaulted differently --
-  # build to Debug, test to Release -- so a fix could land in one tree
-  # while the suite ran the other, with nothing in either command's
-  # output saying which. Release stays the default on a tree that has
-  # never been built: heavy suites run ~5x faster there, and there is no
-  # recent build to disagree with.
-  if release or debug:
-    build_type = _resolve_build_type(release, debug)
-  else:
-    build_type = last_build_type() or "Release"
   settings = _detect_settings(build_type)
-  typer.echo(f"profile: {_profile_name(settings)}"
-             f"{project_options.profile_note()}")
   build_dir = Path("_build") / _profile_name(settings)
+  typer.echo(_profile_line(build_dir.name,
+                           _profile_origin(release, debug, relwithdebinfo)))
   targets = targets or []
   if len(targets) == 1:
     # remember the filter for this module's vscode prompt + launch args
@@ -159,7 +159,7 @@ def test(
   else:
     profile = _ensure_profile(settings)
     _warn_dependency_upload_skipped(skip_dependency_upload)
-    _conan_install(profile)
+    _conan_install(profile, build_dir)
     _cmake_configure(build_dir, build_type, tests=True, bench=False)
     try:
       _cmake_build(build_dir, [f"{t}-tests" for t in targets])
@@ -167,7 +167,7 @@ def test(
       _status("BUILD FAILED")                # compile/link error — no tests ran
       raise typer.Exit(1)
     if not skip_dependency_upload:
-      _upload_to_remote()
+      _upload_to_remote([build_dir / "conan-graph.json"])
 
   ctest_cmd = [
     "ctest", "--test-dir", str(build_dir),
@@ -187,7 +187,8 @@ def test(
     ctest_cmd += ["-L", f"^({alt})$"]
   if filter:
     ctest_cmd += ["-R", filter]
-  ctest_cmd += parallel_args(parallel, jobs)
+  ctest_cmd += _label_exclude_args(targets, label_exclude)
+  ctest_cmd += parallel_args(no_parallel, jobs)
   # Nothing older than this run may be counted as part of it.
   shutil.rmtree(build_dir / PYTEST_REPORTS, ignore_errors=True)
   # Capture ctest so the result banner can quote its pass/fail summary —
@@ -210,42 +211,58 @@ def test(
   # Python tests — skipped when ctest `targets` narrow the C++ run or
   # when --no-pytest is set.
   if not (no_pytest or targets):
+    pytest_env = os.environ.copy()
+    pytest_env.update(
+      PATH=os.pathsep.join([str(build_dir.resolve() / "bin"),
+                            *([pytest_env["PATH"]] if pytest_env.get("PATH") else [])]),
+      BUILDUTIL_BUILD_DIR=str(build_dir.resolve()),
+      BUILDUTIL_PROFILE=_profile_name(settings),
+    )
     try:
-      _run_pytests(extra_args=pytest_extra)
+      _run_pytests(env=pytest_env, extra_args=pytest_extra)
     except subprocess.CalledProcessError:
       _status("PYTEST FAILED")
       raise typer.Exit(1)
 
-  # The conan package test — part of the unqualified run (owner req):
-  # a full `buildutil test` on a packaged project also proves the
-  # PACKAGE, by export-pkg of the tree just built + test_package/
-  # consuming it from the cache. Targeted/filtered runs skip it, same
-  # as they skip pytest; --no-build skips it because it builds.
-  from .. import packaging
-  if (not no_build and not targets and not filter and packaging.configured()
-      and packaging.has_package_test()):
-    host, build_prof = _host_build_profiles(profile)
-    try:
-      # no bump, non-interactive: a TEST run consumes no build number
-      # and never prompts — with no version inferrable (no semver tag
-      # yet) the package test is skipped with the reason, not an error
-      pkg_version, _ = packaging.resolve_version(bump=False, isatty=False)
-    except SystemExit as e:
-      typer.echo(f"package test skipped: {e}")
-      pkg_version = None
-    if pkg_version:
-      shared = packaging.shared_requested()
-      try:
-        reference = packaging.export_pkg(pkg_version, host, build_prof,
-                                         shared=shared)
-        typer.echo(f"package test: {reference}")
-        packaging.run_package_test(pkg_version, host, build_prof,
-                                   shared=shared)
-      except subprocess.CalledProcessError:
-        _status("PACKAGE TEST FAILED")
-        raise typer.Exit(1)
-
+  if not no_build and not targets and not filter:
+    _run_package_smoke(profile)
   _status(f"OK — {summary}" if summary else "OK")
+
+
+def _label_exclude_args(targets: list[str], patterns: list[str]) -> list[str]:
+  labels = config.PROJECT["test_exclude_labels"]
+  if not targets and not patterns and labels:
+    alt = "|".join(re.escape(label) for label in labels)
+    patterns = [f"^({alt})$"]
+  return [arg for pattern in patterns for arg in ("-LE", pattern)]
+
+
+def _run_package_smoke(profile: Path) -> None:
+  # Owner requirement: an unqualified test run must prove the package too,
+  # exporting the built tree and consuming it through test_package/.
+  # Targeted/filtered runs skip this, as does --no-build because it builds.
+  from .. import packaging
+  if not packaging.configured() or not packaging.has_package_test():
+    return
+  try:
+    pkg_version, _ = packaging.resolve_version(bump=False, isatty=False)
+  except SystemExit as e:
+    typer.echo(f"package test skipped: {e}")
+    return
+  host, build_prof = _host_build_profiles(profile)
+  shared = packaging.shared_requested()
+  reference = packaging.ref(pkg_version, user="buildutil", channel="smoke")
+  try:
+    packaging.export_pkg(pkg_version, host, build_prof, shared=shared,
+                         user="buildutil", channel="smoke")
+    typer.echo(f"package test: {reference}")
+    packaging.run_package_test(pkg_version, host, build_prof, shared=shared,
+                               user="buildutil", channel="smoke")
+  except subprocess.CalledProcessError:
+    _status("PACKAGE TEST FAILED")
+    raise typer.Exit(1)
+  finally:
+    subprocess.check_call(["conan", "remove", reference, "-c"])
 
 
 

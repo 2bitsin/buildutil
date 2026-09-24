@@ -102,3 +102,13 @@ def test_init_without_the_flag_still_renders_it_off(tmp_path):
   assert cp.returncode == 0, cp.stderr
   machinery = (deposit.cmake_dir(tmp_path) / "buildutil.cmake").read_text()
   assert "if(OFF)" in machinery
+
+
+def test_optimize_renders_only_declared_modules(tmp_path):
+  cfg = {"cmake_option_prefix": "DEMO", "module_define_prefix": "DM",
+         "optimize_always": ["scene", "render-compositor"]}
+  machinery = (deposit.ensure(tmp_path, cfg) / "buildutil.cmake").read_text()
+  assert 'set(_buildutil_optimize_always "scene" "render-compositor")' in machinery
+  cfg["optimize_always"] = []
+  machinery = (deposit.ensure(tmp_path, cfg) / "buildutil.cmake").read_text()
+  assert 'set(_buildutil_optimize_always )' in machinery

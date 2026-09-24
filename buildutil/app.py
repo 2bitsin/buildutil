@@ -180,12 +180,12 @@ def _root(
          "itself, so it skips the include/instantiation chain and jumps to "
          "where the error is reported. Pass it BEFORE the subcommand."),
   no_watchdog: bool = typer.Option(
-    False, "--no-watchdog",
-    help="Escape hatch: run this one command without the wall-clock "
-         "budget (warn 1min / error 2min / FAIL 3min). For known-long "
-         "commands like coverage. Off by default in CI already (the job "
-         "timeout is the bound). Legal ANYWHERE on the line — every "
-         "subcommand accepts it: `buildutil coverage --no-watchdog`."),
+    False, "--i-am-willingly-circumventing-build-and-test-time-safeguards",
+    help="Run this one command without the wall-clock budget (warn 1min / "
+         "error 2min / FAIL 3min). The name is the reason: a run the "
+         "watchdog fails is a defect to fix, not a guard to lift. Off by "
+         "default in CI already (the job timeout is the bound). Legal "
+         "ANYWHERE on the line."),
   watchdog_budget: float = typer.Option(
     180.0, "--watchdog-budget",
     help="Move the watchdog's FAIL line to N seconds for this command "
@@ -274,18 +274,35 @@ def _option_option():
          "project.")
 
 
-def _refuse_renamed_no_upload(ctx: typer.Context, value: bool) -> bool:
-  if value and not ctx.resilient_parsing:
-    typer.echo(
-      f"buildutil {ctx.command.name}: --no-upload was renamed to "
-      "--skip-dependency-upload-so-everyone-rebuilds-from-source. Pass that "
-      "if you really mean it; publish --no-upload is unchanged.", err=True)
-    raise typer.Exit(code=2)
-  return value
+def _refused_flag_option(flag: str, reason: str):
+  """A hidden flag whose use exits 2 with `reason`, so an old script is found."""
+  def refuse(ctx: typer.Context, value: bool) -> bool:
+    if value and not ctx.resilient_parsing:
+      typer.echo(f"buildutil {ctx.command.name}: {reason}", err=True)
+      raise typer.Exit(code=2)
+    return value
+  return typer.Option(False, flag, hidden=True, is_eager=True, callback=refuse)
 
 
 def _renamed_no_upload_option():
-  """Hidden on the build verbs: typing --no-upload explains the rename."""
+  return _refused_flag_option(
+    "--no-upload",
+    "--no-upload was renamed to "
+    "--skip-dependency-upload-so-everyone-rebuilds-from-source. Pass that "
+    "if you really mean it; publish --no-upload is unchanged.")
+
+
+def _retired_parallel_option():
+  return _refused_flag_option(
+    "--parallel",
+    "--parallel is gone: ctest runs in parallel by default now, over 0.7 x "
+    "the core count or --jobs. Drop the switch, or pass --no-parallel for a "
+    "serial run.")
+
+
+def _no_parallel_option():
   return typer.Option(
-    False, "--no-upload", hidden=True, is_eager=True,
-    callback=_refuse_renamed_no_upload)
+    False, "--no-parallel",
+    help="Run ctest serially, one test at a time. Parallel over 0.7 x the "
+         "core count (or --jobs) is the default; the per-test --timeout "
+         "bounds a single hang either way.")

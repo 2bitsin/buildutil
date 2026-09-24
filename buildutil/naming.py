@@ -19,8 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-# buildutil.cmake: set(_buildutil_kind_tags "obj;lib;a;exe;so;dll;dylib")
-KIND_TAGS = ("obj", "lib", "a", "exe", "so", "dll", "dylib")
+KIND_TAGS = ("obj", "lib", "a", "exe", "so", "dll", "dylib", "test")
 
 # THE PLATFORM VOCABULARY, in one place.
 #
@@ -100,7 +99,7 @@ SOURCE_EXTENSIONS = {
 # Which cmake LANGUAGE an extension needs enabled, where cmake does not
 # enable it from project(<name> CXX). Enabled by presence, on the target
 # platform the extension is legal on.
-EXTENSION_LANGUAGE = {"mm": "OBJCXX", "m": "OBJC", "rc": "RC",
+EXTENSION_LANGUAGE = {"c": "C", "mm": "OBJCXX", "m": "OBJC", "rc": "RC",
                       "s": "ASM", "S": "ASM"}
 
 # Headers are NOT filtered by tag and never will be: nobody chooses what

@@ -7,6 +7,7 @@ the BUILD tree, and the archive of a module with no sources of its own,
 which holds no object and which `package_info()` then had to be taught to
 ignore by name.
 """
+import json
 import shutil
 import subprocess
 import sys
@@ -130,3 +131,56 @@ def test_a_build_without_suites_asks_for_no_components(monkeypatch):
   monkeypatch.setattr(engine.subprocess, "check_call", calls.append)
   engine._install_tree(Path("b"), tests=False, bench=False)
   assert len(calls) == 1
+
+
+@e2e
+@pytest.mark.skipif(
+  not any(shutil.which(cc) for cc in ("cc", "gcc", "clang", "cl")),
+  reason="needs a C compiler on PATH")
+def test_c_module_compiles_and_links_with_native_toolchain(tmp_path):
+  deposit.ensure(tmp_path, CFG)
+  (tmp_path / "CMakeLists.txt").write_text(ROOT_CMAKE)
+  src = tmp_path / "sources"
+  module = src / "native.so"
+  module.mkdir(parents=True)
+  (src / "CMakeLists.txt").write_text("Scan_subdirectories()\n")
+  (module / "CMakeLists.txt").write_text("Init_submodule()\n")
+  (module / "native.c").write_text(
+    "#ifdef __cplusplus\n#error C source compiled as C++\n#endif\n"
+    "int native_value(void) { return 42; }\n")
+  build, _, shipped = _packaged(tmp_path)
+  commands = json.loads((build / "compile_commands.json").read_text())
+  assert any(Path(c["file"]).name == "native.c" for c in commands)
+  assert any("native" in f and f.endswith((".so", ".dylib", ".dll"))
+             for f in shipped), shipped
+
+
+@e2e
+@pytest.mark.parametrize("group", ["", "group.lib/"])
+def test_tagged_component_paths_and_dependency_edges(tmp_path, group):
+  deposit.ensure(tmp_path, CFG)
+  (tmp_path / "CMakeLists.txt").write_text(ROOT_CMAKE)
+  src = tmp_path / "sources"
+  src.mkdir()
+  (src / "CMakeLists.txt").write_text("Scan_subdirectories()\n")
+  parent = src / group
+  if group:
+    parent.mkdir()
+    (parent / "CMakeLists.txt").write_text("Scan_subdirectories()\n")
+  target = "group-net" if group else "net"
+  for name in ("net.so", "util"):
+    module = parent / name
+    module.mkdir()
+    cmake = "Init_submodule()\n"
+    if name == "util":
+      cmake += f"Link_dependencies({target})\n"
+    (module / "CMakeLists.txt").write_text(cmake)
+    (module / "code.cpp").write_text("int value() { return 42; }\n")
+  _, prefix, _ = _packaged(tmp_path)
+  manifest = prefix / "share/buildutil/buildutil-components.json"
+  components = {c["path"]: c for c in json.loads(manifest.read_text())["components"]}
+  clean_group = "group/" if group else ""
+  net, util = (clean_group + name for name in ("net", "util"))
+  assert set(components) == {net, util}
+  assert components[util]["needs"] == [net]
+  assert components[net]["needs"] == []

@@ -24,6 +24,7 @@ import re
 from pathlib import Path
 
 from . import naming
+from .config import CXX_STANDARDS
 
 TEMPLATES = Path(__file__).resolve().parent / "templates" / "cmake"
 
@@ -94,10 +95,13 @@ def _render(src: Path, cfg: dict, version: str,
     .replace("@MODULE_PLATFORMS@", "\n".join(
       f'  _buildutil_module_platforms(dormant "{name}" "{";".join(tags)}")'
       for name, tags in cfg.get("modules_platforms", {}).items()))
+    .replace("@OPTIMIZE_ALWAYS@", " ".join(
+      f'"{name}"' for name in cfg.get("optimize_always", [])))
     .replace("@MODULES_NO_ARC@", no_arc)
     .replace("@MODULE_FRAMEWORKS@", _module_frameworks(cfg))
     .replace("@PLATFORM_TABLE@", naming.platform_table_cmake())
     .replace("@PLATFORM_TAGS@", naming.platform_alternation())
+    .replace("@KIND_TAGS@", ";".join(naming.KIND_TAGS))
     .replace("@EXTENSIONS@", extensions)
     .replace("@REFLECT_NAMESPACE@", cfg.get("reflect_namespace") or "reflect")
     .replace("@REFLECT_ANNOTATION@", cfg.get("reflect_annotation") or "macro")
@@ -105,9 +109,13 @@ def _render(src: Path, cfg: dict, version: str,
     .replace("@RESOURCE_NAMESPACE@", _resource_namespace(cfg))
     .replace("@RESOURCE_SETS@", _resource_sets(cfg))
     .replace("@PROJECT_OPTIONS@", _project_options(cfg))
+    .replace("@BUILD_IDENTITY@", _build_identity(cfg))
     .replace("@RUNTIME_PAYLOAD@", _runtime_payload(cfg))
     .replace("@PYTHON_SUITES@", _python_suites(cfg))
+    .replace("@DISCOVERY_TIMEOUT@", str(cfg.get("test_discovery_timeout", 30)))
     .replace("@MACOS_BUNDLE@", _macos_bundle(cfg))
+    .replace("@CXX_STANDARD@", str(cfg.get("cxx_standard") or ""))
+    .replace("@CXX_STANDARDS@", ";".join(map(str, CXX_STANDARDS)))
   )
 
 
@@ -137,8 +145,17 @@ def _project_options(cfg: dict) -> str:
   if not declared:
     return ""
   return '_buildutil_project_options("{name}" "{declarations}")'.format(
-    name=cfg.get("name") or "project",
-    declarations=declaration_list(declared))
+    name=_project_name(cfg), declarations=declaration_list(declared))
+
+
+def _project_name(cfg: dict) -> str:
+  """What the generated tree is keyed by; a minimal cfg names nothing."""
+  return cfg.get("name") or "project"
+
+
+def _build_identity(cfg: dict) -> str:
+  """The call that reads _bdudata/buildinfo.json and renders its header."""
+  return f'_buildutil_build_identity("{_project_name(cfg)}")'
 
 
 def _python_suites(cfg: dict) -> str:
@@ -192,6 +209,20 @@ def _resource_sets(cfg: dict) -> str:
         namespace=entry.get("namespace", ""),
         mime=",".join(entry.get("mime") or [])))
   return "\n".join(lines)
+
+
+HOST_WRAPPER = TEMPLATES.parent / "host" / "conanfile.py"
+
+
+def render_host_wrapper(folder: Path, cmake_name: str) -> None:
+  """Render one SYSTEM Require's system@host recipe, rewriting only a change."""
+  text = HOST_WRAPPER.read_text(encoding="utf-8").replace("@CMAKE_NAME@",
+                                                          cmake_name)
+  recipe = folder / "conanfile.py"
+  if recipe.is_file() and recipe.read_text(encoding="utf-8") == text:
+    return
+  folder.mkdir(parents=True, exist_ok=True)
+  recipe.write_text(text, encoding="utf-8")
 
 
 def deposited_version(root: Path) -> str | None:

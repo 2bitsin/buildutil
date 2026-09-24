@@ -52,7 +52,7 @@ def deps(
   debug: bool = typer.Option(
     False, "--debug", help="Only the Debug configuration."),
   relwithdebinfo: bool = typer.Option(
-    False, "--relwithdebinfo", help="Only the RelWithDebInfo configuration."),
+    False, "--relwithdebinfo", help="Optimized build with debug info."),
   conan_home: str = typer.Option(
     None, "--conan-home",
     help="Override the CONAN_HOME path."),
@@ -65,16 +65,17 @@ def deps(
   one sitting instead of stalling the first build of each flavor;
   flags narrow it to specific configurations.
   """
+  build_type = _resolve_build_type(release, debug, relwithdebinfo)
   _enter(conan_home)
   _select_compiler(compiler, "auto")
-  chosen = [build_type for flag, build_type in
-            ((debug, "Debug"), (release, "Release"),
-             (relwithdebinfo, "RelWithDebInfo")) if flag]
+  chosen = ([build_type]
+            if release or debug or relwithdebinfo else [])
   for build_type in chosen or ["Debug", "Release", "RelWithDebInfo"]:
     settings = _detect_settings(build_type)
     profile = _ensure_profile(settings)
+    build_dir = Path("_build") / _profile_name(settings)
     typer.echo(f"deps: conan install for {_profile_name(settings)}")
-    _conan_install(profile)
+    _conan_install(profile, build_dir)
 
 
 @app.command()
@@ -151,8 +152,10 @@ def clean(
 
 @app.command()
 def build(
-  release: bool = typer.Option(False, "--release", help="Optimized build."),
-  debug: bool = typer.Option(False, "--debug", help="Debug build (default)."),
+  release: bool = typer.Option(False, "--release", help="Optimized build (default)."),
+  debug: bool = typer.Option(False, "--debug", help="Debug build."),
+  relwithdebinfo: bool = typer.Option(
+    False, "--relwithdebinfo", help="Optimized build with debug info."),
   no_tests: bool = typer.Option(
     False, "--no-tests", help="Skip building test targets."
   ),
@@ -189,11 +192,13 @@ def build(
   option: list[str] = _option_option(),
 ):
   """Run conan install, cmake configure, and cmake build."""
+  build_type = _resolve_build_type(release, debug, relwithdebinfo)
   _enter(conan_home)
   _select_compiler(compiler, "auto")
   _warn_dependency_upload_skipped(skip_dependency_upload)
   _full_build(
-    _resolve_build_type(release, debug),
+    build_type,
+    _profile_origin(release, debug, relwithdebinfo),
     tests=not no_tests,
     upload=not skip_dependency_upload,
     bench=include_bench,

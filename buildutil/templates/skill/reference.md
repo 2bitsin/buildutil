@@ -32,7 +32,9 @@ the hook (the build puts it on PYTHONPATH):
 - `emit(relpath, content, shared=False)` — write-if-changed (an
   unchanged input never churns a rebuild) and register. The relpath is
   the include spelling.
-- `declare(path)` — register an already-written file.
+- `declare(path, options=None, defines=None)` — register an
+  already-written file; `options`/`defines` compile that one source
+  with them (a checked-in source of the module too).
 - `depends(*paths)` — inputs whose change re-runs configure.
 - `output_dir(shared=False)` — the emit root, for tools that write
   their own files.

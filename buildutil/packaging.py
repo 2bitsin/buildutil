@@ -26,9 +26,11 @@ assembly and version derivation are testable without either tool.
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import subprocess
+import types
 from pathlib import Path
 
 from . import config
@@ -91,6 +93,16 @@ def _git_semver_base(run=subprocess.run) -> str:
     if m:
       return m.group(1)
   return ""
+
+
+def tag_version(root: Path) -> str:
+  """The last reachable x.y.z tag of the tree at root, '' when there is none."""
+  def git(command, **kwargs):
+    try:
+      return subprocess.run(command, cwd=root, **kwargs)
+    except OSError:
+      return subprocess.CompletedProcess(command, 1, "", "")
+  return _git_semver_base(git)
 
 
 _VERSION_RE = re.compile(r"^(\d+\.\d+\.\d+)\.(\d+)$")
@@ -193,18 +205,33 @@ def resolve_version(bump: bool, override: str = "", git=subprocess.run,
           lambda: _save_state(final_base, final_build, root))
 
 
-def ref(version: str) -> str:
-  return f"{package_name()}/{version}"
+def ref(version: str, user: str | None = None,
+        channel: str | None = None) -> str:
+  suffix = f"@{user or ''}/{channel or ''}" if user or channel else ""
+  return f"{package_name()}/{version}{suffix}"
 
 
-_REQUIRE_RE = re.compile(
-  r'^\s*Require\s*\(\s*([\w-]+)\s+VERSION\s+"([^"]+)"(.*?)\)',
-  re.MULTILINE | re.DOTALL)
+REQUIRES_PARSER = (Path(__file__).resolve().parent / "templates" / "project"
+                   / "buildutil_requires.py")
 
-# the tokens that keep a dep OUT of the consumer-facing graph — exact
-# case, like the template parser and cmake_parse_arguments (a lowercase
-# `system` is Boost's component, not the keyword)
-_NON_RUNTIME = {"SYSTEM", "TOOL", "TEST", "BENCH"}
+
+@functools.cache
+def requires_parser() -> types.ModuleType:
+  """The Require() parser conanfile.py imports from beside itself."""
+  module = types.ModuleType("buildutil_requires")
+  module.__file__ = str(REQUIRES_PARSER)
+  source = REQUIRES_PARSER.read_text(encoding="utf-8")
+  exec(compile(source, str(REQUIRES_PARSER), "exec"), module.__dict__)
+  return module
+
+
+def declared_requires(root: Path | None = None,
+                      target_os: str | None = None) -> list[dict]:
+  """sources/CMakeLists.txt's Require() lines, as conanfile.py reads them."""
+  path = (root or config.REPO_ROOT) / "sources" / "CMakeLists.txt"
+  if not path.is_file():
+    return []
+  return requires_parser().requires(path.read_text(), target_os)
 
 
 def ranged_runtime_requires(root: Path | None = None) -> list[tuple[str, str]]:
@@ -216,18 +243,29 @@ def ranged_runtime_requires(root: Path | None = None) -> list[tuple[str, str]]:
   in, and the recipe's source-build refusal fires — blaming driver
   discipline for what is really version drift. SYSTEM/TOOL/TEST/BENCH
   deps stay out: they never reach a consumer's graph."""
-  root = root or config.REPO_ROOT
-  path = root / "sources" / "CMakeLists.txt"
-  if not path.is_file():
-    return []
   ranged = []
-  for name, version, extra in _REQUIRE_RE.findall(path.read_text()):
-    if _NON_RUNTIME & set(extra.split()):
+  for entry in declared_requires(root):
+    if any(entry[lane] for lane in ("system", "tool", "test", "bench")):
       continue
-    v = version.strip()
+    v = entry["floor"].strip()
     if v == "*" or v.startswith((">", "<", "~", "^")):
-      ranged.append((name, v))
+      ranged.append((entry["cmake_name"], v))
   return ranged
+
+
+_HOST_REQUIRES = re.compile(r"(?m)^_HOST_REQUIRES = 1$")
+
+
+def knows_host_requires(recipe: str) -> bool:
+  """Whether a conanfile's text is the template that forces host wrappers."""
+  return bool(_HOST_REQUIRES.search(recipe))
+
+
+def host_requires(root: Path | None = None,
+                  target_os: str | None = None) -> list[dict]:
+  """The Require(... SYSTEM) lines active on target_os."""
+  return [entry for entry in declared_requires(root, target_os)
+          if entry["system"]]
 
 
 def shared_requested() -> bool:
@@ -241,35 +279,42 @@ def shared_requested() -> bool:
 
 def export_pkg(version: str, profile: Path, build_profile: Path,
                shared: bool = False,
-               run=subprocess.check_call) -> str:
+               run=subprocess.check_call, *, user: str | None = None,
+               channel: str | None = None) -> str:
   """Package the locally built tree into the conan cache. The recipe's
   layout() points at the same _build/<profile> dir buildutil built, so
   package() (cmake --install) packages exactly what was just built.
   --version is the ONE derivation reaching conan — the recipe adopts it
   in set_version(), never re-deriving. -tf= : export-pkg would auto-run
   test_package, and the callers here invoke `conan test` explicitly —
-  once, not twice."""
+  once, not twice.
+  Optional user/channel select a namespaced reference for export and testing."""
   run(["conan", "export-pkg", ".", f"--version={version}", "-tf=",
+       *(["--user", user] if user else []),
+       *(["--channel", channel] if channel else []),
        *((["-o", "&:shared=True"]) if shared else []),
        f"--profile:host={profile}", f"--profile:build={build_profile}"])
-  return ref(version)
+  return ref(version, user, channel)
 
 
 def run_package_test(version: str, profile: Path, build_profile: Path,
                      shared: bool = False,
-                     run=subprocess.check_call) -> None:
+                     run=subprocess.check_call, *, user: str | None = None,
+                     channel: str | None = None) -> None:
   """Consume the cached package the way a consumer would: build and run
   test_package/ against the reference — requesting the same shared
   option the export packaged, or the test computes the other
   package_id and misses the binary. --build=missing lets the test's
-  own scaffolding deps resolve without demanding a prebuilt cache."""
-  run(["conan", "test", "test_package", ref(version),
+  own scaffolding deps resolve without demanding a prebuilt cache.
+  Optional user/channel select a namespaced reference for export and testing."""
+  run(["conan", "test", "test_package", ref(version, user, channel),
        *((["-o", f"{package_name()}/*:shared=True"]) if shared else []),
        f"--profile:host={profile}", f"--profile:build={build_profile}",
        "--build=missing"])
 
 
-def upload(version: str, run=subprocess.check_call) -> None:
+def upload(version: str, target_os: str | None = None,
+           run=subprocess.check_call) -> None:
   """Recipe + binaries to the project remote; a missing remote is an
   ERROR here (unlike the dependency-cache upload, which skips): publish
   without a destination did not publish, and must say so."""
@@ -281,3 +326,8 @@ def upload(version: str, run=subprocess.check_call) -> None:
       "/ .env / CI_ARTIFACTORY_*) — there is nowhere to publish to. "
       "Configure the remote seam and re-run.")
   run(["conan", "upload", ref(version), "-r", name, "--confirm"])
+  # a consumer resolves the forced wrapper from the remote and probes its host
+  for host in host_requires(target_os=target_os):
+    if not host["test"] and not host["bench"]:
+      run(["conan", "upload", host["ref"], "-r", name, "--confirm",
+           "--only-recipe"])

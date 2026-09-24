@@ -13,6 +13,8 @@ empty file marks the root and takes every default.
     name = "bossdeux"               # vscode task labels, messages
     cmake_option_prefix = "BOSSDEUX"  # -D<PREFIX>_MAX_ERRORS etc.
     module_define_prefix = "BDX"    # <PREFIX>_<NAME>_ENABLED=1 defines
+    cxx_standard = 23               # the project's own targets; 20|23|26,
+                                    # absent = the lane's standard
 
     [options]
     contracts = true           # project options: the value is the DEFAULT,
@@ -205,6 +207,8 @@ def _load_project() -> dict:
     "name": "project",
     "cmake_option_prefix": "BUILDUTIL",
     "module_define_prefix": "MOD",
+    "cxx_standard": None,        # [project] cxx_standard: 20|23|26
+    "optimize_always": [],
     "options": {},               # [options]: name -> default value
     "venv_extra_deps": [],
     "coverage_bridge_dirs": [],
@@ -215,6 +219,8 @@ def _load_project() -> dict:
     "modules_no_arc": [],        # [modules.<name>] objc_arc = false
     "modules_frameworks": {},    # [modules.<name>] frameworks = [...]
     "test_python_suites": [],    # [test] python: non-module suite dirs
+    "test_discovery_timeout": 30,
+    "test_exclude_labels": [],
     "test_python_timeouts": {},  # [test.timeout]: suite -> its own seconds
     "bench_suite": "",
     "run_default": "",
@@ -250,6 +256,8 @@ def _load_project() -> dict:
   for key in ("name", "cmake_option_prefix", "module_define_prefix"):
     if key in proj:
       cfg[key] = proj[key]
+  cfg["cxx_standard"] = _cxx_standard(proj)
+  cfg["optimize_always"] = _optimize_always(raw)
   cfg["options"] = _project_options(raw)
   cfg["venv_extra_deps"] = list(raw.get("venv", {}).get("extra_deps", []))
   cfg["coverage_bridge_dirs"] = list(
@@ -273,7 +281,9 @@ def _load_project() -> dict:
   cfg["modules_no_arc"] = _modules_without_arc(raw)
   cfg["modules_frameworks"] = _module_frameworks(raw)
   test = _test_table(raw)
+  cfg["test_discovery_timeout"] = test.get("discovery_timeout", 30)
   cfg["test_python_suites"] = _python_suites(test)
+  cfg["test_exclude_labels"] = _test_exclude_labels(test)
   cfg["test_python_timeouts"] = _python_suite_timeouts(
     test, cfg["test_python_suites"])
   cfg["bench_suite"] = str(raw.get("bench", {}).get("suite", ""))
@@ -324,6 +334,21 @@ def _load_project() -> dict:
                "a path inside the repo, relative to its root")
   cfg["bundle_macos"] = _bundle_macos(raw, cfg["name"])
   return cfg
+
+
+CXX_STANDARDS = (20, 23, 26)
+
+
+def _cxx_standard(proj: dict) -> int | None:
+  """[project] cxx_standard, one of CXX_STANDARDS; None leaves the lane's."""
+  if "cxx_standard" not in proj:
+    return None
+  value = proj["cxx_standard"]
+  if type(value) is not int or value not in CXX_STANDARDS:
+    sys.exit(f"buildutil.toml: [project] cxx_standard = {value!r} is not a "
+             "standard buildutil builds (accepted: "
+             f"{', '.join(map(str, CXX_STANDARDS))})")
+  return value
 
 
 def _is_option_name(name: str) -> bool:
@@ -450,6 +475,7 @@ def _bundle_macos(raw: dict, project_name: str) -> dict:
 
 
 _MODULE_KEYS = {"objc_arc", "frameworks", "platforms"}
+_MOVED_MODULE_KEYS = {"soversion", "version"}
 
 
 def _module_tables(raw: dict):
@@ -462,12 +488,42 @@ def _module_tables(raw: dict):
   for name, entry in modules.items():
     if not isinstance(entry, dict):
       continue
+    moved = sorted(set(entry) & _MOVED_MODULE_KEYS)
+    if moved:
+      sys.exit(f"buildutil.toml: [modules.{name}] {', '.join(moved)} moved "
+               "to the module's configure.py: soversion(<n>, version=\"x.y.z\")")
     unknown = sorted(set(entry) - _MODULE_KEYS)
     if unknown:
       sys.exit(f"buildutil.toml: [modules.{name}] has unknown key(s) "
                f"{', '.join(unknown)} (known: "
                f"{', '.join(sorted(_MODULE_KEYS))})")
     yield name, entry
+
+
+def _modules_by_name() -> dict[str, tuple[str, ...]]:
+  """Every module directory under sources/, keyed by its target name."""
+  from . import naming
+  return {naming.module_name(parts): parts
+          for parts in naming.modules(REPO_ROOT / "sources")}
+
+
+def _optimize_always(raw: dict) -> list[str]:
+  table = raw.get("optimize", {})
+  if not isinstance(table, dict):
+    sys.exit("buildutil.toml: [optimize] must be a table")
+  unknown = sorted(set(table) - {"always"})
+  if unknown:
+    sys.exit(f"buildutil.toml: [optimize] unknown key(s): {', '.join(unknown)}")
+  names = table.get("always", [])
+  if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+    sys.exit("buildutil.toml: [optimize] always must be a list of module names")
+  if not names:
+    return []
+  known = _modules_by_name()
+  for name in names:
+    if name not in known:
+      sys.exit(f"buildutil.toml: [optimize] always: unknown module {name!r}")
+  return names
 
 
 def _module_platforms(raw: dict) -> dict:
@@ -537,7 +593,7 @@ def _modules_without_arc(raw: dict) -> list[str]:
   return out
 
 
-_TEST_KEYS = {"python", "timeout"}
+_TEST_KEYS = {"python", "timeout", "discovery_timeout", "exclude_labels"}
 
 
 def _test_table(raw: dict) -> dict:
@@ -549,7 +605,21 @@ def _test_table(raw: dict) -> dict:
   if unknown:
     sys.exit(f"buildutil.toml: [test] has unknown key(s) "
              f"{', '.join(unknown)} (known: {', '.join(sorted(_TEST_KEYS))})")
+  seconds = test.get("discovery_timeout", 30)
+  if isinstance(seconds, bool) or not isinstance(seconds, int):
+    sys.exit("buildutil.toml: [test] discovery_timeout must be an integer "
+             f"number of seconds, not {seconds!r}")
+  if seconds <= 0:
+    sys.exit(f"buildutil.toml: [test] discovery_timeout is {seconds}; "
+             "discovery must be allowed more than zero seconds")
   return test
+
+
+def _test_exclude_labels(test: dict) -> list[str]:
+  labels = test.get("exclude_labels", [])
+  if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+    sys.exit("buildutil.toml: [test] exclude_labels must be a list of strings")
+  return labels
 
 
 def _python_suites(test: dict) -> list[str]:
@@ -735,6 +805,15 @@ def cmake_path(path) -> str:
   would get; a plain string is read as a path of the running platform.
   """
   return (path if isinstance(path, PurePath) else Path(path)).as_posix()
+
+
+def cmake_cache_entry(cache: Path, name: str) -> str | None:
+  """The value of one CMakeCache.txt entry, None when absent."""
+  prefix = f"{name}:"
+  for line in cache.read_text(errors="replace").splitlines():
+    if line.startswith(prefix):
+      return line.partition("=")[2].strip()
+  return None
 
 # Local, gitignored working data (the `_*` rule). The build counter and the
 # module build toggles live here so they never reach history.

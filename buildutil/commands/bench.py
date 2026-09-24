@@ -34,10 +34,10 @@ def bench(
     help="Module names (e.g. hello) whose ${target}-benches "
          "executables get built and launched. Default: every module "
          "that has a *.bench.cpp file. Ignored in suite mode."),
-  release: bool = typer.Option(
-    True, "--release/--debug",
-    help="Build flavor. Release is the default — running a Debug build "
-         "through google-benchmark gives wildly misleading numbers."),
+  release: bool = typer.Option(False, "--release", help="Optimized build (default)."),
+  debug: bool = typer.Option(False, "--debug", help="Debug build."),
+  relwithdebinfo: bool = typer.Option(
+    False, "--relwithdebinfo", help="Optimized build with debug info."),
   filter: str = typer.Option(
     "", "--filter",
     help="Forwarded to each bench binary as --benchmark_filter=<re>."),
@@ -80,21 +80,23 @@ def bench(
   resolve. With `[bench] suite = "pkg.module"` in buildutil.toml the
   project's own python suite runs instead.
   """
+  build_type = _resolve_build_type(release, debug, relwithdebinfo)
+  if perf:
+    build_type = "RelWithDebInfo"
   suite = PROJECT["bench_suite"]
   _enter(conan_home)
   if suite:
     if not no_build:
       _select_compiler(compiler, "auto")
-      build_type = _resolve_build_type(release, not release)
       settings = _detect_settings(build_type)
       profile = _ensure_profile(settings)
       build_dir = Path("_build") / _profile_name(settings)
       _warn_dependency_upload_skipped(skip_dependency_upload)
-      _conan_install(profile)
+      _conan_install(profile, build_dir)
       _cmake_configure(build_dir, build_type, tests=True, bench=False)
       _cmake_build(build_dir)
       if not skip_dependency_upload:
-        _upload_to_remote()
+        _upload_to_remote([build_dir / "conan-graph.json"])
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
       p for p in ("tools", env.get("PYTHONPATH", "")) if p)
@@ -110,13 +112,11 @@ def bench(
     # remember the filter for this module's vscode prompt + launch args
     from .. import vscode as _vscode
     _vscode.record_input("benchfilter", targets[0], filter)
-  build_type = "RelWithDebInfo" if perf else (
-    "Release" if release else "Debug")
   settings = _detect_settings(build_type)
   profile = _ensure_profile(settings)
   build_dir = Path("_build") / _profile_name(settings)
 
-  _conan_install(profile)
+  _conan_install(profile, build_dir)
   _cmake_configure(build_dir, build_type, tests=False, bench=True)
   _cmake_build(build_dir)
 

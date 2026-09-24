@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from buildutil import deposit
 
 CFG = {"cmake_option_prefix": "ACME", "module_define_prefix": "ACM"}
@@ -205,12 +207,19 @@ def test_msvc_reads_the_sources_as_utf8(tmp_path):
   files, the first time one project was compiled by a native cl."""
   machinery = (deposit.ensure(tmp_path, CFG) / "buildutil.cmake").read_text()
   msvc_options = [line for line in machinery.splitlines()
-                  if "CXX_COMPILER_ID:MSVC>:/std:c++latest" in line]
+                  if "CXX_COMPILER_ID:MSVC>:/bigobj" in line]
   assert msvc_options, "the MSVC compile-options genex moved"
   assert "/utf-8" in msvc_options[0]
 
 
-def test_test_discovery_never_runs_in_the_source_tree(tmp_path):
+def test_gnu_rejects_brace_narrowing(tmp_path):
+  machinery = (deposit.ensure(tmp_path, CFG) / "buildutil.cmake").read_text()
+  assert ('"$<$<AND:${cxx},$<CXX_COMPILER_ID:GNU>>:-Werror=narrowing>"'
+          in machinery)
+
+
+@pytest.mark.parametrize("seconds", [None, 73])
+def test_test_discovery_never_runs_in_the_source_tree(tmp_path, seconds):
   """gtest_discover_tests' WORKING_DIRECTORY is where the DISCOVERY runs
   too, and CMake 4.2 writes its listing there:
 
@@ -227,8 +236,13 @@ def test_test_discovery_never_runs_in_the_source_tree(tmp_path):
   The discovery runs in the build tree now and the tests keep their
   working directory through TEST_LIST at ctest time. Measured on cmake
   4.2.3 and 4.4.2: json in the build dir, WORKING_DIRECTORY still the
-  module's source dir."""
-  machinery = (deposit.ensure(tmp_path, CFG) / "buildutil.cmake").read_text()
+  module's source dir.
+
+  PRE_TEST defers discovery until ctest, with the default or configured timeout asserted below."""
+  cfg = dict(CFG)
+  if seconds is not None:
+    cfg["test_discovery_timeout"] = seconds
+  machinery = (deposit.ensure(tmp_path, cfg) / "buildutil.cmake").read_text()
   start = machinery.index("gtest_discover_tests(")
   call = machinery[start:machinery.index("\n  set(_buildutil_workdir_script",
                                          start)]
@@ -238,6 +252,9 @@ def test_test_discovery_never_runs_in_the_source_tree(tmp_path):
     "cmake_test_discovery_<hash>.json into it")
   assert "TEST_LIST ${test_target}_discovered" in call
 
-  # ...and the tests still get it, at ctest time, where that list exists
-  assert "TEST_INCLUDE_FILES" in machinery
+  assert "DISCOVERY_MODE PRE_TEST" in call
+  assert f"DISCOVERY_TIMEOUT {seconds or 30}" in call
+  registration = ('set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES\n'
+                  '               "${_buildutil_workdir_script}")')
+  assert machinery.index(registration) > start
   assert ('WORKING_DIRECTORY \\"${CMAKE_CURRENT_SOURCE_DIR}\\"') in machinery

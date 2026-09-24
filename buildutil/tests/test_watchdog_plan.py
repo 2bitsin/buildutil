@@ -20,7 +20,7 @@ def test_interactive_uses_the_per_verb_budget():
 
 
 # The reason the long verbs have budgets at all: so no caller has to reach
-# for --no-watchdog, which removes the alarm rather than moving it.
+# for --i-am-willingly-circumventing-build-and-test-time-safeguards, which removes the alarm rather than moving it.
 def test_every_long_verb_still_arms_something():
   for verb in ("bench", "coverage", "analyze", "publish"):
     assert _plan(verb) is not None
@@ -49,8 +49,8 @@ from buildutil.__main__ import _lift_watchdog_flags
 
 def test_lift_pulls_switches_from_after_the_subcommand():
   flags, rest = _lift_watchdog_flags(
-    ["build", "--release", "--no-watchdog", "--watchdog-budget", "600"])
-  assert flags == ["--no-watchdog", "--watchdog-budget", "600"]
+    ["build", "--release", "--i-am-willingly-circumventing-build-and-test-time-safeguards", "--watchdog-budget", "600"])
+  assert flags == ["--i-am-willingly-circumventing-build-and-test-time-safeguards", "--watchdog-budget", "600"]
   assert rest == ["build", "--release"]
 
 
@@ -61,7 +61,7 @@ def test_lift_equals_form_and_already_leading():
 
 
 def test_lift_never_crosses_the_double_dash():
-  argv = ["run", "--target", "x", "--", "--no-watchdog", "--watchdog-budget"]
+  argv = ["run", "--target", "x", "--", "--i-am-willingly-circumventing-build-and-test-time-safeguards", "--watchdog-budget"]
   flags, rest = _lift_watchdog_flags(argv)
   assert flags == []
   assert rest == argv          # the target's argv is forwarded untouched
@@ -69,7 +69,7 @@ def test_lift_never_crosses_the_double_dash():
 
 def test_parse_switches_forms():
   assert watchdog.parse_switches([]) == (False, 180.0, False)
-  assert watchdog.parse_switches(["--no-watchdog"]) == (True, 180.0, False)
+  assert watchdog.parse_switches(["--i-am-willingly-circumventing-build-and-test-time-safeguards"]) == (True, 180.0, False)
   assert watchdog.parse_switches(["--watchdog-budget", "600"]) == (False, 600.0, True)
   assert watchdog.parse_switches(["--watchdog-budget=90"]) == (False, 90.0, True)
 
@@ -80,7 +80,7 @@ def test_arm_for_pre_project_verbs_follow_the_rules(monkeypatch):
   monkeypatch.delenv("CI", raising=False)
   watchdog.arm_for("init", [])
   assert armed == [180.0]                    # generic budget applies
-  watchdog.arm_for("init", ["--no-watchdog"])
+  watchdog.arm_for("init", ["--i-am-willingly-circumventing-build-and-test-time-safeguards"])
   assert armed == [180.0]                    # disabled: nothing armed
   monkeypatch.setenv("CI", "1")
   watchdog.arm_for("update", [])
